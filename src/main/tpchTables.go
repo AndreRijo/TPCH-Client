@@ -8,6 +8,13 @@ import (
 
 //*****TABLES*****//
 
+const (
+	CUSTOMER, LINEITEM, NATION, ORDERS, PART, PARTSUPP, REGION, SUPPLIER = 0, 1, 2, 3, 4, 5, 6, 7
+)
+
+//TODO: Might be wise to extend all (or at least customer/orders) with REGIONKEY for faster acessing REGIONKEY when doing queries
+//Alternativelly, a map of key -> regionKey would also work just fine
+
 type Customer struct {
 	C_CUSTKEY    int32
 	C_NAME       string
@@ -106,6 +113,20 @@ type Tables struct {
 	Regions           []*Region
 	Suppliers         []*Supplier
 	MaxOrderLineitems int32
+	//Note: Likely not all of these are needed
+	Types        [][]string
+	Containers   [][]string
+	Segments     []string
+	Priorities   []string
+	Instructions []string
+	Modes        []string
+	Nouns        []string
+	Verbs        []string
+	Adjectives   []string
+	Adverbs      []string
+	Prepositions []string
+	Auxiliaries  []string
+	Terminators  []rune
 }
 
 //*****Auxiliary data types*****//
@@ -175,6 +196,7 @@ func CreateClientTables(rawData [][][]string) (tables *Tables) {
 		Regions:           createRegionTable(rawData[6]),
 		Suppliers:         createSupplierTable(rawData[7]),
 		MaxOrderLineitems: maxOrderLineitems,
+		Segments:          createSegmentsList(),
 	}
 	endTime := time.Now().UnixNano() / 1000000
 	fmt.Println("Time taken to process tables:", endTime-startTime, "ms")
@@ -204,15 +226,18 @@ func createCustomerTable(cTable [][]string) (customers []*Customer) {
 
 func createLineitemTable(liTable [][]string, nOrders int) (lineItems []*LineItem, maxLineItem int32) {
 	fmt.Println("Creating lineItem table")
-	//First discover what is the max number of items an order can have
-	max := liTable[0][3]
-	for _, entry := range liTable {
-		if entry[3] > max {
-			max = entry[3]
+	/*
+		//First discover what is the max number of items an order can have
+		max := liTable[0][3]
+		for _, entry := range liTable {
+			if entry[3] > max {
+				max = entry[3]
+			}
 		}
-	}
-	max64, _ := strconv.ParseInt(max, 10, 32)
-	maxLineItem = int32(max64)
+		max64, _ := strconv.ParseInt(max, 10, 32)
+		maxLineItem = int32(max64)
+	*/
+	maxLineItem = 8
 	//TODO: If this max is the same accross SFs, then we can just hardcode it
 
 	//TODO: Remove +100
@@ -418,4 +443,60 @@ func createDate(stringDate string) (date *Date) {
 		MONTH: int8(month64),
 		DAY:   int8(day64),
 	}
+}
+
+func createSegmentsList() []string {
+	return []string{"AUTOMOBILE", "BUILDING", "FURNITURE", "MACHINERY", "HOUSEHOLD"}
+}
+
+func (tab *Tables) InitConstants() {
+	tab.Segments = createSegmentsList()
+}
+
+func (tab *Tables) CreateCustomers(table [][][]string) {
+	tab.Customers = createCustomerTable(table[CUSTOMER])
+}
+
+func (tab *Tables) CreateLineitems(table [][][]string) {
+	tab.LineItems, tab.MaxOrderLineitems = createLineitemTable(table[LINEITEM], len(tab.Orders))
+}
+
+func (tab *Tables) CreateNations(table [][][]string) {
+	tab.Nations = createNationTable(table[NATION])
+}
+
+func (tab *Tables) CreateOrders(table [][][]string) {
+	tab.Orders = createOrdersTable(table[ORDERS])
+}
+
+func (tab *Tables) CreateParts(table [][][]string) {
+	tab.Parts = createPartTable(table[PART])
+}
+
+func (tab *Tables) CreateRegions(table [][][]string) {
+	tab.Regions = createRegionTable(table[REGION])
+}
+
+func (tab *Tables) CreatePartsupps(table [][][]string) {
+	tab.PartSupps = createPartsuppTable(table[PARTSUPP])
+}
+
+func (tab *Tables) CreateSuppliers(table [][][]string) {
+	tab.Suppliers = createSupplierTable(table[SUPPLIER])
+}
+
+func (tab *Tables) NationkeyToRegionkey(nationKey int64) int8 {
+	return tab.Nations[nationKey].N_REGIONKEY
+}
+
+func (tab *Tables) SuppkeyToRegionkey(suppKey int64) int8 {
+	return tab.Nations[tab.Suppliers[suppKey].S_NATIONKEY].N_REGIONKEY
+}
+
+func (tab *Tables) CustkeyToRegionkey(custKey int64) int8 {
+	return tab.Nations[tab.Customers[custKey].C_NATIONKEY].N_REGIONKEY
+}
+
+func (tab *Tables) OrderkeyToRegionkey(orderKey int32) int8 {
+	return tab.Nations[tab.Customers[tab.Orders[GetOrderIndex(orderKey)].O_CUSTKEY].C_NATIONKEY].N_REGIONKEY
 }

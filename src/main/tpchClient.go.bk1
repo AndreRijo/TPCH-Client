@@ -10,6 +10,7 @@ import (
 	"os/signal"
 	"proto"
 	"runtime"
+	"runtime/debug"
 	"runtime/pprof"
 	"sort"
 	"strconv"
@@ -21,8 +22,6 @@ import (
 
 	pb "github.com/golang/protobuf/proto"
 )
-
-//TODO: BUG - not all orders get send to the server. Mainly, seems like 50k+ (prob 40k+) doesn't get sent.
 
 /**
 Used:
@@ -69,12 +68,6 @@ type QueuedMsg struct {
 	code byte
 }
 
-type Channels struct {
-	procTableChan chan int
-	prepSendChan  chan int
-	dataChans     []chan QueuedMsg
-}
-
 const (
 	cpuProfileLoc = "../../profiles/cpu.prof"
 	memProfileLoc = "../../profiles/mem.cpu"
@@ -101,11 +94,7 @@ const (
 	LARGE_ORDERS     = "q18lo"
 	SEGM_DELAY       = "q3sd"
 
-	QUEUE_COMPLETE  = byte(255)
-	MAX_BUFF_PROTOS = 50
-
-	C_NATIONKEY, L_SUPPKEY, N_REGIONKEY, O_CUSTKEY, PS_SUPPKEY, S_NATIONKEY, R_REGIONKEY = 3, 2, 2, 1, 1, 3, 0
-	PART_BKT, INDEX_BKT                                                                  = 5, 6
+	QUEUE_COMPLETE = byte(255)
 )
 
 var (
@@ -127,9 +116,7 @@ var (
 	updCompleteFilename = [...]string{updFolder + updsNames[0] + updExtension, updFolder + updsNames[1] + updExtension,
 		updFolder + updsNames[2] + deleteExtension}
 
-	//servers = []string{"127.0.0.1:8087"}
-	servers = []string{"127.0.0.1:8087", "127.0.0.1:8087", "127.0.0.1:8087", "127.0.0.1:8087", "127.0.0.1:8087"}
-	//servers = []string{"127.0.0.1:8087", "127.0.0.1:8088", "127.0.0.1:8089", "127.0.0.1:8090", "127.0.0.1:8091"}
+	servers = []string{"127.0.0.1:8087"}
 
 	//Just for debugging
 	nProtosSent = 0
@@ -141,34 +128,20 @@ var (
 	read       [][]int8 //Positions in tables that actually have values
 	procTables *Tables
 
-	//Note: nil corresponds to Part, which isn't associated to any nation/region
-	regionFuncs = [...]func([]string) int8{custToRegion, lineitemToRegion, nationToRegion, ordersToRegion,
-		nil, partSuppToRegion, regionToRegion, supplierToRegion}
-
 	//Queues to send data
-	//dataQueue  = make(chan QueuedMsg, MAX_BUFF_PROTOS)
-	indexQueue = make(chan QueuedMsg, MAX_BUFF_PROTOS)
-	updsQueue  = make(chan QueuedMsg, MAX_BUFF_PROTOS)
-
-	conns = make([]net.Conn, len(servers))
-
-	//TODO: Might want to read this from a file later on
-	buckets = []string{"R1", "R2", "R3", "R4", "R5", "PART", "INDEX"}
-
-	channels = Channels{
-		procTableChan: make(chan int, 10),
-		prepSendChan:  make(chan int, 10),
-		dataChans: []chan QueuedMsg{make(chan QueuedMsg, MAX_BUFF_PROTOS), make(chan QueuedMsg, MAX_BUFF_PROTOS),
-			make(chan QueuedMsg, MAX_BUFF_PROTOS), make(chan QueuedMsg, MAX_BUFF_PROTOS), make(chan QueuedMsg, MAX_BUFF_PROTOS)},
-	}
+	dataQueue  = make(chan QueuedMsg, 100)
+	indexQueue = make(chan QueuedMsg, 100)
+	//queriesQueue  = make(chan QueuedMsg, 100)
+	updsQueue = make(chan QueuedMsg, 100)
 )
 
-/*
+//TODO: Start sending tables while still reading them
 func main() {
-	startProfiling()
+	/*
+		startProfiling()
 		go debugMemory()
 		stopProfiling()
-
+	*/
 
 	rand.Seed(time.Now().UnixNano())
 	go handleServerComm()
@@ -185,32 +158,16 @@ func main() {
 	//prepareIndexesToSend()
 
 	//collectDataStatistics()
+	/*
+		for _, lineItem := range procTables.LineItems {
+			if lineItem != nil {
+				fmt.Printf("%+v\n", *lineItem)
+			}
+		}
+	*/
 	//TODO: Finish updates
 	select {}
-}
-*/
 
-func main() {
-	rand.Seed(time.Now().UnixNano())
-	readHeaders()
-
-	for i := range channels.dataChans {
-		go handleServerCommV2(i)
-	}
-	go handleTableProcessing()
-	go handlePrepareSend()
-
-	tables = make([][][]string, len(tableNames))
-	procTables = &Tables{}
-	procTables.InitConstants()
-	handleTables()
-
-	//tables = nil
-	//debug.FreeOSMemory()
-	//prepareIndexesToSend()
-
-	//collectDataStatistics()
-	select {}
 }
 
 func readHeaders() {
@@ -220,172 +177,6 @@ func readHeaders() {
 	fmt.Println("Time taken for reading headers:", finishTime-startTime, "ms")
 }
 
-func handleTables() {
-	startTime := time.Now().UnixNano() / 1000000
-	//Force these to be read first
-	readProcessSendTable(REGION)
-	readProcessSendTable(NATION)
-	readProcessSendTable(SUPPLIER)
-	readProcessSendTable(CUSTOMER)
-	//Order is irrelevant now
-	readProcessSendTable(PARTSUPP)
-	readProcessSendTable(ORDERS)
-	readProcessSendTable(LINEITEM)
-	readProcessSendTable(PART)
-	finishTime := time.Now().UnixNano() / 1000000
-	fmt.Println("Time taken to read tables:", finishTime-startTime, "ms")
-}
-
-func readProcessSendTable(i int) {
-	fmt.Println("Reading", tableNames[i], i)
-	nEntries := tableEntries[i]
-	if tableUsesSF[i] {
-		nEntries = int(float64(nEntries) * scaleFactor)
-	}
-	tables[i] = tpchTools.ReadTable(tableFolder+tableNames[i]+tableExtension, tableParts[i], nEntries, read[i])
-	//Read complete, can now start processing and sending it
-	channels.procTableChan <- i
-}
-
-func handleTableProcessing() {
-	left := len(tableNames)
-	for ; left > 0; left-- {
-		i := <-channels.procTableChan
-		fmt.Println("Creating", tableNames[i], i)
-		switch i {
-		case CUSTOMER:
-			procTables.CreateCustomers(tables)
-		case LINEITEM:
-			procTables.CreateLineitems(tables)
-		case NATION:
-			procTables.CreateNations(tables)
-		case ORDERS:
-			procTables.CreateOrders(tables)
-		case PART:
-			procTables.CreateParts(tables)
-		case REGION:
-			procTables.CreateRegions(tables)
-		case PARTSUPP:
-			procTables.CreatePartsupps(tables)
-		case SUPPLIER:
-			procTables.CreateSuppliers(tables)
-		}
-		channels.prepSendChan <- i
-	}
-	fmt.Println("Finished creating all tables")
-	maxOrder := int32(0)
-	for _, order := range procTables.Orders {
-		if order != nil && order.O_ORDERKEY > maxOrder {
-			maxOrder = order.O_ORDERKEY
-		}
-	}
-	fmt.Println("MAX ORDER:", maxOrder)
-	//Now we can start preparing the indexes
-	prepareIndexesToSend()
-}
-
-func handlePrepareSend() {
-	left := len(tableNames)
-	for ; left > 0; left-- {
-		i := <-channels.prepSendChan
-		fmt.Println("Preparing protos", tableNames[i], i)
-		if i == PART {
-			prepareSendAny(i)
-		} else {
-			prepareSendPartitioned(i)
-		}
-	}
-	fmt.Println("Finished preparing protos for all tables")
-	for _, channel := range channels.dataChans {
-		channel <- QueuedMsg{code: QUEUE_COMPLETE}
-	}
-}
-
-/*
-func readTables() (tables [][][]string) {
-	startTime := time.Now().UnixNano() / 1000000
-	//tableName -> [entry] -> [fields of each entry]
-	tables = make([][][]string, len(tableNames), len(tableNames))
-	for i := 0; i < len(tableNames); i++ {
-		fmt.Println("Reading", tableNames[i])
-		nEntries := tableEntries[i]
-		if tableUsesSF[i] {
-			nEntries = int(float64(nEntries) * scaleFactor)
-		}
-		tables[i] = tpchTools.ReadTable(tableFolder+tableNames[i]+tableExtension, tableParts[i], nEntries, read[i])
-	}
-	endTime := time.Now().UnixNano() / 1000000
-	fmt.Println("Time taken for reading tables from files:", endTime-startTime, "ms")
-	return
-}
-*/
-
-func handleServerCommV2(connIndex int) {
-	conn, err := net.Dial("tcp", servers[connIndex])
-	tools.CheckErr("Network connection establishment err", err)
-	conns[connIndex] = conn
-
-	start := time.Now().UnixNano() / 1000000
-	fmt.Println("Starting to send data protos for server", servers[connIndex], "...")
-	complete := false
-	i := 0
-	for !complete {
-		msg := <-channels.dataChans[connIndex]
-		if msg.code == QUEUE_COMPLETE {
-			complete = true
-		} else {
-			fmt.Println("Sending proto", i)
-			antidote.SendProto(msg.code, msg.Message, conn)
-			fmt.Println("Receiving proto", i)
-			antidote.ReceiveProto(conn)
-			fmt.Println("Proto received", i)
-			i++
-		}
-	}
-	fmt.Println("All data protos for server", servers[connIndex], "have been sent.")
-	end := time.Now().UnixNano() / 1000000
-	fmt.Printf("Time to send dataProtos for %d: %d\n", connIndex, end-start)
-
-	if connIndex == 0 {
-		handleIndexComm()
-	}
-}
-
-func handleIndexComm() {
-	conn := conns[0]
-	start := time.Now().UnixNano() / 1000000
-
-	//Start a txn for the indexes
-	startTxn := antidote.CreateStartTransaction(nil)
-	antidote.SendProto(antidote.StartTrans, startTxn, conn)
-	_, txnReplyProto, _ := antidote.ReceiveProto(conn)
-	txnId := txnReplyProto.(*proto.ApbStartTransactionResp).GetTransactionDescriptor()
-
-	complete := false
-	for !complete {
-		msg := <-indexQueue
-		if msg.code == QUEUE_COMPLETE {
-			complete = true
-		} else {
-			msg.Message.(*proto.ApbUpdateObjects).TransactionDescriptor = txnId
-			antidote.SendProto(msg.code, msg.Message, conn)
-			antidote.ReceiveProto(conn)
-		}
-	}
-
-	//Commit for indexes
-	commitTxn := antidote.CreateCommitTransaction(txnId)
-	antidote.SendProto(antidote.CommitTrans, commitTxn, conn)
-	antidote.ReceiveProto(conn)
-	fmt.Println("All index protos have been sent.")
-	end := time.Now().UnixNano() / 1000000
-	fmt.Println("Time taken to send index protos: ", end-start)
-
-	runtime.GC()
-	sendQueries(conn)
-}
-
-/*
 func handleServerComm() {
 	conn, err := net.Dial("tcp", servers[0])
 	tools.CheckErr("Network connection establishment err", err)
@@ -416,6 +207,7 @@ func handleServerComm() {
 	_, txnReplyProto, _ := antidote.ReceiveProto(conn)
 	txnId := txnReplyProto.(*proto.ApbStartTransactionResp).GetTransactionDescriptor()
 
+	/*
 		complete = false
 		for !complete {
 			msg := <-indexQueue
@@ -427,6 +219,7 @@ func handleServerComm() {
 				antidote.ReceiveProto(conn)
 			}
 		}
+	*/
 
 	//Commit for indexes
 	commitTxn := antidote.CreateCommitTransaction(txnId)
@@ -440,7 +233,23 @@ func handleServerComm() {
 	//sendQueries(conn)
 }
 
-/*
+func readTables() (tables [][][]string) {
+	startTime := time.Now().UnixNano() / 1000000
+	//tableName -> [entry] -> [fields of each entry]
+	tables = make([][][]string, len(tableNames), len(tableNames))
+	for i := 0; i < len(tableNames); i++ {
+		fmt.Println("Reading", tableNames[i])
+		nEntries := tableEntries[i]
+		if tableUsesSF[i] {
+			nEntries = int(float64(nEntries) * scaleFactor)
+		}
+		tables[i] = tpchTools.ReadTable(tableFolder+tableNames[i]+tableExtension, tableParts[i], nEntries, read[i])
+	}
+	endTime := time.Now().UnixNano() / 1000000
+	fmt.Println("Time taken for reading tables from files:", endTime-startTime, "ms")
+	return
+}
+
 func prepareTablesToSend() {
 	startTime := time.Now().UnixNano() / 1000000
 	for i := 0; i < len(tables); i++ {
@@ -453,96 +262,21 @@ func prepareTablesToSend() {
 	finishTime := time.Now().UnixNano() / 1000000
 	fmt.Println("Time taken for preparing tables to send:", finishTime-startTime, "ms")
 }
-*/
 
 /*
-func prepareTableV2(name string, headers []string, primKeys []int, table [][]string, read []int8, queue chan QueuedMsg) {
-	switch name {
-	case tableNames[CUSTOMER]:
+func sendTableData(conn net.Conn, primKeys [][]int) {
 
-	case tableNames[LINEITEM]:
+		fmt.Println("Table len", len(tables))
+		for i := 0; i < len(primKeys); i++ {
+			fmt.Println("Preparing to send", tableNames[i])
+			sendTable(conn, tableNames[i], headers[i], primKeys[i], tables[i])
+		}
+		fmt.Println("Sent", nProtosSent, "protos.")
 
-	case tableNames[NATION]:
-
-	case tableNames[ORDERS]:
-
-	case tableNames[PART]:
-
-	case tableNames[PARTSUPP]:
-
-	case tableNames[REGION]:
-
-	case tableNames[SUPPLIER]:
-
-	}
+	prepareAndSendIndexes(conn, primKeys)
 }
 */
 
-func prepareSendPartitioned(tableIndex int) {
-	regionFunc := regionFuncs[tableIndex]
-
-	updsPerServer := make([]map[string]crdt.UpdateArguments, len(procTables.Regions))
-	for i := range channels.dataChans {
-		updsPerServer[i] = make(map[string]crdt.UpdateArguments)
-	}
-	table, header, primKeys, read, name := tables[tableIndex], headers[tableIndex], keys[tableIndex], read[tableIndex], tableNames[tableIndex]
-
-	var key string
-	var upd *crdt.EmbMapUpdateAll
-	var region int8
-	var currMap map[string]crdt.UpdateArguments
-	for _, obj := range table {
-		key, upd = getEntryUpd(header, primKeys, obj, read)
-		region = regionFunc(obj)
-		currMap = updsPerServer[region]
-		currMap[key] = *upd
-		if len(currMap) == maxUpdSize {
-			queueDataProto(currMap, name, buckets[region], channels.dataChans[region])
-			updsPerServer[region] = make(map[string]crdt.UpdateArguments)
-		}
-	}
-
-	for i, leftUpds := range updsPerServer {
-		if len(leftUpds) > 0 {
-			queueDataProto(leftUpds, name, buckets[i], channels.dataChans[i])
-		}
-	}
-	//Clean table
-	tables[tableIndex] = nil
-}
-
-func prepareSendAny(tableIndex int) {
-	upds := make(map[string]crdt.UpdateArguments)
-	table, header, primKeys, read, name := tables[tableIndex], headers[tableIndex], keys[tableIndex], read[tableIndex], tableNames[tableIndex]
-
-	var key string
-	var upd *crdt.EmbMapUpdateAll
-	for _, obj := range table {
-		key, upd = getEntryUpd(header, primKeys, obj, read)
-		upds[key] = *upd
-		if len(upds) == maxUpdSize {
-			queueDataProto(upds, name, buckets[PART_BKT], channels.dataChans[0])
-			upds = make(map[string]crdt.UpdateArguments)
-		}
-	}
-
-	if len(upds) > 0 {
-		queueDataProto(upds, name, buckets[PART_BKT], channels.dataChans[0])
-	}
-	//Clean table
-	tables[tableIndex] = nil
-}
-
-func queueDataProto(currMap map[string]crdt.UpdateArguments, name string, bucket string, dataChan chan QueuedMsg) {
-	var currUpd crdt.UpdateArguments = crdt.EmbMapUpdateAll{Upds: currMap}
-	dataChan <- QueuedMsg{
-		code: antidote.StaticUpdateObjs,
-		Message: antidote.CreateStaticUpdateObjs(nil, []antidote.UpdateObjectParams{antidote.UpdateObjectParams{
-			KeyParams:  antidote.KeyParams{Key: name, CrdtType: proto.CRDTType_RRMAP, Bucket: bucket},
-			UpdateArgs: &currUpd}})}
-}
-
-/*
 //This is both used for sending the initial data and updates, at least for now
 func prepareTable(name string, headers []string, primKeys []int, table [][]string, read []int8, queue chan QueuedMsg) {
 	for nEntriesLeft := len(table); nEntriesLeft > 0; nEntriesLeft -= maxUpdSize {
@@ -552,6 +286,23 @@ func prepareTable(name string, headers []string, primKeys []int, table [][]strin
 		dataQueue <- QueuedMsg{Message: antidote.CreateStaticUpdateObjs(nil, updates), code: antidote.StaticUpdateObjs}
 	}
 }
+
+/*
+func sendTable(conn net.Conn, name string, headers []string, primKeys []int, table [][]string) {
+	fmt.Println("Table", name, "len", len(table))
+	for nEntriesLeft := len(table); nEntriesLeft > 0; nEntriesLeft -= maxUpdSize {
+		nUpds := min(maxUpdSize, nEntriesLeft)
+		fmt.Println("Preparing to send", nUpds, "updates")
+		updates := []antidote.UpdateObjectParams{*getTableUpd(name, headers, primKeys, table[nEntriesLeft-nUpds:nEntriesLeft])}
+		fmt.Println("Sending proto")
+		antidote.SendProto(antidote.StaticUpdateObjs, antidote.CreateStaticUpdateObjs(updates), conn)
+		fmt.Println("Receiving proto")
+		antidote.ReceiveProto(conn)
+		fmt.Println("Reply proto received")
+		nProtosSent++
+	}
+}
+*/
 
 //Updates to multiple keys of a table (e.g., multiple keys of the costumer table)
 //Each table is also a RWEmbMap whose values are RWEmbMaps.
@@ -570,7 +321,6 @@ func getTableUpd(name string, headers []string, primKeys []int, table [][]string
 		UpdateArgs: &keyUpd,
 	}
 }
-*/
 
 //Inner most updates: the object/entry itself (upd to an RWEmbMap, whose entries are LWWRegisters)
 func getEntryUpd(headers []string, primKeys []int, table []string, read []int8) (objKey string, entriesUpd *crdt.EmbMapUpdateAll) {
@@ -623,8 +373,6 @@ func getEntryORMapUpd(headers []string, primKeys []int, table []string, read []i
 	//TODO: Also remove the slicing after removing the "_"
 	return buf.String()[:buf.Len()-1], &crdt.MapAddAll{Values: entries}
 }
-
-/////*********** INDEXES **********/////
 
 func prepareIndexesToSend() {
 	finishTimes := make([]int64, 7)
@@ -824,8 +572,14 @@ func prepareQ3Index() (upds []antidote.UpdateObjectParams) {
 	//Each entry in the topK will be for an orderkey.
 	//Orderdate will need to be retrieved separatelly.
 
+	/*
+		type IntPair struct {
+			first  int32
+			second int32
+		}*/
 	//segment -> orderDate -> orderkey -> sum
 	sumMap := make(map[string]map[int8]map[int32]*float64)
+	//TODO: Store this somewhere. This comes from segments
 
 	var i int32
 	var j int8
@@ -895,7 +649,7 @@ func prepareQ3Index() (upds []antidote.UpdateObjectParams) {
 			keyArgs = antidote.KeyParams{
 				Key:      SEGM_DELAY + mktSeg + strconv.FormatInt(int64(day), 10),
 				CrdtType: proto.CRDTType_TOPK_RMV,
-				Bucket:   buckets[INDEX_BKT],
+				Bucket:   "bkt",
 			}
 			//TODO: Actually use float
 			for orderKey, sum := range dayMap {
@@ -993,7 +747,7 @@ func prepareQ5Index() (upds []antidote.UpdateObjectParams) {
 			}
 			var args crdt.UpdateArguments = regDateUpd
 			upds[i] = antidote.UpdateObjectParams{
-				KeyParams:  antidote.KeyParams{Key: regS + years[year-1993], CrdtType: proto.CRDTType_RRMAP, Bucket: buckets[INDEX_BKT]},
+				KeyParams:  antidote.KeyParams{Key: regS + years[year-1993], CrdtType: proto.CRDTType_RRMAP, Bucket: "bkt"},
 				UpdateArgs: &args,
 			}
 			i++
@@ -1062,7 +816,7 @@ func prepareQ11Index() (upds []antidote.UpdateObjectParams) {
 		keyArgs = antidote.KeyParams{
 			Key:      IMP_SUPPLY + procTables.Nations[natKey].N_NAME,
 			CrdtType: proto.CRDTType_TOPK_RMV,
-			Bucket:   buckets[INDEX_BKT],
+			Bucket:   "bkt",
 		}
 		for partKey, value := range partMap {
 			//TODO: Not use int32
@@ -1077,7 +831,7 @@ func prepareQ11Index() (upds []antidote.UpdateObjectParams) {
 		keyArgs = antidote.KeyParams{
 			Key:      SUM_SUPPLY + procTables.Nations[natKey].N_NAME,
 			CrdtType: proto.CRDTType_COUNTER,
-			Bucket:   buckets[INDEX_BKT],
+			Bucket:   "bkt",
 		}
 		//TODO: Not use int32
 		var currUpd crdt.UpdateArguments = crdt.Increment{Change: int32(*value * (0.0001 / scaleFactor))}
@@ -1160,7 +914,7 @@ func prepareQ14Index() (upds []antidote.UpdateObjectParams) {
 			NAdds:    int64(*totalP),
 		}
 		upds[i] = antidote.UpdateObjectParams{
-			KeyParams:  antidote.KeyParams{Key: PROMO_PERCENTAGE + key, CrdtType: proto.CRDTType_AVG, Bucket: buckets[INDEX_BKT]},
+			KeyParams:  antidote.KeyParams{Key: PROMO_PERCENTAGE + key, CrdtType: proto.CRDTType_AVG, Bucket: "bkt"},
 			UpdateArgs: &currUpd,
 		}
 		i++
@@ -1235,7 +989,7 @@ func prepareQ15Index() (upds []antidote.UpdateObjectParams) {
 			keyArgs = antidote.KeyParams{
 				Key:      TOP_SUPPLIERS + strconv.FormatInt(int64(year), 10) + strconv.FormatInt(int64(month), 10),
 				CrdtType: proto.CRDTType_TOPK_RMV,
-				Bucket:   buckets[INDEX_BKT],
+				Bucket:   "bkt",
 			}
 			for suppKey, value := range monthMap[month] {
 				//TODO: Not use int32 for value
@@ -1357,7 +1111,7 @@ func prepareQ18Index() (upds []antidote.UpdateObjectParams) {
 		keyArgs = antidote.KeyParams{
 			Key:      LARGE_ORDERS + strconv.FormatInt(int64(quantity), 10),
 			CrdtType: proto.CRDTType_TOPK_RMV,
-			Bucket:   buckets[INDEX_BKT],
+			Bucket:   "bkt",
 		}
 		for orderKey, pair := range orderMap {
 			//TODO: Store the customerKey also
@@ -1383,8 +1137,6 @@ func sendTableEntries(headers [][]string, keys []string, table [][][]string) {
 
 }
 */
-
-/////*********** UPDATES/DELETES **********/////
 
 func readUpds() (ordersUpds [][]string, lineItemUpds [][]string, deleteKeys []string) {
 	return tpchTools.ReadUpdates(updCompleteFilename[:], updEntries[:], updParts[:])
@@ -1431,11 +1183,8 @@ func getTableDelete(tableKey string, deleteKeys []string) (delete *antidote.Upda
 	}
 }
 
-/////*********** QUERIES **********/////
-
 func sendQueries(conn net.Conn) {
 	time.Sleep(2000 * time.Millisecond)
-	fmt.Println("Starting to send queries")
 	finishTimes := make([]int64, 7)
 	queries := []int{-1, 3, 5, 11, 14, 15, 18}
 	finishTimes[0] = time.Now().UnixNano() / 1000000
@@ -1483,16 +1232,13 @@ func sendQ3(conn net.Conn) {
 	*/
 
 	readParam := []antidote.ReadObjectParams{antidote.ReadObjectParams{
-		KeyParams: antidote.KeyParams{Key: SEGM_DELAY + rndSeg + strconv.FormatInt(rndDay, 10), CrdtType: proto.CRDTType_TOPK_RMV, Bucket: buckets[INDEX_BKT]},
+		KeyParams: antidote.KeyParams{Key: SEGM_DELAY + rndSeg + strconv.FormatInt(rndDay, 10), CrdtType: proto.CRDTType_TOPK_RMV, Bucket: "bkt"},
 		ReadArgs:  crdt.GetTopNArguments{NumberEntries: 10},
 	}}
-	/*
-		readProto := antidote.CreateStaticRead(nil, []antidote.ReadObjectParams{}, readParam)
-		antidote.SendProto(antidote.StaticRead, readProto, conn)
-		_, replyProto, _ := antidote.ReceiveProto(conn)
-		topKProto := replyProto.(*proto.ApbStaticReadObjectsResp).GetObjects().GetObjects()[0].GetTopk()
-	*/
-	topKProto := sendReceiveReadProto([]antidote.ReadObjectParams{}, readParam).GetObjects().GetObjects()[0].GetTopk()
+	readProto := antidote.CreateStaticRead(nil, []antidote.ReadObjectParams{}, readParam)
+	antidote.SendProto(antidote.StaticRead, readProto, conn)
+	_, replyProto, _ := antidote.ReceiveProto(conn)
+	topKProto := replyProto.(*proto.ApbStaticReadObjectsResp).GetObjects().GetObjects()[0].GetTopk()
 	values := topKProto.GetValues()
 
 	orderIDs := make([]int32, 10)
@@ -1506,66 +1252,40 @@ func sendQ3(conn net.Conn) {
 
 	orderDate, shipPriority := headers[ORDERS][4], headers[ORDERS][7]
 	registerArgs := crdt.StateReadArguments{}
+	//orderMapArgs := crdt.EmbMapPartialArguments{Args: map[string]crdt.ReadArguments{"O_ORDERDATE": registerArgs, "O_SHIPPRIORITY": registerArgs}}
 	orderMapArgs := crdt.EmbMapPartialArguments{Args: map[string]crdt.ReadArguments{orderDate: registerArgs, shipPriority: registerArgs}}
-
-	/*
-		orderIDsArgs := make(map[string]crdt.ReadArguments)
-		for _, orderID := range orderIDs {
-			orderIDsArgs[strconv.FormatInt(int64(orderID), 10)] = orderMapArgs
-		}
-
-		readParam[0] = antidote.ReadObjectParams{
-			KeyParams: antidote.KeyParams{Key: tableNames[3], CrdtType: proto.CRDTType_RRMAP, Bucket: "bkt"},
-			ReadArgs:  crdt.EmbMapPartialArguments{Args: orderIDsArgs},
-		}
-	*/
-	readParams, orderIDsArgs := getReadArgsPerBucket(ORDERS)
+	orderIDsArgs := make(map[string]crdt.ReadArguments)
 	for _, orderID := range orderIDs {
-		orderIDsArgs[procTables.OrderkeyToRegionkey(orderID)][strconv.FormatInt(int64(orderID), 10)] = orderMapArgs
-	}
-	for i, args := range orderIDsArgs {
-		if len(args) == 0 {
-			delete(readParams, i)
-		}
+		orderIDsArgs[strconv.FormatInt(int64(orderID), 10)] = orderMapArgs
 	}
 
-	replies := sendReceiveBucketReadProtos(readParams)
-	states := mergeMapReplies(replies)
+	readParam[0] = antidote.ReadObjectParams{
+		KeyParams: antidote.KeyParams{Key: tableNames[3], CrdtType: proto.CRDTType_RRMAP, Bucket: "bkt"},
+		ReadArgs:  crdt.EmbMapPartialArguments{Args: orderIDsArgs},
+	}
+	readProto = antidote.CreateStaticRead(nil, []antidote.ReadObjectParams{}, readParam)
+	antidote.SendProto(antidote.StaticRead, readProto, conn)
+	_, replyProto, _ = antidote.ReceiveProto(conn)
+	//ordersMapState := antidote.ConvertProtoObjectToAntidoteState(
+	//replyProto.(*antidote.ApbStaticReadObjectsResp).GetObjects().GetObjects()[0], proto.CRDTType_RRMAP).(crdt.EmbMapEntryState)
+	ordersMapState := crdt.ReadRespProtoToAntidoteState(replyProto.(*proto.ApbStaticReadObjectsResp).GetObjects().GetObjects()[0],
+		proto.CRDTType_RRMAP, proto.READType_GET_VALUES).(crdt.EmbMapEntryState)
 
 	fmt.Printf("Q3: top 10 orders for segment %s not delivered as of %d:03:1995:\n", rndSeg, rndDay)
+	//written = 0
 	var orderID int32
 	var order map[string]crdt.State
 	for _, pair := range values {
 		orderID = pair.GetPlayerId()
-		order = states[strconv.FormatInt(int64(orderID), 10)].States
+		order = ordersMapState.States[strconv.FormatInt(int64(orderID), 10)].(crdt.EmbMapEntryState).States
 		fmt.Printf("%d | %d | %s | %s\n", orderID, pair.GetScore(),
 			order[orderDate].(crdt.RegisterState).Value.(string), order[shipPriority].(crdt.RegisterState).Value.(string))
+		//written++
+		//if written == 10 {
+		//break
+		//}
 	}
 
-	/*
-		readProto = antidote.CreateStaticRead(nil, []antidote.ReadObjectParams{}, readParam)
-		antidote.SendProto(antidote.StaticRead, readProto, conn)
-		_, replyProto, _ = antidote.ReceiveProto(conn)
-		//ordersMapState := antidote.ConvertProtoObjectToAntidoteState(
-		//replyProto.(*antidote.ApbStaticReadObjectsResp).GetObjects().GetObjects()[0], proto.CRDTType_RRMAP).(crdt.EmbMapEntryState)
-		ordersMapState := crdt.ReadRespProtoToAntidoteState(replyProto.(*proto.ApbStaticReadObjectsResp).GetObjects().GetObjects()[0],
-			proto.CRDTType_RRMAP, proto.READType_GET_VALUES).(crdt.EmbMapEntryState)
-
-		fmt.Printf("Q3: top 10 orders for segment %s not delivered as of %d:03:1995:\n", rndSeg, rndDay)
-		//written = 0
-		var orderID int32
-		var order map[string]crdt.State
-		for _, pair := range values {
-			orderID = pair.GetPlayerId()
-			order = ordersMapState.States[strconv.FormatInt(int64(orderID), 10)].(crdt.EmbMapEntryState).States
-			fmt.Printf("%d | %d | %s | %s\n", orderID, pair.GetScore(),
-				order[orderDate].(crdt.RegisterState).Value.(string), order[shipPriority].(crdt.RegisterState).Value.(string))
-			//written++
-			//if written == 10 {
-			//break
-			//}
-		}
-	*/
 }
 
 func sendQ5(conn net.Conn) {
@@ -1573,19 +1293,15 @@ func sendQ5(conn net.Conn) {
 	rndYear := 1993 + rand.Int63n(5)
 	readParam := []antidote.ReadObjectParams{antidote.ReadObjectParams{
 		KeyParams: antidote.KeyParams{
-			Key: NATION_REVENUE + rndRegion + strconv.FormatInt(rndYear, 10), CrdtType: proto.CRDTType_RRMAP, Bucket: buckets[INDEX_BKT]},
+			Key: NATION_REVENUE + rndRegion + strconv.FormatInt(rndYear, 10), CrdtType: proto.CRDTType_RRMAP, Bucket: "bkt"},
 	},
 	}
 
-	/*
-		readProto := antidote.CreateStaticReadObjs(nil, readParam)
-		antidote.SendProto(antidote.StaticReadObjs, readProto, conn)
-		_, replyProto, _ := antidote.ReceiveProto(conn)
-	*/
-	replyProto := sendReceiveReadObjsProto(readParam)
-	mapState := crdt.ReadRespProtoToAntidoteState(replyProto.GetObjects().GetObjects()[0], proto.CRDTType_RRMAP, proto.READType_FULL).(crdt.EmbMapEntryState)
-	//mapState := crdt.ReadRespProtoToAntidoteState(
-	//replyProto.(*proto.ApbStaticReadObjectsResp).GetObjects().GetObjects()[0], proto.CRDTType_RRMAP, proto.READType_FULL).(crdt.EmbMapEntryState)
+	readProto := antidote.CreateStaticReadObjs(nil, readParam)
+	antidote.SendProto(antidote.StaticReadObjs, readProto, conn)
+	_, replyProto, _ := antidote.ReceiveProto(conn)
+	mapState := crdt.ReadRespProtoToAntidoteState(
+		replyProto.(*proto.ApbStaticReadObjectsResp).GetObjects().GetObjects()[0], proto.CRDTType_RRMAP, proto.READType_FULL).(crdt.EmbMapEntryState)
 
 	//year -> nation
 	//yearMap := mapState.States[strconv.FormatInt(rndYear, 10)].(crdt.EmbMapEntryState)
@@ -1600,18 +1316,15 @@ func sendQ11(conn net.Conn) {
 	//Unfortunatelly we can't use the topk query of "only values above min" here as we need to fetch the min from the database first.
 	rndNation := procTables.Nations[rand.Intn(len(procTables.Nations))].N_NAME
 	readParam := []antidote.ReadObjectParams{
-		antidote.ReadObjectParams{KeyParams: antidote.KeyParams{Key: IMP_SUPPLY + rndNation, CrdtType: proto.CRDTType_TOPK_RMV, Bucket: buckets[INDEX_BKT]}},
-		antidote.ReadObjectParams{KeyParams: antidote.KeyParams{Key: SUM_SUPPLY + rndNation, CrdtType: proto.CRDTType_COUNTER, Bucket: buckets[INDEX_BKT]}},
+		antidote.ReadObjectParams{KeyParams: antidote.KeyParams{Key: IMP_SUPPLY + rndNation, CrdtType: proto.CRDTType_TOPK_RMV, Bucket: "bkt"}},
+		antidote.ReadObjectParams{KeyParams: antidote.KeyParams{Key: SUM_SUPPLY + rndNation, CrdtType: proto.CRDTType_COUNTER, Bucket: "bkt"}},
 	}
 
-	/*
-		readProto := antidote.CreateStaticReadObjs(nil, readParam)
-		antidote.SendProto(antidote.StaticReadObjs, readProto, conn)
-		_, replyProto, _ := antidote.ReceiveProto(conn)
-	*/
-	replyProto := sendReceiveReadObjsProto(readParam)
-	objsProto := replyProto.GetObjects().GetObjects()
-	//objsProto := replyProto.(*proto.ApbStaticReadObjectsResp).GetObjects().GetObjects()
+	readProto := antidote.CreateStaticReadObjs(nil, readParam)
+	antidote.SendProto(antidote.StaticReadObjs, readProto, conn)
+
+	_, replyProto, _ := antidote.ReceiveProto(conn)
+	objsProto := replyProto.(*proto.ApbStaticReadObjectsResp).GetObjects().GetObjects()
 	topkProto, counterProto := objsProto[0].GetTopk(), objsProto[1].GetCounter()
 
 	minValue := counterProto.GetValue()
@@ -1634,15 +1347,12 @@ func sendQ14(conn net.Conn) {
 	date = strconv.FormatInt(year, 10) + strconv.FormatInt(month, 10)
 
 	readParam := []antidote.ReadObjectParams{antidote.ReadObjectParams{
-		KeyParams: antidote.KeyParams{Key: PROMO_PERCENTAGE + date, CrdtType: proto.CRDTType_AVG, Bucket: buckets[INDEX_BKT]},
+		KeyParams: antidote.KeyParams{Key: PROMO_PERCENTAGE + date, CrdtType: proto.CRDTType_AVG, Bucket: "bkt"},
 	}}
-	/*
-		readProto := antidote.CreateStaticReadObjs(nil, readParam)
-		antidote.SendProto(antidote.StaticReadObjs, readProto, conn)
-		_, replyProto, _ := antidote.ReceiveProto(conn)
-		avgProto := replyProto.(*proto.ApbStaticReadObjectsResp)
-	*/
-	avgProto := sendReceiveReadObjsProto(readParam)
+	readProto := antidote.CreateStaticReadObjs(nil, readParam)
+	antidote.SendProto(antidote.StaticReadObjs, readProto, conn)
+	_, replyProto, _ := antidote.ReceiveProto(conn)
+	avgProto := replyProto.(*proto.ApbStaticReadObjectsResp)
 	fmt.Printf("Q14: %d_%d: %f.\n", year, month, avgProto.GetObjects().GetObjects()[0].GetAvg().GetAvg())
 }
 
@@ -1652,16 +1362,13 @@ func sendQ15(conn net.Conn) {
 	date := strconv.FormatInt(rndYear, 10) + strconv.FormatInt(rndQuarter, 10)
 
 	readParam := []antidote.ReadObjectParams{antidote.ReadObjectParams{
-		KeyParams: antidote.KeyParams{Key: TOP_SUPPLIERS + date, CrdtType: proto.CRDTType_TOPK_RMV, Bucket: buckets[INDEX_BKT]},
+		KeyParams: antidote.KeyParams{Key: TOP_SUPPLIERS + date, CrdtType: proto.CRDTType_TOPK_RMV, Bucket: "bkt"},
 		ReadArgs:  crdt.GetTopNArguments{NumberEntries: 1},
 	}}
-	/*
-		readProto := antidote.CreateStaticRead(nil, []antidote.ReadObjectParams{}, readParam)
-		antidote.SendProto(antidote.StaticRead, readProto, conn)
-		_, replyProto, _ := antidote.ReceiveProto(conn)
-		topkProto := replyProto.(*proto.ApbStaticReadObjectsResp).GetObjects().GetObjects()[0].GetTopk()
-	*/
-	topkProto := sendReceiveReadProto([]antidote.ReadObjectParams{}, readParam).GetObjects().GetObjects()[0].GetTopk()
+	readProto := antidote.CreateStaticRead(nil, []antidote.ReadObjectParams{}, readParam)
+	antidote.SendProto(antidote.StaticRead, readProto, conn)
+	_, replyProto, _ := antidote.ReceiveProto(conn)
+	topkProto := replyProto.(*proto.ApbStaticReadObjectsResp).GetObjects().GetObjects()[0].GetTopk()
 
 	fmt.Printf("Q15: best supplier(s) for months [%d, %d] of year %d\n", rndQuarter, rndQuarter+2, rndYear)
 	values := topkProto.GetValues()
@@ -1685,15 +1392,12 @@ func sendQ18(conn net.Conn) {
 
 	//Should ask for a GetTopN if we ever change the topK to not be top 100
 	readParam := []antidote.ReadObjectParams{antidote.ReadObjectParams{
-		KeyParams: antidote.KeyParams{Key: LARGE_ORDERS + strconv.FormatInt(int64(rndQuantity), 10), CrdtType: proto.CRDTType_TOPK_RMV, Bucket: buckets[INDEX_BKT]},
+		KeyParams: antidote.KeyParams{Key: LARGE_ORDERS + strconv.FormatInt(int64(rndQuantity), 10), CrdtType: proto.CRDTType_TOPK_RMV, Bucket: "bkt"},
 	}}
-	/*
-		readObjsProto := antidote.CreateStaticReadObjs(nil, readParam)
-		antidote.SendProto(antidote.StaticReadObjs, readObjsProto, conn)
-		_, replyProto, _ := antidote.ReceiveProto(conn)
-		topkProto := replyProto.(*proto.ApbStaticReadObjectsResp).GetObjects().GetObjects()[0].GetTopk()
-	*/
-	topkProto := sendReceiveReadObjsProto(readParam).GetObjects().GetObjects()[0].GetTopk()
+	readObjsProto := antidote.CreateStaticReadObjs(nil, readParam)
+	antidote.SendProto(antidote.StaticReadObjs, readObjsProto, conn)
+	_, replyProto, _ := antidote.ReceiveProto(conn)
+	topkProto := replyProto.(*proto.ApbStaticReadObjectsResp).GetObjects().GetObjects()[0].GetTopk()
 	values := topkProto.GetValues()
 	sort.Slice(values, func(i, j int) bool { return values[i].GetScore() > values[j].GetScore() })
 
@@ -1717,6 +1421,7 @@ func sendQ18(conn net.Conn) {
 	orderIDs = orderIDs[:written]
 
 	/*
+		//TODO: Only read part of the map
 		readParam[0] = antidote.ReadObjectParams{KeyParams: antidote.KeyParams{Key: tableNames[3], CrdtType: antidote.CRDTType_RRMAP, Bucket: "bkt"}}
 		readProto = antidote.CreateStaticReadObjs(nil, readParam)
 		antidote.SendProto(antidote.StaticReadObjs, readProto, conn)
@@ -1725,35 +1430,19 @@ func sendQ18(conn net.Conn) {
 	orderDate, orderTotalPrice, orderCustKey := headers[ORDERS][4], headers[ORDERS][3], headers[ORDERS][1]
 	registerArgs := crdt.StateReadArguments{}
 	orderMapArgs := crdt.EmbMapPartialArguments{Args: map[string]crdt.ReadArguments{orderDate: registerArgs, orderTotalPrice: registerArgs, orderCustKey: registerArgs}}
-	/*
-		orderIDsArgs := make(map[string]crdt.ReadArguments)
-		for _, orderID := range orderIDs {
-			orderIDsArgs[strconv.FormatInt(int64(orderID), 10)] = orderMapArgs
-		}
-			readParam[0] = antidote.ReadObjectParams{
-				KeyParams: antidote.KeyParams{Key: tableNames[3], CrdtType: proto.CRDTType_RRMAP, Bucket: "bkt"},
-				ReadArgs:  crdt.EmbMapPartialArguments{Args: orderIDsArgs},
-			}
-	*/
-	readParams, orderIDsArgs := getReadArgsPerBucket(ORDERS)
+	orderIDsArgs := make(map[string]crdt.ReadArguments)
 	for _, orderID := range orderIDs {
-		orderIDsArgs[procTables.OrderkeyToRegionkey(orderID)][strconv.FormatInt(int64(orderID), 10)] = orderMapArgs
+		orderIDsArgs[strconv.FormatInt(int64(orderID), 10)] = orderMapArgs
 	}
-	for i, args := range orderIDsArgs {
-		if len(args) == 0 {
-			delete(orderIDsArgs, i)
-		}
+	readParam[0] = antidote.ReadObjectParams{
+		KeyParams: antidote.KeyParams{Key: tableNames[3], CrdtType: proto.CRDTType_RRMAP, Bucket: "bkt"},
+		ReadArgs:  crdt.EmbMapPartialArguments{Args: orderIDsArgs},
 	}
-
-	/*
-		readProto := antidote.CreateStaticRead(nil, []antidote.ReadObjectParams{}, readParam)
-		antidote.SendProto(antidote.StaticRead, readProto, conn)
-		_, replyProto, _ = antidote.ReceiveProto(conn)
-		ordersMapState := crdt.ReadRespProtoToAntidoteState(
-			replyProto.(*proto.ApbStaticReadObjectsResp).GetObjects().GetObjects()[0], proto.CRDTType_RRMAP, proto.READType_GET_VALUES).(crdt.EmbMapEntryState)
-	*/
-	replies := sendReceiveBucketReadProtos(readParams)
-	orderStates := mergeMapReplies(replies)
+	readProto := antidote.CreateStaticRead(nil, []antidote.ReadObjectParams{}, readParam)
+	antidote.SendProto(antidote.StaticRead, readProto, conn)
+	_, replyProto, _ = antidote.ReceiveProto(conn)
+	ordersMapState := crdt.ReadRespProtoToAntidoteState(
+		replyProto.(*proto.ApbStaticReadObjectsResp).GetObjects().GetObjects()[0], proto.CRDTType_RRMAP, proto.READType_GET_VALUES).(crdt.EmbMapEntryState)
 
 	customerIDs := make([]int32, 100, 100)
 	mapCustomerIDs := make(map[int32]struct{})
@@ -1761,8 +1450,7 @@ func sendQ18(conn net.Conn) {
 	var int32CustomerID int32
 	written = 0
 	for _, orderID := range orderIDs {
-		//currCustomerID, _ = strconv.ParseInt(ordersMapState.States[strconv.FormatInt(int64(orderID), 10)].(crdt.EmbMapEntryState).States[orderCustKey].(crdt.RegisterState).Value.(string), 10, 32)
-		currCustomerID, _ = strconv.ParseInt(orderStates[strconv.FormatInt(int64(orderID), 10)].States[orderCustKey].(crdt.RegisterState).Value.(string), 10, 32)
+		currCustomerID, _ = strconv.ParseInt(ordersMapState.States[strconv.FormatInt(int64(orderID), 10)].(crdt.EmbMapEntryState).States[orderCustKey].(crdt.RegisterState).Value.(string), 10, 32)
 		int32CustomerID = int32(currCustomerID)
 		_, has := mapCustomerIDs[int32CustomerID]
 		if !has {
@@ -1782,32 +1470,18 @@ func sendQ18(conn net.Conn) {
 
 	cName := headers[CUSTOMER][1]
 	orderMapArgs = crdt.EmbMapPartialArguments{Args: map[string]crdt.ReadArguments{cName: registerArgs}}
-	/*
-		orderIDsArgs = make(map[string]crdt.ReadArguments)
-		for _, custID := range customerIDs {
-			orderIDsArgs[strconv.FormatInt(int64(custID), 10)] = orderMapArgs
-		}
-		readParam[0] = antidote.ReadObjectParams{
-			KeyParams: antidote.KeyParams{Key: tableNames[3], CrdtType: proto.CRDTType_RRMAP, Bucket: "bkt"},
-			ReadArgs:  crdt.EmbMapPartialArguments{Args: orderIDsArgs},
-		}
-
-		_, replyProto, _ = antidote.ReceiveProto(conn)
-		custMapState := crdt.ReadRespProtoToAntidoteState(
-			replyProto.(*proto.ApbStaticReadObjectsResp).GetObjects().GetObjects()[0], proto.CRDTType_RRMAP, proto.READType_GET_VALUES).(crdt.EmbMapEntryState)
-	*/
-	readParams, orderIDsArgs = getReadArgsPerBucket(CUSTOMER)
+	orderIDsArgs = make(map[string]crdt.ReadArguments)
 	for _, custID := range customerIDs {
-		custID64 := int64(custID)
-		orderIDsArgs[procTables.CustkeyToRegionkey(custID64)][strconv.FormatInt(custID64, 10)] = orderMapArgs
+		orderIDsArgs[strconv.FormatInt(int64(custID), 10)] = orderMapArgs
 	}
-	for i, args := range orderIDsArgs {
-		if len(args) == 0 {
-			delete(orderIDsArgs, i)
-		}
+	readParam[0] = antidote.ReadObjectParams{
+		KeyParams: antidote.KeyParams{Key: tableNames[3], CrdtType: proto.CRDTType_RRMAP, Bucket: "bkt"},
+		ReadArgs:  crdt.EmbMapPartialArguments{Args: orderIDsArgs},
 	}
-	replies = sendReceiveBucketReadProtos(readParams)
-	custStates := mergeMapReplies(replies)
+
+	_, replyProto, _ = antidote.ReceiveProto(conn)
+	custMapState := crdt.ReadRespProtoToAntidoteState(
+		replyProto.(*proto.ApbStaticReadObjectsResp).GetObjects().GetObjects()[0], proto.CRDTType_RRMAP, proto.READType_GET_VALUES).(crdt.EmbMapEntryState)
 
 	fmt.Printf("Q18 top 100 customers for large quantity orders with quantity above %d\n", rndQuantity)
 	nPrinted := 0
@@ -1816,9 +1490,9 @@ func sendQ18(conn net.Conn) {
 		if pair.GetScore() < rndQuantity {
 			break
 		}
-		order = orderStates[strconv.FormatInt(int64(pair.GetPlayerId()), 10)].States
+		order = ordersMapState.States[strconv.FormatInt(int64(pair.GetPlayerId()), 10)].(crdt.EmbMapEntryState).States
 		currCustomerID, _ = strconv.ParseInt(order[orderCustKey].(crdt.RegisterState).Value.(string), 10, 32)
-		customer = custStates[strconv.FormatInt(currCustomerID, 10)].States
+		customer = custMapState.States[strconv.FormatInt(currCustomerID, 10)].(crdt.EmbMapEntryState).States
 		fmt.Printf("%s | %d | %d | %s | %s | %d\n",
 			customer[cName], currCustomerID, pair.GetPlayerId(), order[orderDate], order[orderTotalPrice], pair.GetScore())
 		nPrinted++
@@ -1843,68 +1517,6 @@ func sendQ18(conn net.Conn) {
 		}
 	*/
 }
-
-func getReadArgsPerBucket(tableIndex int) (readParams map[int8]antidote.ReadObjectParams, args map[int8]map[string]crdt.ReadArguments) {
-	args = make(map[int8]map[string]crdt.ReadArguments)
-	var i, regionLen int8 = 0, int8(len(procTables.Regions))
-	readParams = make(map[int8]antidote.ReadObjectParams)
-	for ; i < regionLen; i++ {
-		args[i] = make(map[string]crdt.ReadArguments)
-		readParams[i] = antidote.ReadObjectParams{
-			KeyParams: antidote.KeyParams{Key: tableNames[tableIndex], CrdtType: proto.CRDTType_RRMAP, Bucket: buckets[i]},
-			ReadArgs:  crdt.EmbMapPartialArguments{Args: args[i]},
-		}
-	}
-	return
-}
-
-//Always sends to the first replica
-func sendReceiveReadObjsProto(fullReads []antidote.ReadObjectParams) (replyProto *proto.ApbStaticReadObjectsResp) {
-	antidote.SendProto(antidote.StaticReadObjs, antidote.CreateStaticReadObjs(nil, fullReads), conns[0])
-	_, tmpProto, _ := antidote.ReceiveProto(conns[0])
-	return tmpProto.(*proto.ApbStaticReadObjectsResp)
-}
-
-//Always sends to the first replica
-func sendReceiveReadProto(fullReads []antidote.ReadObjectParams, partReads []antidote.ReadObjectParams) (replyProto *proto.ApbStaticReadObjectsResp) {
-	antidote.SendProto(antidote.StaticRead, antidote.CreateStaticRead(nil, fullReads, partReads), conns[0])
-	_, tmpProto, _ := antidote.ReceiveProto(conns[0])
-	return tmpProto.(*proto.ApbStaticReadObjectsResp)
-}
-
-//Note: assumes only partial reads, for simplicity
-func sendReceiveBucketReadProtos(partReads map[int8]antidote.ReadObjectParams) (replyProtos map[int8]*proto.ApbStaticReadObjectsResp) {
-	fullR := []antidote.ReadObjectParams{}
-	for i, partR := range partReads {
-		fmt.Println("Sending read to", i, partR)
-		antidote.SendProto(antidote.StaticRead, antidote.CreateStaticRead(nil, fullR, []antidote.ReadObjectParams{partR}), conns[i])
-	}
-	replyProtos = make(map[int8]*proto.ApbStaticReadObjectsResp)
-	//Note: this receiving of replies could be optimized
-	for i, _ := range partReads {
-		//fmt.Println("Receiving reply from", i)
-		_, replyProto, _ := antidote.ReceiveProto(conns[i])
-		replyProtos[i] = replyProto.(*proto.ApbStaticReadObjectsResp)
-		//fmt.Println("Reply received:", replyProtos[i].GetObjects().GetObjects())
-	}
-	return
-}
-
-//Could be more generic as long as it is reasonable to return state instead of crdt.EmbMapEntryState
-func mergeMapReplies(replies map[int8]*proto.ApbStaticReadObjectsResp) (merged map[string]crdt.EmbMapEntryState) {
-	merged = make(map[string]crdt.EmbMapEntryState)
-	for _, reply := range replies {
-		bktState := crdt.ReadRespProtoToAntidoteState(reply.GetObjects().GetObjects()[0],
-			proto.CRDTType_RRMAP, proto.READType_GET_VALUES).(crdt.EmbMapEntryState)
-		fmt.Println(bktState)
-		for keyS, state := range bktState.States {
-			merged[keyS] = state.(crdt.EmbMapEntryState)
-		}
-	}
-	return
-}
-
-/////*********** OTHERS **********/////
 
 func collectDataStatistics() {
 	nationsToRegion := make(map[int8]int8)
@@ -2042,43 +1654,4 @@ func debugMemory() {
 		*/
 		time.Sleep(1000 * time.Millisecond)
 	}
-}
-
-/**********BUCKET CHOOSER HELPERS**********/
-
-//Funcs for deciding bucket for partial replication
-
-func custToRegion(obj []string) int8 {
-	nationKey, _ := strconv.ParseInt(obj[C_NATIONKEY], 10, 8)
-	return procTables.NationkeyToRegionkey(nationKey)
-}
-
-func lineitemToRegion(obj []string) int8 {
-	suppKey, _ := strconv.ParseInt(obj[L_SUPPKEY], 10, 32)
-	return procTables.SuppkeyToRegionkey(suppKey)
-}
-
-func nationToRegion(obj []string) int8 {
-	nationKey, _ := strconv.ParseInt(obj[C_NATIONKEY], 10, 8)
-	return procTables.NationkeyToRegionkey(nationKey)
-}
-
-func ordersToRegion(obj []string) int8 {
-	custKey, _ := strconv.ParseInt(obj[O_CUSTKEY], 10, 32)
-	return procTables.CustkeyToRegionkey(custKey)
-}
-
-func partSuppToRegion(obj []string) int8 {
-	suppKey, _ := strconv.ParseInt(obj[PS_SUPPKEY], 10, 32)
-	return procTables.SuppkeyToRegionkey(suppKey)
-}
-
-func regionToRegion(obj []string) int8 {
-	regionKey, _ := strconv.ParseInt(obj[R_REGIONKEY], 10, 8)
-	return int8(regionKey)
-}
-
-func supplierToRegion(obj []string) int8 {
-	nationKey, _ := strconv.ParseInt(obj[S_NATIONKEY], 10, 8)
-	return procTables.NationkeyToRegionkey(nationKey)
 }
