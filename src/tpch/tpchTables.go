@@ -1,8 +1,9 @@
-package main
+package tpch
 
 import (
 	"fmt"
 	"strconv"
+	"strings"
 	"time"
 )
 
@@ -10,10 +11,13 @@ import (
 
 const (
 	CUSTOMER, LINEITEM, NATION, ORDERS, PART, PARTSUPP, REGION, SUPPLIER = 0, 1, 2, 3, 4, 5, 6, 7
+	PROMO                                                                = "PROMO"
 )
 
 //TODO: Might be wise to extend all (or at least customer/orders) with REGIONKEY for faster acessing REGIONKEY when doing queries
 //Alternativelly, a map of key -> regionKey would also work just fine
+
+//Might also be worth investigating if some of those types can't be downgraded to smaller bytesizes. Specially in lineitem
 
 type Customer struct {
 	C_CUSTKEY    int32
@@ -31,7 +35,7 @@ type LineItem struct {
 	L_PARTKEY       int32
 	L_SUPPKEY       int32
 	L_LINENUMBER    int8
-	L_QUANTITY      int32
+	L_QUANTITY      int8
 	L_EXTENDEDPRICE float64
 	L_DISCOUNT      float64
 	L_TAX           string
@@ -101,11 +105,12 @@ type Supplier struct {
 }
 
 //For Customers, Suppliers and Parts the first entry is empty in order for the ID to match the position in the array
-//Orders and LineItems use special position. Always use GetOrder/LineItemIndex() methods to access them
+//Orders and LineItems (on 1st position) use special positioning. Always use GetOrder() method to access them
+//LineItems use double position. The first index is order (the one with special positioning), the second is the linenumber.
 //PartSupps has no easy indexing for now. Nations/Regions use 0-n and so do their IDs.
 type Tables struct {
 	Customers         []*Customer
-	LineItems         []*LineItem
+	LineItems         [][]*LineItem
 	Nations           []*Nation
 	Orders            []*Orders
 	Parts             []*Part
@@ -127,6 +132,11 @@ type Tables struct {
 	Prepositions []string
 	Auxiliaries  []string
 	Terminators  []rune
+	//Latest added orders and lineitems. May be nil if no upds besides the initial data loading have been done
+	LastAddedOrders    []*Orders
+	LastAddedLineItems [][]*LineItem
+	//Index helpers
+	PromoParts map[int32]struct{}
 }
 
 //*****Auxiliary data types*****//
@@ -138,7 +148,7 @@ type Date struct {
 }
 
 //returns true if the caller is higher than the argument
-func (date *Date) isHigher(otherDate *Date) bool {
+func (date *Date) isHigherOrEqual(otherDate *Date) bool {
 	if date.YEAR > otherDate.YEAR {
 		return true
 	}
@@ -156,7 +166,7 @@ func (date *Date) isHigher(otherDate *Date) bool {
 	if date.DAY > otherDate.DAY {
 		return true
 	}
-	return false
+	return true
 }
 
 func (date *Date) isSmallerOrEqual(otherDate *Date) bool {
@@ -198,6 +208,7 @@ func CreateClientTables(rawData [][][]string) (tables *Tables) {
 		MaxOrderLineitems: maxOrderLineitems,
 		Segments:          createSegmentsList(),
 	}
+	tables.PromoParts = calculatePromoParts(tables.Parts)
 	endTime := time.Now().UnixNano() / 1000000
 	fmt.Println("Time taken to process tables:", endTime-startTime, "ms")
 	return
@@ -224,23 +235,80 @@ func createCustomerTable(cTable [][]string) (customers []*Customer) {
 	return
 }
 
+func createLineitemTable(liTable [][]string, nOrders int) (lineItems [][]*LineItem, maxLineItem int32) {
+	fmt.Println("Creating lineItem table")
+	maxLineItem = 8
+
+	lineItems = make([][]*LineItem, nOrders)
+	bufItems := make([]*LineItem, maxLineItem+1)
+	var newLine []*LineItem
+
+	var partKey, orderKey, suppKey, lineNumber, quantity int64
+	var convLineNumber int8
+	var convOrderKey int32
+	var extendedPrice, discount float64
+	bufI, bufOrder, currOrderID := 0, 0, int32(1)
+	for _, entry := range liTable {
+		//Create lineitem
+		orderKey, _ = strconv.ParseInt(entry[0], 10, 32)
+		partKey, _ = strconv.ParseInt(entry[1], 10, 32)
+		suppKey, _ = strconv.ParseInt(entry[2], 10, 32)
+		lineNumber, _ = strconv.ParseInt(entry[3], 10, 8)
+		quantity, _ = strconv.ParseInt(entry[4], 10, 8)
+		convLineNumber, convOrderKey = int8(lineNumber), int32(orderKey)
+		extendedPrice, _ = strconv.ParseFloat(entry[5], 32)
+		discount, _ = strconv.ParseFloat(entry[6], 32)
+
+		bufItems[bufI] = &LineItem{
+			L_ORDERKEY:      convOrderKey,
+			L_PARTKEY:       int32(partKey),
+			L_SUPPKEY:       int32(suppKey),
+			L_LINENUMBER:    convLineNumber,
+			L_QUANTITY:      int8(quantity),
+			L_EXTENDEDPRICE: extendedPrice,
+			L_DISCOUNT:      discount,
+			L_TAX:           entry[7],
+			L_RETURNFLAG:    entry[8],
+			L_LINESTATUS:    entry[9],
+			L_SHIPDATE:      createDate(entry[10]),
+			L_COMMITDATE:    entry[11],
+			L_RECEIPTDATE:   entry[12],
+			L_SHIPINSTRUCT:  entry[13],
+			L_SHIPMODE:      entry[14],
+			L_COMMENT:       entry[15],
+		}
+
+		//Check if it belongs to a new order
+		if convOrderKey != currOrderID {
+			//Add everything in the buffer apart from the new one to the table
+			newLine = make([]*LineItem, bufI)
+			for k, item := range bufItems[:bufI] {
+				newLine[k] = item
+			}
+			lineItems[bufOrder] = newLine
+			bufOrder++
+			bufItems[0] = bufItems[bufI]
+			currOrderID = convOrderKey
+			bufI = 0
+		}
+
+		bufI++
+	}
+
+	//Last order
+	newLine = make([]*LineItem, bufI)
+	for k, item := range bufItems[:bufI] {
+		newLine[k] = item
+	}
+	lineItems[bufOrder] = newLine
+	return
+}
+
+/*
 func createLineitemTable(liTable [][]string, nOrders int) (lineItems []*LineItem, maxLineItem int32) {
 	fmt.Println("Creating lineItem table")
-	/*
-		//First discover what is the max number of items an order can have
-		max := liTable[0][3]
-		for _, entry := range liTable {
-			if entry[3] > max {
-				max = entry[3]
-			}
-		}
-		max64, _ := strconv.ParseInt(max, 10, 32)
-		maxLineItem = int32(max64)
-	*/
 	maxLineItem = 8
-	//TODO: If this max is the same accross SFs, then we can just hardcode it
 
-	//TODO: Remove +100
 	nEntries := int32(nOrders)*maxLineItem + maxLineItem + 1 + 100 //Leave one extra empty entry at the end for easier access via order
 	lineItems = make([]*LineItem, nEntries, nEntries)
 	var partKey, orderKey, suppKey, lineNumber, quantity int64
@@ -253,7 +321,7 @@ func createLineitemTable(liTable [][]string, nOrders int) (lineItems []*LineItem
 		partKey, _ = strconv.ParseInt(entry[1], 10, 32)
 		suppKey, _ = strconv.ParseInt(entry[2], 10, 32)
 		lineNumber, _ = strconv.ParseInt(entry[3], 10, 8)
-		quantity, _ = strconv.ParseInt(entry[4], 10, 32)
+		quantity, _ = strconv.ParseInt(entry[4], 10, 8)
 		convLineNumber, convOrderKey = int8(lineNumber), int32(orderKey)
 		extendedPrice, _ = strconv.ParseFloat(entry[5], 32)
 		discount, _ = strconv.ParseFloat(entry[6], 32)
@@ -264,7 +332,7 @@ func createLineitemTable(liTable [][]string, nOrders int) (lineItems []*LineItem
 			L_PARTKEY:       int32(partKey),
 			L_SUPPKEY:       int32(suppKey),
 			L_LINENUMBER:    convLineNumber,
-			L_QUANTITY:      int32(quantity),
+			L_QUANTITY:      int8(quantity),
 			L_EXTENDEDPRICE: extendedPrice,
 			L_DISCOUNT:      discount,
 			L_TAX:           entry[7],
@@ -280,6 +348,7 @@ func createLineitemTable(liTable [][]string, nOrders int) (lineItems []*LineItem
 	}
 	return
 }
+*/
 
 func createNationTable(nTable [][]string) (nations []*Nation) {
 	fmt.Println("Creating nation table")
@@ -397,6 +466,16 @@ func createSupplierTable(sTable [][]string) (suppliers []*Supplier) {
 	return
 }
 
+func calculatePromoParts(parts []*Part) (inPromo map[int32]struct{}) {
+	inPromo = make(map[int32]struct{})
+	for _, part := range parts[1:] {
+		if strings.HasPrefix(part.P_TYPE, PROMO) {
+			inPromo[part.P_PARTKEY] = struct{}{}
+		}
+	}
+	return
+}
+
 func GetOrderIndex(orderKey int32) (indexKey int32) {
 	//1 -> 7: 1 -> 7
 	//9 -> 15: 1 -> 7
@@ -407,6 +486,7 @@ func GetOrderIndex(orderKey int32) (indexKey int32) {
 	return orderKey%8 + 8*(orderKey/32)
 }
 
+/*
 func GetLineitemIndex(lineitemKey int8, orderKey int32, maxLineitem int32) (indexKey int32) {
 	//Same idea as in getOrderIndex but... we need to find a way to manage with multiple keys
 	//Note that delete deletes a whole order so all of the lineitems of that order get deleted.
@@ -432,6 +512,7 @@ func GetLineitemIndex(lineitemKey int8, orderKey int32, maxLineitem int32) (inde
 	//return (lineKey % (maxLineitem + 1)) + ((maxLineitem * (orderKey - 1)) % (maxLineitem * 8)) + maxLineitem*8*(orderKey/32)
 	return (lineKey % (maxLineitem + 1)) + ((maxLineitem * (orderKey)) % (maxLineitem * 8)) + maxLineitem*8*(orderKey/32)
 }
+*/
 
 func createDate(stringDate string) (date *Date) {
 	yearS, monthS, dayS := stringDate[0:4], stringDate[5:7], stringDate[8:10]
@@ -448,6 +529,72 @@ func createDate(stringDate string) (date *Date) {
 func createSegmentsList() []string {
 	return []string{"AUTOMOBILE", "BUILDING", "FURNITURE", "MACHINERY", "HOUSEHOLD"}
 }
+
+func (tab *Tables) UpdateOrderLineitems(order [][]string, lineItems [][]string) {
+	//Just call createOrder and createLineitem and store them
+	tab.LastAddedOrders = createOrdersTable(order)
+	tab.LastAddedLineItems, _ = createLineitemTable(lineItems, len(order)+1)
+}
+
+/*
+func (tab *Tables) UpdateOrderLineitems(order []string, lineItems [][]string) (orderObj *Orders,
+	lineItemsObjs []*LineItem) {
+	//Order
+	orderKey, _ := strconv.ParseInt(order[0], 10, 32)
+	custKey, _ := strconv.ParseInt(order[1], 10, 32)
+	orderKey32 := int32(orderKey)
+	orderObj = &Orders{
+		O_ORDERKEY:      orderKey32,
+		O_CUSTKEY:       int32(custKey),
+		O_ORDERSTATUS:   order[2],
+		O_TOTALPRICE:    order[3],
+		O_ORDERDATE:     createDate(order[4]),
+		O_ORDERPRIORITY: order[5],
+		O_CLERK:         order[6],
+		O_SHIPPRIORITY:  order[7],
+		O_COMMENT:       order[8],
+	}
+	tab.Orders[GetOrderIndex(orderKey32)] = orderObj
+
+	//Lineitems
+	lineItemsObjs = make([]*LineItem, len(lineItems))
+	lineIndex := GetLineitemIndex(1, orderKey32, tab.MaxOrderLineitems)
+	var partKey, suppKey, lineNumber, quantity int64
+	var extendedPrice, discount float64
+	var convLineNumber int8
+	for i, item := range lineItems {
+		partKey, _ = strconv.ParseInt(item[1], 10, 32)
+		suppKey, _ = strconv.ParseInt(item[2], 10, 32)
+		lineNumber, _ = strconv.ParseInt(item[3], 10, 8)
+		quantity, _ = strconv.ParseInt(item[4], 10, 8)
+		convLineNumber = int8(lineNumber)
+		extendedPrice, _ = strconv.ParseFloat(item[5], 32)
+		discount, _ = strconv.ParseFloat(item[6], 32)
+
+		lineItemsObjs[i] = &LineItem{
+			L_ORDERKEY:      orderKey32,
+			L_PARTKEY:       int32(partKey),
+			L_SUPPKEY:       int32(suppKey),
+			L_LINENUMBER:    convLineNumber,
+			L_QUANTITY:      int8(quantity),
+			L_EXTENDEDPRICE: extendedPrice,
+			L_DISCOUNT:      discount,
+			L_TAX:           item[7],
+			L_RETURNFLAG:    item[8],
+			L_LINESTATUS:    item[9],
+			L_SHIPDATE:      createDate(item[10]),
+			L_COMMITDATE:    item[11],
+			L_RECEIPTDATE:   item[12],
+			L_SHIPINSTRUCT:  item[13],
+			L_SHIPMODE:      item[14],
+			L_COMMENT:       item[15],
+		}
+		tab.LineItems[lineIndex] = lineItemsObjs[i]
+		lineIndex++
+	}
+	return
+}
+*/
 
 func (tab *Tables) InitConstants() {
 	tab.Segments = createSegmentsList()
@@ -494,6 +641,10 @@ func (tab *Tables) SuppkeyToRegionkey(suppKey int64) int8 {
 }
 
 func (tab *Tables) CustkeyToRegionkey(custKey int64) int8 {
+	return tab.Nations[tab.Customers[custKey].C_NATIONKEY].N_REGIONKEY
+}
+
+func (tab *Tables) Custkey32ToRegionkey(custKey int32) int8 {
 	return tab.Nations[tab.Customers[custKey].C_NATIONKEY].N_REGIONKEY
 }
 

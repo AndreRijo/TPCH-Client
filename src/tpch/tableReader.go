@@ -1,4 +1,4 @@
-package tpchTools
+package tpch
 
 import (
 	"bufio"
@@ -107,26 +107,23 @@ func processHeaderLine(line string, headers [][]string, toRead [][]int8, keys []
 
 //File order: orders, lineitem, delete
 //fileLocs and nEntries are required for the 3 files. nParts is only required for the first two.
-func ReadUpdates(fileLocs []string, nEntries []int, nParts []int) (ordersUpds [][]string, lineItemUpds [][]string, deleteKeys []string) {
-	ordersUpds = processUpdFile(fileLocs[0], nEntries[0], nParts[0])
-	lineItemUpds = processUpdFile(fileLocs[1], nEntries[1], nParts[1])
+func ReadUpdates(fileLocs []string, nEntries []int, nParts []int, toRead [][]int8) (ordersUpds [][]string, lineItemUpds [][]string, deleteKeys []string) {
+	ordersUpds = processUpdFile(fileLocs[0], nEntries[0], nParts[0], toRead[0])
+	lineItemUpds = processUpdFile(fileLocs[1], nEntries[1], nParts[1], toRead[1])
 	deleteKeys = processDeleteFile(fileLocs[2], nEntries[2])
 	return
 }
 
-func processUpdFile(fileLoc string, nEntries int, nParts int) (tableUpds [][]string) {
-	//TODO: Updates
-	/*
-		if file, err := getFile(fileLoc); err == nil {
-			defer file.Close()
-			tableUpds = make([][]string, nEntries, nEntries)
-			scanner := bufio.NewScanner(file)
-			i := 0
-			for ; scanner.Scan(); i++ {
-				tableUpds[i] = processLine(scanner.Text(), nParts)
-			}
+func processUpdFile(fileLoc string, nEntries int, nParts int, toRead []int8) (tableUpds [][]string) {
+	if file, err := getFile(fileLoc); err == nil {
+		defer file.Close()
+		tableUpds = make([][]string, nEntries, nEntries)
+		scanner := bufio.NewScanner(file)
+		i := 0
+		for ; scanner.Scan(); i++ {
+			tableUpds[i] = processLine(scanner.Text(), nParts, toRead)
 		}
-	*/
+	}
 	return
 }
 

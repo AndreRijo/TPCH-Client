@@ -10,6 +10,7 @@ import (
 	"os/signal"
 	"proto"
 	"runtime"
+	"runtime/debug"
 	"runtime/pprof"
 	"sort"
 	"strconv"
@@ -21,8 +22,6 @@ import (
 
 	pb "github.com/golang/protobuf/proto"
 )
-
-//TODO: BUG - not all orders get send to the server. Mainly, seems like 50k+ (prob 40k+) doesn't get sent.
 
 /**
 Used:
@@ -64,6 +63,17 @@ With small; VM, disabled, replicaID of 2 bytes intead of 8: 1604MB
 
 //TODO: Possibly support TopK returning results sorted?
 
+//TODO: Lineitems should be replicated both in C_NATIONKEY and S_NATIONKEY
+
+/*
+	Stuff todo:
+	a) lineitems should be replicated in two servers (DONE, but may incour in unecessary updates when running with single replica)
+	b) need to support updates; including updating the indexes
+	c) (not priority) topk should support a list of extra data, which can be implemented as an array of strings or an array of bytes
+	d) Need to support doing queries without index
+	e) Need to measure overhead of doing updates with indexes.
+*/
+
 type QueuedMsg struct {
 	pb.Message
 	code byte
@@ -75,19 +85,34 @@ type Channels struct {
 	dataChans     []chan QueuedMsg
 }
 
+type ExecutionTimes struct {
+	startTime          int64
+	header             int64
+	read               int64
+	clientTables       int64
+	prepareDataProtos  int64
+	sendDataProtos     []int64
+	prepareIndexProtos []int64
+	sendIndexProtos    int64
+	totalData          int64
+	totalIndex         int64
+	queries            []int64
+	totalQueries       int64
+	finishTime         int64
+}
+
 const (
 	cpuProfileLoc = "../../profiles/cpu.prof"
-	memProfileLoc = "../../profiles/mem.cpu"
+	memProfileLoc = "../../profiles/mem.prof"
 
-	tableFolder = "/Users/a.rijo/Documents/University_6th_year/potionDB docs/2.18.0_rc2/tables/0.01SF/"
-	headerLoc   = "/Users/a.rijo/Documents/University_6th_year/potionDB docs/tpc_h/tpch_headers_small.txt"
-	updFolder   = "/Users/a.rijo/Documents/University_6th_year/potionDB docs/2.18.0_rc2/upds/0.01SF/"
+	tableFolder = "/Users/a.rijo/Documents/University_6th_year/potionDB docs/2.18.0_rc2/tables/0.1SF/"
+	headerLoc   = "/Users/a.rijo/Documents/University_6th_year/potionDB docs/tpc_h/tpch_headers_min.txt"
+	updFolder   = "/Users/a.rijo/Documents/University_6th_year/potionDB docs/2.18.0_rc2/upds/0.1SF/"
 
-	scaleFactor                                   = 0.01
+	scaleFactor                                   = 0.1
 	tableExtension, updExtension, deleteExtension = ".tbl", ".tbl.u1", ".1"
 	maxUpdSize                                    = 2000 //Max number of entries for a single upd msg. To avoid sending the whole table in one request...
 
-	//TODO: Think about buckets
 	bucket          = "bkt"
 	headerOrders    = 3
 	headerLineItems = 1
@@ -101,11 +126,13 @@ const (
 	LARGE_ORDERS     = "q18lo"
 	SEGM_DELAY       = "q3sd"
 
-	QUEUE_COMPLETE  = byte(255)
-	MAX_BUFF_PROTOS = 50
+	QUEUE_COMPLETE    = byte(255)
+	MAX_BUFF_PROTOS   = 50
+	QUERY_WAIT        = 1000
+	FORCE_PROTO_CLEAN = 1000
 
-	C_NATIONKEY, L_SUPPKEY, N_REGIONKEY, O_CUSTKEY, PS_SUPPKEY, S_NATIONKEY, R_REGIONKEY = 3, 2, 2, 1, 1, 3, 0
-	PART_BKT, INDEX_BKT                                                                  = 5, 6
+	C_NATIONKEY, L_SUPPKEY, L_ORDERKEY, N_REGIONKEY, O_CUSTKEY, PS_SUPPKEY, S_NATIONKEY, R_REGIONKEY = 3, 2, 0, 2, 1, 1, 3, 0
+	PART_BKT, INDEX_BKT                                                                              = 5, 6
 )
 
 var (
@@ -113,9 +140,11 @@ var (
 	tableNames = [...]string{"customer", "lineItem", "nation", "orders", "part", "partsupp", "region", "supplier"}
 	//The lineItem table number of entries must be changed manually, as it is not a direct relation with SF.
 	//6001215
+	//2999668
+	//1800093
 	//600572
 	//60175
-	tableEntries = [...]int{150000, 60175, 25, 1500000, 200000, 800000, 5, 10000}
+	tableEntries = [...]int{150000, 600572, 25, 1500000, 200000, 800000, 5, 10000}
 	tableParts   = [...]int{8, 16, 4, 9, 9, 5, 3, 7}
 	tableUsesSF  = [...]bool{true, false, false, true, true, true, false, true}
 	updsNames    = [...]string{"orders", "lineitem", "delete"}
@@ -128,8 +157,8 @@ var (
 		updFolder + updsNames[2] + deleteExtension}
 
 	//servers = []string{"127.0.0.1:8087"}
-	servers = []string{"127.0.0.1:8087", "127.0.0.1:8087", "127.0.0.1:8087", "127.0.0.1:8087", "127.0.0.1:8087"}
-	//servers = []string{"127.0.0.1:8087", "127.0.0.1:8088", "127.0.0.1:8089", "127.0.0.1:8090", "127.0.0.1:8091"}
+	//servers = []string{"127.0.0.1:8087", "127.0.0.1:8087", "127.0.0.1:8087", "127.0.0.1:8087", "127.0.0.1:8087"}
+	servers = []string{"127.0.0.1:8087", "127.0.0.1:8088", "127.0.0.1:8089", "127.0.0.1:8090", "127.0.0.1:8091"}
 
 	//Just for debugging
 	nProtosSent = 0
@@ -141,9 +170,10 @@ var (
 	read       [][]int8 //Positions in tables that actually have values
 	procTables *Tables
 
-	//Note: nil corresponds to Part, which isn't associated to any nation/region
-	regionFuncs = [...]func([]string) int8{custToRegion, lineitemToRegion, nationToRegion, ordersToRegion,
+	//Note: Part isn't partitioned and lineItem uses multiRegionFunc
+	regionFuncs = [...]func([]string) int8{custToRegion, nil, nationToRegion, ordersToRegion,
 		nil, partSuppToRegion, regionToRegion, supplierToRegion}
+	multiRegionFunc = [...]func([]string) []int8{nil, lineitemToRegion, nil, nil, nil, nil, nil, nil}
 
 	//Queues to send data
 	//dataQueue  = make(chan QueuedMsg, MAX_BUFF_PROTOS)
@@ -160,6 +190,12 @@ var (
 		prepSendChan:  make(chan int, 10),
 		dataChans: []chan QueuedMsg{make(chan QueuedMsg, MAX_BUFF_PROTOS), make(chan QueuedMsg, MAX_BUFF_PROTOS),
 			make(chan QueuedMsg, MAX_BUFF_PROTOS), make(chan QueuedMsg, MAX_BUFF_PROTOS), make(chan QueuedMsg, MAX_BUFF_PROTOS)},
+	}
+
+	times = ExecutionTimes{
+		sendDataProtos:     make([]int64, len(servers)),
+		prepareIndexProtos: make([]int64, 6),
+		queries:            make([]int64, 6),
 	}
 )
 
@@ -191,7 +227,21 @@ func main() {
 */
 
 func main() {
-	rand.Seed(time.Now().UnixNano())
+	go debugMemory()
+	go func() {
+		i := int64(10)
+		for {
+			time.Sleep(10000 * time.Millisecond)
+			file, _ := os.Create(memProfileLoc + strconv.FormatInt(i, 10))
+			defer file.Close()
+			pprof.WriteHeapProfile(file)
+			i += 10
+		}
+	}()
+
+	startTime := time.Now().UnixNano()
+	rand.Seed(startTime)
+	times.startTime = startTime
 	readHeaders()
 
 	for i := range channels.dataChans {
@@ -217,7 +267,8 @@ func readHeaders() {
 	startTime := time.Now().UnixNano() / 1000000
 	headers, keys, read = tpchTools.ReadHeaders(headerLoc, len(tableNames))
 	finishTime := time.Now().UnixNano() / 1000000
-	fmt.Println("Time taken for reading headers:", finishTime-startTime, "ms")
+	times.header = finishTime - startTime
+	//fmt.Println("Time taken for reading headers:", finishTime-startTime, "ms")
 }
 
 func handleTables() {
@@ -228,12 +279,13 @@ func handleTables() {
 	readProcessSendTable(SUPPLIER)
 	readProcessSendTable(CUSTOMER)
 	//Order is irrelevant now
-	readProcessSendTable(PARTSUPP)
 	readProcessSendTable(ORDERS)
 	readProcessSendTable(LINEITEM)
+	readProcessSendTable(PARTSUPP)
 	readProcessSendTable(PART)
 	finishTime := time.Now().UnixNano() / 1000000
-	fmt.Println("Time taken to read tables:", finishTime-startTime, "ms")
+	times.read = finishTime - startTime
+	//fmt.Println("Time taken to read tables:", finishTime-startTime, "ms")
 }
 
 func readProcessSendTable(i int) {
@@ -272,14 +324,8 @@ func handleTableProcessing() {
 		}
 		channels.prepSendChan <- i
 	}
+	times.clientTables = (time.Now().UnixNano() - times.startTime) / 1000000
 	fmt.Println("Finished creating all tables")
-	maxOrder := int32(0)
-	for _, order := range procTables.Orders {
-		if order != nil && order.O_ORDERKEY > maxOrder {
-			maxOrder = order.O_ORDERKEY
-		}
-	}
-	fmt.Println("MAX ORDER:", maxOrder)
 	//Now we can start preparing the indexes
 	prepareIndexesToSend()
 }
@@ -291,10 +337,14 @@ func handlePrepareSend() {
 		fmt.Println("Preparing protos", tableNames[i], i)
 		if i == PART {
 			prepareSendAny(i)
+		} else if i == LINEITEM {
+			prepareSendMultiplePartitioned(i)
 		} else {
 			prepareSendPartitioned(i)
 		}
+		runtime.GC()
 	}
+	times.prepareDataProtos = (time.Now().UnixNano() - times.startTime) / 1000000
 	fmt.Println("Finished preparing protos for all tables")
 	for _, channel := range channels.dataChans {
 		channel <- QueuedMsg{code: QUEUE_COMPLETE}
@@ -334,17 +384,24 @@ func handleServerCommV2(connIndex int) {
 		if msg.code == QUEUE_COMPLETE {
 			complete = true
 		} else {
-			fmt.Println("Sending proto", i)
+			//fmt.Println("Sending proto", i)
 			antidote.SendProto(msg.code, msg.Message, conn)
-			fmt.Println("Receiving proto", i)
+			//fmt.Println("Receiving proto", i)
 			antidote.ReceiveProto(conn)
-			fmt.Println("Proto received", i)
+			//fmt.Println("Proto received", i)
 			i++
+			if i%FORCE_PROTO_CLEAN == 0 {
+				fmt.Println("Sent data proto number", i)
+				if connIndex == 0 {
+					runtime.GC()
+				}
+			}
 		}
 	}
 	fmt.Println("All data protos for server", servers[connIndex], "have been sent.")
 	end := time.Now().UnixNano() / 1000000
-	fmt.Printf("Time to send dataProtos for %d: %d\n", connIndex, end-start)
+	times.sendDataProtos[connIndex] = end - start
+	//fmt.Printf("Time to send dataProtos for %d: %d\n", connIndex, end-start)
 
 	if connIndex == 0 {
 		handleIndexComm()
@@ -379,104 +436,14 @@ func handleIndexComm() {
 	antidote.ReceiveProto(conn)
 	fmt.Println("All index protos have been sent.")
 	end := time.Now().UnixNano() / 1000000
-	fmt.Println("Time taken to send index protos: ", end-start)
+	times.sendIndexProtos = end - start
+	times.totalData = end - times.startTime/1000000
+	//fmt.Println("Time taken to send index protos: ", end-start)
 
 	runtime.GC()
+	debug.FreeOSMemory()
 	sendQueries(conn)
 }
-
-/*
-func handleServerComm() {
-	conn, err := net.Dial("tcp", servers[0])
-	tools.CheckErr("Network connection establishment err", err)
-
-	start := time.Now().UnixNano() / 1000000
-	fmt.Println("Starting to send data protos...")
-	complete := false
-	i := 0
-	for !complete {
-		msg := <-dataQueue
-		if msg.code == QUEUE_COMPLETE {
-			complete = true
-		} else {
-			fmt.Println("Sending proto", i)
-			antidote.SendProto(msg.code, msg.Message, conn)
-			fmt.Println("Receiving proto", i)
-			antidote.ReceiveProto(conn)
-			fmt.Println("Proto received", i)
-			i++
-		}
-	}
-	fmt.Println("All data protos have been sent.")
-
-	fmt.Println("Starting to send index protos...")
-	//Start a txn for the indexes
-	startTxn := antidote.CreateStartTransaction(nil)
-	antidote.SendProto(antidote.StartTrans, startTxn, conn)
-	_, txnReplyProto, _ := antidote.ReceiveProto(conn)
-	txnId := txnReplyProto.(*proto.ApbStartTransactionResp).GetTransactionDescriptor()
-
-		complete = false
-		for !complete {
-			msg := <-indexQueue
-			if msg.code == QUEUE_COMPLETE {
-				complete = true
-			} else {
-				msg.Message.(*proto.ApbUpdateObjects).TransactionDescriptor = txnId
-				antidote.SendProto(msg.code, msg.Message, conn)
-				antidote.ReceiveProto(conn)
-			}
-		}
-
-	//Commit for indexes
-	commitTxn := antidote.CreateCommitTransaction(txnId)
-	antidote.SendProto(antidote.CommitTrans, commitTxn, conn)
-	antidote.ReceiveProto(conn)
-	fmt.Println("All index protos have been sent.")
-	end := time.Now().UnixNano() / 1000000
-	fmt.Println("Finish: ", end-start)
-
-	runtime.GC()
-	//sendQueries(conn)
-}
-
-/*
-func prepareTablesToSend() {
-	startTime := time.Now().UnixNano() / 1000000
-	for i := 0; i < len(tables); i++ {
-		fmt.Println("Preparing table", tableNames[i])
-		prepareTable(tableNames[i], headers[i], keys[i], tables[i], read[i], dataQueue)
-		fmt.Println("Prepared table", tableNames[i])
-	}
-	//Send msg signalling the end
-	dataQueue <- QueuedMsg{code: QUEUE_COMPLETE}
-	finishTime := time.Now().UnixNano() / 1000000
-	fmt.Println("Time taken for preparing tables to send:", finishTime-startTime, "ms")
-}
-*/
-
-/*
-func prepareTableV2(name string, headers []string, primKeys []int, table [][]string, read []int8, queue chan QueuedMsg) {
-	switch name {
-	case tableNames[CUSTOMER]:
-
-	case tableNames[LINEITEM]:
-
-	case tableNames[NATION]:
-
-	case tableNames[ORDERS]:
-
-	case tableNames[PART]:
-
-	case tableNames[PARTSUPP]:
-
-	case tableNames[REGION]:
-
-	case tableNames[SUPPLIER]:
-
-	}
-}
-*/
 
 func prepareSendPartitioned(tableIndex int) {
 	regionFunc := regionFuncs[tableIndex]
@@ -499,6 +466,41 @@ func prepareSendPartitioned(tableIndex int) {
 		if len(currMap) == maxUpdSize {
 			queueDataProto(currMap, name, buckets[region], channels.dataChans[region])
 			updsPerServer[region] = make(map[string]crdt.UpdateArguments)
+		}
+	}
+
+	for i, leftUpds := range updsPerServer {
+		if len(leftUpds) > 0 {
+			queueDataProto(leftUpds, name, buckets[i], channels.dataChans[i])
+		}
+	}
+	//Clean table
+	tables[tableIndex] = nil
+}
+
+func prepareSendMultiplePartitioned(tableIndex int) {
+	regionFunc := multiRegionFunc[tableIndex]
+
+	updsPerServer := make([]map[string]crdt.UpdateArguments, len(procTables.Regions))
+	for i := range channels.dataChans {
+		updsPerServer[i] = make(map[string]crdt.UpdateArguments)
+	}
+	table, header, primKeys, read, name := tables[tableIndex], headers[tableIndex], keys[tableIndex], read[tableIndex], tableNames[tableIndex]
+
+	var key string
+	var upd *crdt.EmbMapUpdateAll
+	var regions []int8
+	var currMap map[string]crdt.UpdateArguments
+	for _, obj := range table {
+		key, upd = getEntryUpd(header, primKeys, obj, read)
+		regions = regionFunc(obj)
+		for _, reg := range regions {
+			currMap = updsPerServer[reg]
+			currMap[key] = *upd
+			if len(currMap) == maxUpdSize {
+				queueDataProto(currMap, name, buckets[reg], channels.dataChans[reg])
+				updsPerServer[reg] = make(map[string]crdt.UpdateArguments)
+			}
 		}
 	}
 
@@ -627,170 +629,47 @@ func getEntryORMapUpd(headers []string, primKeys []int, table []string, read []i
 /////*********** INDEXES **********/////
 
 func prepareIndexesToSend() {
-	finishTimes := make([]int64, 7)
-	finishTimes[0] = time.Now().UnixNano() / 1000000
-	queries := []int{-1, 3, 5, 11, 14, 15, 18}
+	startTime := time.Now().UnixNano() / 1000000
+	//queries := []int{-1, 3, 5, 11, 14, 15, 18}
 	//TODO: Later consider 6, 10, 2, by this order.
 	fmt.Println("Preparing indexes...")
 	//queueIndex(prepareQ2Index())
 	queueIndex(prepareQ3Index())
-	finishTimes[1] = time.Now().UnixNano() / 1000000
+	times.prepareIndexProtos[0] = time.Now().UnixNano() / 1000000
 	fmt.Println("Index Q3 OK")
 	queueIndex(prepareQ5Index())
-	finishTimes[2] = time.Now().UnixNano() / 1000000
+	times.prepareIndexProtos[1] = time.Now().UnixNano() / 1000000
 	fmt.Println("Index Q5 OK")
 	queueIndex(prepareQ11Index())
-	finishTimes[3] = time.Now().UnixNano() / 1000000
+	times.prepareIndexProtos[2] = time.Now().UnixNano() / 1000000
 	fmt.Println("Index Q11 OK")
 	queueIndex(prepareQ14Index())
-	finishTimes[4] = time.Now().UnixNano() / 1000000
+	times.prepareIndexProtos[3] = time.Now().UnixNano() / 1000000
 	fmt.Println("Index Q14 OK")
 	queueIndex(prepareQ15Index())
-	finishTimes[5] = time.Now().UnixNano() / 1000000
+	times.prepareIndexProtos[4] = time.Now().UnixNano() / 1000000
 	fmt.Println("Index Q15 OK")
 	queueIndex(prepareQ18Index())
-	finishTimes[6] = time.Now().UnixNano() / 1000000
+	endTime := time.Now().UnixNano() / 1000000
+	times.prepareIndexProtos[5] = endTime
 	fmt.Println("Index Q18 OK")
+
+	for i := len(times.prepareIndexProtos) - 1; i > 0; i-- {
+		times.prepareIndexProtos[i] -= times.prepareIndexProtos[i-1]
+	}
+	times.prepareIndexProtos[0] -= startTime
+	times.totalIndex = endTime - startTime
 
 	//Signal the end
 	indexQueue <- QueuedMsg{code: QUEUE_COMPLETE}
 
-	fmt.Println("All indexes prepared.")
-	fmt.Println("Total time taken preparing indexes:", finishTimes[6]-finishTimes[0], "ms")
-	for i := 1; i < len(finishTimes); i++ {
-		fmt.Printf("Time taken for Q%d: %d ms\n", queries[i], finishTimes[i]-finishTimes[i-1])
-	}
-}
-
-//TODO: Delete, but keep the comments
-func prepareAndSendIndexes(conn net.Conn, primKeys [][]int) {
-	fmt.Println("Sending indexes...")
 	/*
-		It would help to have the headers also indexed, in order to avoid having to search for each column.
-		I likelly also need to have the tables indexed by primKey?
+		fmt.Println("All indexes prepared.")
+		fmt.Println("Total time taken preparing indexes:", finishTimes[6]-finishTimes[0], "ms")
+		for i := 1; i < len(finishTimes); i++ {
+			fmt.Printf("Time taken for Q%d: %d ms\n", queries[i], finishTimes[i]-finishTimes[i-1])
+		}
 	*/
-	/*
-		c: customer, l: lineItem, n: nation, o: orders, p: part, ps: partsupp, r: region, s: supplier
-	*/
-	/*
-		List of indexes:
-		2.4.1: 	sum: l_quantity, l_extendedprice, l_extendedprice * (1 - l_discount), l_extendedprice * (1-l_discount)*(1+l_tax))
-				avg: l_quantity, l_extendedprice, l_discount
-				All this based on the days (l_shipdate). Possible idea: 1 instance per day and then sum/avg days requested by query?
-		2.4.2:	topk: min: ps_supplycost
-				TopK should be applied for each pair of (pair.size, pair.type, region)
-				Each entry in a TopK is the supplierID and the supplycost.
-				Each TopK internally should be ordered from min to max. We can achieve this using negative values.
-				We should also keep some extra data with the TopK (supplier, region, etc.)
-		2.4.3:	sum: l_extendedprice*(1-l_discount)
-				This is for each pair of (l_orderkey, o_orderdate, o_shippriority).
-				The query will still need to collect all whose date < o_orderdate and then filter for only those whose
-				l_shipdate is > date. Or maybe we can have some map for that...
-		2.4.4:	sum/count: "number of orders in which at least one lineitem was received later than the commited date"
-				Group this by the pair (o_orderpriority, month) (i.e., group all the days of a month in the same CRDT)
-		2.4.5:
-				sum: l_extendedprice * (1 - l_discount)
-				Group this by the pair (country, year) (i.e., group all the days of a year in the same CRDT).
-				Only lineitems for which the costumer and supplier are of the same nation count for this sum.
-		2.4.6:	sum: l_extendedprice * l_discount
-				Group this by the pair (year, amount, DISCOUNT), where discount would need a precision rate of 0.01.
-				This likelly needs to be better thought of.
-		2.4.7:	sum: l_extendedprice * (1 - l_discount)
-				Group this by the pair (nation1, nation2, year) (i.e., group all the days of a year in the same CRDT).
-				This can be between any two nations (but nation1 != nation2), where nation1 is the supplier nation and
-				nation2 the customer nation.
-				Theorically only years 1995 and 1996 are required.
-		2.4.8:	two sums:
-				1)	sum: l_extendedprice * (1 - l_discount)
-				Group this by (year, product)
-				2) sum: l_extendedprice * (1 - l_discount)
-				Group this by (nation, year, product). Only consider products that are supplied by that nation
-				Note: 1) may be usable for some other query? Check out.
-		2.4.9:	sum: l_extendedprice * (1 - l_discount) - ps_supplycost * l_quantity
-				Group this by (nation, year, product). Only consider products that are supplied by that nation.
-				Note that this is the same grouping as 2.4.8's 2), but also considers ps_supplycost * l_quantity.
-				IMPORTANT NOTE: in the query, the products listed are ones that contains in their name a certain substring.
-				That'll have to be dealt with efficiently. The list of possible substrings is known.
-		2.4.10: topk: top 20 of: sum: l_extendedprice * (1 - l_discount)
-				Group this by (day, costumer). Need to do the sum for returned products by that costumer that were ordered
-				in that day.
-				NOTE: Reconsider this grouping, as the query asks for a period of 3 months, but starting on a random day
-				between February 1993 and January 1995.
-				Likelly needs to be better thought of.
-		2.4.11:	sum: ps_supplycost * ps_availqty
-				Group by (part, nation). Nation is the supplier nation.
-				The query itself only wants the groups for a given nation in which the sum represents >= 0.01%/SF of
-				all parts supplied by that nation. But that's defined as a variable...
-		2.4.12:	count: number of lineitems for which l_receiptdate > l_commitdate
-				Group by priority. If we consider the specifity of the query, two groups are enough
-				(URGENT + PRIORITY, OTHERS)
-		2.4.13:	count: number of customers with a given number of orders
-				Group by PRIORITY. The query itself filters by two comment words picked at random from a limited amount
-				of possible values. This MUST be taken in consideration when creating the indexes.
-		2.4.14:	sum + count (or mix together if possible): l_extendedprice * (1 - l_discount), when p_type starts with "PROMO"
-				Group by month (l_shipdate). Asked date always starts at the 1st day of a given month, between 1993 and 1997.
-				The date interval always covers the whole month.
-		2.4.15:	topk: sum(l_extendedprice * (1-l_discount))
-				Group by month. The sum corresponds to the revenue shipped by a supplier during a given quarter of the year.
-				Date can start between first month of 1993 and 10th month of 1997 (first day always)
-		2.4.16:	count: number of suppliers (check text below)
-				Query: counts suppliers for parts of a given size (receive 8 sizes, 50 different are possible) that aren't of
-				a given brand and whose type doesn't start with a given substring (substring selected from the list of strings defined
-				for Types in 4.2.2.13). Since the substring is always 2 out of 3 words, it might be feasible to group by word as well.
-				Group by SIZE at least.
-				This one should be better thought of. Might be wise to also group by brand. Also need to consider the TYPE filter.
-				Note: When making the count, ignore all entries that have in the comment "Customer Complaints"
-		2.4.17: sum(l_extendedprice) / 7
-				Group by (BRAND, CONTAINER). I think I also need to group by part...?
-				Filter to only consider orders for which que ordered quantity is less than 20% or the average ordered quantity
-				for that item. Likelly need an avg index for that.
-		2.4.18: topk with 100 elements: o_totalprice, o_orderdate
-				Group by l_quantity. Theorically only need quantities between 312 and 315.
-				Stores orders whose quantity is above a given value.
-		2.4.19:	sum(l_extendedprice * (1 - l_discount))
-				Think quite well on how to do this one. A lot of filters are used.
-		2.4.20:	No idea which topk to "directly" answer this query.
-				However, sum(l_quantity) grouped by (YEAR, SUPPLIER, PART) would help a lot for sure.
-				May have to consider how to handle the COLOR filter, or on a better index.
-		2.4.21:	topk(count(number of supplied orders that were delivered (receiptdate) after commitdate only due to this supplier))
-				This count only considers multi-supplier orders with current status of F in which only one supplier delivered late.
-				Group count by (NATION, SUPPLIER)
-				Group topk by NATION.
-		2.4.22:	count: (number of customers without orders for 7 years and above average positive account balance)
-				sum: (c_acctbal)
-				avg: (c_acctbal). Aditional filter: c_acctbal > 0.0
-				Considers customers who haven't placed orders for 7 years (i.e., entire DB? Query doesn't filter years) but that
-				have greater than average "positive" account balance.
-				The three indexes have the same filtering (apart from the aditional one on avg) and grouping rules.
-				Group by (substring(1, 2, c_phone))
-	*/
-	/*
-		Map CRDT:
-		Different types being concurrently assigned to the same key - assume this doesn't happen.
-		Remove/Update: likelly go with remove-wins, which seems to be the easier.
-	*/
-	/*
-		To select: 2.4.3 (topk with sum), 2.4.5 (sum, grouped by (country, year)),
-		2.4.11 (simple topk of a sum, along with a key (ID)), 2.4.14 (sum + count, no topk, no other data to show),
-		2.4.15, 2.4.18 (topk, but with multiple data to show)
-		2.4.2 seems to be more complicated than it is worth it.
-		Could be interesting if we found a good way to group it: 2.4.6, 2.4.10
-	*/
-	q14Upds := prepareQ14Index()
-
-	startTxn := antidote.CreateStartTransaction(nil)
-	antidote.SendProto(antidote.StartTrans, startTxn, conn)
-	_, txnReplyProto, _ := antidote.ReceiveProto(conn)
-	txnId := txnReplyProto.(*proto.ApbStartTransactionResp).GetTransactionDescriptor()
-
-	//Send all indexes
-	updsProto := antidote.CreateUpdateObjs(txnId, q14Upds)
-	antidote.SendProto(antidote.UpdateObjs, updsProto, conn)
-	antidote.ReceiveProto(conn)
-
-	commitTxn := antidote.CreateCommitTransaction(txnId)
-	antidote.SendProto(antidote.CommitTrans, commitTxn, conn)
-	antidote.ReceiveProto(conn)
 }
 
 func queueIndex(upds []antidote.UpdateObjectParams) {
@@ -862,7 +741,7 @@ func prepareQ3Index() (upds []antidote.UpdateObjectParams) {
 					break
 				}
 				//Check if L_SHIPDATE is higher than minDate and, if it is, check month/year. If month/year > march 1995, then add to all entries. Otherwise, use day to know which entries.
-				if item.L_SHIPDATE.isHigher(minDate) || minDate == item.L_SHIPDATE {
+				if item.L_SHIPDATE.isHigher(minDate) || *minDate == *item.L_SHIPDATE {
 					if item.L_SHIPDATE.MONTH > 3 || item.L_SHIPDATE.YEAR > 1995 {
 						//All days
 						minDay = 1
@@ -1176,7 +1055,7 @@ func prepareQ15Index() (upds []antidote.UpdateObjectParams) {
 	//Group by month. The sum corresponds to the revenue shipped by a supplier during a given quarter of the year.
 	//Date can start between first month of 1993 and 10th month of 1997 (first day always)
 	//Have one topK per quarter
-	//month -> supplierID -> sum
+	//year -> month -> supplierID -> sum
 	yearMap := make(map[int16]map[int8]map[int32]*float64)
 	var monthMap map[int8]map[int32]*float64
 
@@ -1240,7 +1119,7 @@ func prepareQ15Index() (upds []antidote.UpdateObjectParams) {
 			for suppKey, value := range monthMap[month] {
 				//TODO: Not use int32 for value
 				var currUpd crdt.UpdateArguments = crdt.TopKAdd{TopKScore: crdt.TopKScore{
-					Id:    int32(suppKey),
+					Id:    suppKey,
 					Score: int32(*value),
 				}}
 				upds[i] = antidote.UpdateObjectParams{KeyParams: keyArgs, UpdateArgs: &currUpd}
@@ -1253,6 +1132,8 @@ func prepareQ15Index() (upds []antidote.UpdateObjectParams) {
 	return
 }
 
+//TODO: This likelly could be reimplemented with only 1 topK and using the query of "above value".
+//Albeit that potencially would imply downloading more than 100 customers.
 func prepareQ18Index() (upds []antidote.UpdateObjectParams) {
 	//2.4.18: topk with 100 elements: o_totalprice, o_orderdate
 	//Group by l_quantity. Theorically only need quantities between 312 and 315.
@@ -1287,7 +1168,7 @@ func prepareQ18Index() (upds []antidote.UpdateObjectParams) {
 		item = procTables.LineItems[orderKeyOffset]
 		for currItemIndex = 1; item != nil && item.L_ORDERKEY == order.O_ORDERKEY; currItemIndex++ {
 			//fmt.Println(item)
-			currQuantity += item.L_QUANTITY
+			currQuantity += int32(item.L_QUANTITY)
 			item = procTables.LineItems[orderKeyOffset+currItemIndex]
 			//item = procTables.LineItems[GetLineitemIndex(int8(currItemIndex+1), orderKey, procTables.MaxOrderLineitems)]
 		}
@@ -1374,20 +1255,11 @@ func prepareQ18Index() (upds []antidote.UpdateObjectParams) {
 	return
 }
 
-/*
-func sendTableCreation(headers [][]string, keys []string) {
-	updates := make([]antidote.UpdateObjectParams, 1)
-}
-
-func sendTableEntries(headers [][]string, keys []string, table [][][]string) {
-
-}
-*/
-
 /////*********** UPDATES/DELETES **********/////
 
 func readUpds() (ordersUpds [][]string, lineItemUpds [][]string, deleteKeys []string) {
-	return tpchTools.ReadUpdates(updCompleteFilename[:], updEntries[:], updParts[:])
+	updPartsRead := [][]int8{read[ORDERS], read[LINEITEM]}
+	return tpchTools.ReadUpdates(updCompleteFilename[:], updEntries[:], updParts[:], updPartsRead)
 }
 
 //TODO: This will need to be updated as we add "index" CRDTs
@@ -1405,6 +1277,282 @@ func sendUpdateData(ordersUpds [][]string, lineItemUpds [][]string, deleteKeys [
 	//sendTable(conn, tableNames[headerOrders], headers[headerOrders], primKeys, ordersUpds)
 	//sendTable(conn, tableNames[headerLineItems], headers[headerLineItems], primKeys, lineItemUpds)
 	//prepareDeletes(deleteKeys)
+
+	/*
+		Idea: re-use the connections (possibly with different channels). We'll prepare some updates while the initial data is still being sent, but not all.
+		Each update must generate updates for its own table and its indexes. However, let's try to avoid having to use the client tables
+		In short:
+		Go through each lineItem until we got a full order
+		For each order
+			- Call a method per query to generate updates for the respective index
+			- Group those updates
+			- Send those updates
+		We can optionally consider grouping multiple orders and calling each query method per order. However, we must ensure everything happens in the same txn.
+	*/
+
+	updsPerServer := make([]map[string]crdt.UpdateArguments, len(procTables.Regions))
+	startLine, endLine := 0, 0
+	for _, order := range ordersUpds {
+		orderID := order[0]
+		//Out of bounds on lineItemUpds is an issue
+		for ; lineItemUpds[endLine][0] == orderID; endLine++ {
+		}
+		getUpdWithIndex(order, lineItemUpds[startLine:endLine])
+		startLine = endLine
+	}
+}
+
+func getUpdWithIndex(order []string, lineItems [][]string) {
+	orderUpd := getEntryUpd(headers[ORDERS], keys[ORDERS], order, read[ORDERS])
+	lineUpds := make([]*crdt.EmbMapUpdateAll, len(lineItems))
+	for i, item := range lineItems {
+		lineUpds[i] = getEntryUpd(headers[LINEITEM], keys[LINEITEM], order, read[LINEITEM])
+	}
+	orderObj, lineItemsObjs := procTables.UpdateOrderLineitems(order, lineItems)
+	indexUpds := getIndexUpds(orderObj, lineItemsObjs)
+}
+
+func getIndexUpds(order *Orders, lineItems []*LineItem) {
+	q3Upds := getQ3Upds(order, lineItems)
+	q5Upds := getQ5Upds(order, lineItems)
+	//Query 11 doesn't need updates (Nation/Supply only, which are never updated.)
+	//q11Upds := getQ11Upds(order, lineItems)
+	q14Upds := getQ14Upds(order, lineItems)
+	q15Upds := getQ15Upds(order, lineItems)
+	q18Upds := getQ18Upds(order, lineItems)
+}
+
+func getQ3Upds(order *Orders, lineItems []*LineItem) (upds []antidote.UpdateObjectParams) {
+	/*
+		Q3 - TopK per pair (o_orderdate, c_mktsegment). Each topK entry: (orderKey, sum)
+				- Sum = l_extendedprice * (1 - l_discount)
+				Need to update all entries for each date < O_ORDERDATE and whose C_MKTSEGMENT matches the
+				order's customer C_MKTSEGMENT.
+	*/
+	const maxDay int8 = 31
+	sums := make([]*float64, maxDay)
+	for i := range sums {
+		sums[i] = new(float64)
+	}
+	nUpds := 0
+	mktSeg := procTables.Customers[order.O_CUSTKEY].C_MKTSEGMENT
+
+	date := order.O_ORDERDATE
+	minDate, maxDate := &Date{YEAR: 1995, MONTH: 03, DAY: 01}, &Date{YEAR: 1995, MONTH: 03, DAY: 31}
+	var minDay int8
+	if date.isSmallerOrEqual(maxDate) {
+		for _, item := range lineItems {
+			if item.L_SHIPDATE.isHigher(minDate) || *item.L_SHIPDATE == *minDate {
+				if item.L_SHIPDATE.MONTH > 3 || item.L_SHIPDATE.YEAR > 1995 {
+					//All days
+					minDay = 1
+				} else {
+					minDay = item.L_SHIPDATE.DAY + 1
+				}
+				for j := minDay; j <= maxDay; j++ {
+					if *sums[j] == 0 {
+						nUpds++
+					}
+					*sums[j] += item.L_EXTENDEDPRICE * (1.0 - item.L_DISCOUNT)
+				}
+			}
+		}
+
+		upds = make([]antidote.UpdateObjectParams, nUpds)
+		var keyArgs antidote.KeyParams
+		i := 0
+		for day, sum := range sums {
+			if *sum > 0 {
+				keyArgs = antidote.KeyParams{
+					Key:      SEGM_DELAY + mktSeg + strconv.FormatInt(int64(day+1), 10),
+					CrdtType: proto.CRDTType_TOPK_RMV,
+					Bucket:   buckets[INDEX_BKT],
+				}
+				var currUpd crdt.UpdateArguments = crdt.TopKAdd{TopKScore: crdt.TopKScore{Id: order.O_ORDERKEY, Score: int32(*sum)}}
+				upds[i] = antidote.UpdateObjectParams{KeyParams: keyArgs, UpdateArgs: &currUpd}
+				i++
+			}
+		}
+
+		return
+	}
+	//No update in the index needed
+	return []antidote.UpdateObjectParams{}
+}
+
+func getQ5Upds(order *Orders, lineItems []*LineItem) (upds []antidote.UpdateObjectParams) {
+	/*
+		Q5 - sum(l_extendedprice * (1 - l_discount)) for each pair (country, pair)
+		The indexes are implemented as a EmbMap of region+date, with one counter entry per nation
+		Note that all updates will go for the same year, region and nation! (as the supplier's nation must match the customer's)
+		So we only need one value and, thus, one increment, if any.
+	*/
+	year := order.O_ORDERDATE.YEAR
+	value := 0.0
+	if year >= 1993 && year <= 1997 {
+		customer := procTables.Customers[order.O_CUSTKEY]
+		nation := procTables.Nations[customer.C_NATIONKEY]
+		var supplier *Supplier
+		for _, item := range lineItems {
+			supplier = procTables.Suppliers[item.L_SUPPKEY]
+			if customer.C_NATIONKEY == supplier.S_NATIONKEY {
+				value += item.L_EXTENDEDPRICE * (1 - item.L_DISCOUNT)
+			}
+		}
+		if value > 0.0 {
+			var mapUpd crdt.UpdateArguments = crdt.EmbMapUpdateAll{
+				Upds: map[string]crdt.UpdateArguments{nation.N_NAME: crdt.Increment{Change: int32(value)}},
+			}
+			return []antidote.UpdateObjectParams{
+				antidote.UpdateObjectParams{
+					KeyParams: antidote.KeyParams{
+						Key:      NATION_REVENUE + procTables.Regions[nation.N_NATIONKEY].R_NAME + strconv.FormatInt(int64(year), 10),
+						CrdtType: proto.CRDTType_RRMAP,
+						Bucket:   buckets[INDEX_BKT],
+					},
+					UpdateArgs: &mapUpd,
+				},
+			}
+		}
+	}
+	//No update in the index needed
+	return []antidote.UpdateObjectParams{}
+}
+
+func getQ14Upds(order *Orders, lineItems []*LineItem) (upds []antidote.UpdateObjectParams) {
+	/*
+		Q14 - 100*sum(l_extendedprice * (1-l_discount)), when p_type = PROMO%, then divide by
+		sum(l_extendedprice * (1-l_discount)) of all parts.
+		So if the piece is in promo, just add the same value in both SumValue and NAdds. If it isn't, add 0
+		in SumValue and the value in NAdds.
+		Do this for each piece. Group it by month (l_shipdate)
+	*/
+
+	promoValues, totalValues := make(map[string]float64, len(lineItems)), make(map[string]float64, len(lineItems))
+	currValue := 0.0
+	const promo = "PROMO"
+	var key string
+
+	for i, item := range lineItems {
+		if item.L_SHIPDATE.YEAR >= 1993 && item.L_SHIPDATE.YEAR <= 1997 {
+			key = strconv.FormatInt(int64(item.L_SHIPDATE.YEAR), 10) + strconv.FormatInt(int64(item.L_SHIPDATE.MONTH), 10)
+			currValue = item.L_EXTENDEDPRICE * (1 - item.L_DISCOUNT)
+			if strings.HasPrefix(procTables.Parts[item.L_PARTKEY].P_TYPE, promo) {
+				promoValues[key] += currValue
+			}
+			totalValues[key] += currValue
+		}
+
+	}
+
+	upds = make([]antidote.UpdateObjectParams, len(totalValues))
+	i := 0
+	for key, total := range totalValues {
+		promo := promoValues[key]
+		var currUpd crdt.UpdateArguments = crdt.AddMultipleValue{
+			SumValue: int64(100.0 * promo),
+			NAdds:    int64(total),
+		}
+		upds[i] = antidote.UpdateObjectParams{
+			KeyParams:  antidote.KeyParams{Key: PROMO_PERCENTAGE + key, CrdtType: proto.CRDTType_AVG, Bucket: buckets[INDEX_BKT]},
+			UpdateArgs: &currUpd,
+		}
+		i++
+	}
+
+	return
+}
+
+func getQ15Upds(order *Orders, lineItems []*LineItem) (upds []antidote.UpdateObjectParams) {
+	/*
+		Q15: topk(sum(l_extendedprice * (1-l_discount))). Each entry corresponds to one supplier.
+		One topk by quarters, between 1st month of 1993 and 10th month of 1997.
+		To determine quarter, use l_shipdate
+	*/
+	/*
+		yearMap := make(map[int16]map[int8]map[int32]float64)
+		var monthMap map[int8]map[int32]float64
+		var suppMap map[int32]float64
+	*/
+	//Year (0-4 for 1993-1997), Quarter (0-3), supplierID -> sum
+	yearMap := make([][]map[int32]float64, 4)
+	for i := range yearMap {
+		yearMap[i] = make([]map[int32]float64, 4)
+	}
+	var suppMap map[int32]float64
+	var has bool
+	year, month, possibleUpds := int16(0), int8(0), 0
+	var year64, month64 int64
+
+	for _, item := range lineItems {
+		year = item.L_SHIPDATE.YEAR - 1993
+		//year >= 1993 && year <= 1997
+		if year >= 0 && year <= 3 {
+			month = ((item.L_SHIPDATE.MONTH - 1) / 3)
+			suppMap = yearMap[year][month]
+			if suppMap == nil {
+				suppMap = make(map[int32]float64)
+				yearMap[year][month] = suppMap
+			}
+			suppMap[item.L_SUPPKEY] += (item.L_EXTENDEDPRICE * (1.0 - item.L_DISCOUNT))
+			possibleUpds++
+		}
+	}
+
+	upds = make([]antidote.UpdateObjectParams, possibleUpds)
+	var keyArgs antidote.KeyParams
+	i := 0
+	for j, monthMap := range yearMap {
+		year64 = int64(j) + 1993
+		for k, suppMap := range monthMap {
+			month64 = int64(k)*3 + 1
+			keyArgs = antidote.KeyParams{
+				Key:      TOP_SUPPLIERS + strconv.FormatInt(year64, 10) + strconv.FormatInt(month64, 10),
+				CrdtType: proto.CRDTType_TOPK_RMV,
+				Bucket:   buckets[INDEX_BKT],
+			}
+			for suppKey, value := range suppMap {
+				var currUpd crdt.UpdateArguments = crdt.TopKAdd{TopKScore: crdt.TopKScore{
+					Id:    suppKey,
+					Score: int32(value),
+				}}
+				upds[i] = antidote.UpdateObjectParams{KeyParams: keyArgs, UpdateArgs: &currUpd}
+				i++
+			}
+		}
+	}
+
+	//If multiple lineitems are from the same supplier, then not all positions in upds will be filled
+	return upds[:i]
+}
+
+func getQ18Upds(order *Orders, lineItems []*LineItem) (upds []antidote.UpdateObjectParams) {
+	quantity := 0
+	for _, item := range lineItems {
+		quantity += int(item.L_QUANTITY)
+	}
+
+	var keyArgs antidote.KeyParams
+	if quantity >= 312 {
+		nUpds := min(315, quantity) - 311 //311 instead of 312 to give space for 312-315.
+		upds = make([]antidote.UpdateObjectParams, nUpds)
+		for i := 0; i < nUpds; i++ {
+			keyArgs = antidote.KeyParams{
+				Key:      LARGE_ORDERS + strconv.FormatInt(int64(quantity), 10),
+				CrdtType: proto.CRDTType_TOPK_RMV,
+				Bucket:   buckets[INDEX_BKT],
+			}
+			var currUpd crdt.UpdateArguments = crdt.TopKAdd{TopKScore: crdt.TopKScore{
+				Id:    order.O_ORDERKEY,
+				Score: int32(quantity),
+			}}
+			upds[i] = antidote.UpdateObjectParams{KeyParams: keyArgs, UpdateArgs: &currUpd}
+			i++
+		}
+	}
+
+	//if quantity is < 312 then there's no updates
+	return []antidote.UpdateObjectParams{}
 }
 
 func prepareDeletes(deleteKeys []string) {
@@ -1434,36 +1582,45 @@ func getTableDelete(tableKey string, deleteKeys []string) (delete *antidote.Upda
 /////*********** QUERIES **********/////
 
 func sendQueries(conn net.Conn) {
-	time.Sleep(2000 * time.Millisecond)
+	time.Sleep(QUERY_WAIT * time.Millisecond)
 	fmt.Println("Starting to send queries")
-	finishTimes := make([]int64, 7)
-	queries := []int{-1, 3, 5, 11, 14, 15, 18}
-	finishTimes[0] = time.Now().UnixNano() / 1000000
+	startTime := time.Now().UnixNano() / 1000000
 	fmt.Println()
 	sendQ3(conn)
-	finishTimes[1] = time.Now().UnixNano() / 1000000
+	times.queries[0] = time.Now().UnixNano() / 1000000
 	fmt.Println()
 	sendQ5(conn)
-	finishTimes[2] = time.Now().UnixNano() / 1000000
+	times.queries[1] = time.Now().UnixNano() / 1000000
 	fmt.Println()
 	sendQ11(conn)
-	finishTimes[3] = time.Now().UnixNano() / 1000000
+	times.queries[2] = time.Now().UnixNano() / 1000000
 	fmt.Println()
 	sendQ14(conn)
-	finishTimes[4] = time.Now().UnixNano() / 1000000
+	times.queries[3] = time.Now().UnixNano() / 1000000
 	fmt.Println()
 	sendQ15(conn)
-	finishTimes[5] = time.Now().UnixNano() / 1000000
+	times.queries[4] = time.Now().UnixNano() / 1000000
 	fmt.Println()
 	sendQ18(conn)
-	finishTimes[6] = time.Now().UnixNano() / 1000000
-	fmt.Println()
+	endTime := time.Now().UnixNano()
+	times.queries[5] = endTime / 1000000
 
-	fmt.Println("All queries have been executed")
-	fmt.Println("Total time for the queries:", finishTimes[6]-finishTimes[0], "ms")
-	for i := 1; i < len(finishTimes); i++ {
-		fmt.Printf("Time taken for Q%d: %d ms\n", queries[i], finishTimes[i]-finishTimes[i-1])
+	for i := len(times.queries) - 1; i > 0; i-- {
+		times.queries[i] -= times.queries[i-1]
 	}
+	times.queries[0] -= startTime
+	times.totalQueries = endTime/1000000 - startTime
+	times.finishTime = endTime
+
+	fmt.Println()
+	fmt.Println("All queries have been executed")
+	printExecutionTimes()
+	/*
+		fmt.Println("Total time for the queries:", finishTimes[6]-finishTimes[0], "ms")
+			for i := 1; i < len(finishTimes); i++ {
+				fmt.Printf("Time taken for Q%d: %d ms\n", queries[i], finishTimes[i]-finishTimes[i-1])
+			}
+	*/
 }
 
 func sendQ3(conn net.Conn) {
@@ -1906,6 +2063,20 @@ func mergeMapReplies(replies map[int8]*proto.ApbStaticReadObjectsResp) (merged m
 
 /////*********** OTHERS **********/////
 
+func printExecutionTimes() {
+	fmt.Println()
+	fmt.Println("*****TEST DURATION*****")
+	fmt.Println("Total duration:", (times.finishTime-times.startTime)/1000000, "ms")
+	fmt.Println("Header read:", times.header, "ms")
+	fmt.Println("Data read:", times.read, "ms")
+	fmt.Println("Client tables:", times.clientTables, "ms")
+	fmt.Println("Preparation of data protobufs:", times.prepareDataProtos, "ms")
+	fmt.Println("Preparation of index protobufs:", times.prepareIndexProtos, "Total:", times.totalIndex, "ms")
+	fmt.Println("Sending of data protobufs:", times.sendDataProtos, "Data + Index:", times.totalData, "ms")
+	fmt.Println("Sending of index protobufs:", times.sendIndexProtos, "ms")
+	fmt.Println("Execution of queries:", times.queries, "Total:", times.totalQueries, "ms")
+}
+
 func collectDataStatistics() {
 	nationsToRegion := make(map[int8]int8)
 	for _, nation := range procTables.Nations {
@@ -2040,7 +2211,7 @@ func debugMemory() {
 				runtime.GC()
 			}
 		*/
-		time.Sleep(1000 * time.Millisecond)
+		time.Sleep(5000 * time.Millisecond)
 	}
 }
 
@@ -2053,9 +2224,14 @@ func custToRegion(obj []string) int8 {
 	return procTables.NationkeyToRegionkey(nationKey)
 }
 
-func lineitemToRegion(obj []string) int8 {
+func lineitemToRegion(obj []string) []int8 {
 	suppKey, _ := strconv.ParseInt(obj[L_SUPPKEY], 10, 32)
-	return procTables.SuppkeyToRegionkey(suppKey)
+	orderKey, _ := strconv.ParseInt(obj[L_ORDERKEY], 10, 32)
+	r1, r2 := procTables.SuppkeyToRegionkey(suppKey), procTables.OrderkeyToRegionkey(int32(orderKey))
+	if r1 == r2 {
+		return []int8{r1}
+	}
+	return []int8{r1, r2}
 }
 
 func nationToRegion(obj []string) int8 {
@@ -2082,3 +2258,111 @@ func supplierToRegion(obj []string) int8 {
 	nationKey, _ := strconv.ParseInt(obj[S_NATIONKEY], 10, 8)
 	return procTables.NationkeyToRegionkey(nationKey)
 }
+
+/*
+	c: customer, l: lineItem, n: nation, o: orders, p: part, ps: partsupp, r: region, s: supplier
+*/
+/*
+	List of indexes:
+	2.4.1: 	sum: l_quantity, l_extendedprice, l_extendedprice * (1 - l_discount), l_extendedprice * (1-l_discount)*(1+l_tax))
+			avg: l_quantity, l_extendedprice, l_discount
+			All this based on the days (l_shipdate). Possible idea: 1 instance per day and then sum/avg days requested by query?
+	2.4.2:	topk: min: ps_supplycost
+			TopK should be applied for each pair of (pair.size, pair.type, region)
+			Each entry in a TopK is the supplierID and the supplycost.
+			Each TopK internally should be ordered from min to max. We can achieve this using negative values.
+			We should also keep some extra data with the TopK (supplier, region, etc.)
+	2.4.3:	sum: l_extendedprice*(1-l_discount)
+			This is for each pair of (l_orderkey, o_orderdate, o_shippriority).
+			The query will still need to collect all whose date < o_orderdate and then filter for only those whose
+			l_shipdate is > date. Or maybe we can have some map for that...
+	2.4.4:	sum/count: "number of orders in which at least one lineitem was received later than the commited date"
+			Group this by the pair (o_orderpriority, month) (i.e., group all the days of a month in the same CRDT)
+	2.4.5:
+			sum: l_extendedprice * (1 - l_discount)
+			Group this by the pair (country, year) (i.e., group all the days of a year in the same CRDT).
+			Only lineitems for which the costumer and supplier are of the same nation count for this sum.
+	2.4.6:	sum: l_extendedprice * l_discount
+			Group this by the pair (year, amount, DISCOUNT), where discount would need a precision rate of 0.01.
+			This likelly needs to be better thought of.
+	2.4.7:	sum: l_extendedprice * (1 - l_discount)
+			Group this by the pair (nation1, nation2, year) (i.e., group all the days of a year in the same CRDT).
+			This can be between any two nations (but nation1 != nation2), where nation1 is the supplier nation and
+			nation2 the customer nation.
+			Theorically only years 1995 and 1996 are required.
+	2.4.8:	two sums:
+			1)	sum: l_extendedprice * (1 - l_discount)
+			Group this by (year, product)
+			2) sum: l_extendedprice * (1 - l_discount)
+			Group this by (nation, year, product). Only consider products that are supplied by that nation
+			Note: 1) may be usable for some other query? Check out.
+	2.4.9:	sum: l_extendedprice * (1 - l_discount) - ps_supplycost * l_quantity
+			Group this by (nation, year, product). Only consider products that are supplied by that nation.
+			Note that this is the same grouping as 2.4.8's 2), but also considers ps_supplycost * l_quantity.
+			IMPORTANT NOTE: in the query, the products listed are ones that contains in their name a certain substring.
+			That'll have to be dealt with efficiently. The list of possible substrings is known.
+	2.4.10: topk: top 20 of: sum: l_extendedprice * (1 - l_discount)
+			Group this by (day, costumer). Need to do the sum for returned products by that costumer that were ordered
+			in that day.
+			NOTE: Reconsider this grouping, as the query asks for a period of 3 months, but starting on a random day
+			between February 1993 and January 1995.
+			Likelly needs to be better thought of.
+	2.4.11:	sum: ps_supplycost * ps_availqty
+			Group by (part, nation). Nation is the supplier nation.
+			The query itself only wants the groups for a given nation in which the sum represents >= 0.01%/SF of
+			all parts supplied by that nation. But that's defined as a variable...
+	2.4.12:	count: number of lineitems for which l_receiptdate > l_commitdate
+			Group by priority. If we consider the specifity of the query, two groups are enough
+			(URGENT + PRIORITY, OTHERS)
+	2.4.13:	count: number of customers with a given number of orders
+			Group by PRIORITY. The query itself filters by two comment words picked at random from a limited amount
+			of possible values. This MUST be taken in consideration when creating the indexes.
+	2.4.14:	sum + count (or mix together if possible): l_extendedprice * (1 - l_discount), when p_type starts with "PROMO"
+			Group by month (l_shipdate). Asked date always starts at the 1st day of a given month, between 1993 and 1997.
+			The date interval always covers the whole month.
+	2.4.15:	topk: sum(l_extendedprice * (1-l_discount))
+			Group by month. The sum corresponds to the revenue shipped by a supplier during a given quarter of the year.
+			Date can start between first month of 1993 and 10th month of 1997 (first day always)
+	2.4.16:	count: number of suppliers (check text below)
+			Query: counts suppliers for parts of a given size (receive 8 sizes, 50 different are possible) that aren't of
+			a given brand and whose type doesn't start with a given substring (substring selected from the list of strings defined
+			for Types in 4.2.2.13). Since the substring is always 2 out of 3 words, it might be feasible to group by word as well.
+			Group by SIZE at least.
+			This one should be better thought of. Might be wise to also group by brand. Also need to consider the TYPE filter.
+			Note: When making the count, ignore all entries that have in the comment "Customer Complaints"
+	2.4.17: sum(l_extendedprice) / 7
+			Group by (BRAND, CONTAINER). I think I also need to group by part...?
+			Filter to only consider orders for which que ordered quantity is less than 20% or the average ordered quantity
+			for that item. Likelly need an avg index for that.
+	2.4.18: topk with 100 elements: o_totalprice, o_orderdate
+			Group by l_quantity. Theorically only need quantities between 312 and 315.
+			Stores orders whose quantity is above a given value.
+	2.4.19:	sum(l_extendedprice * (1 - l_discount))
+			Think quite well on how to do this one. A lot of filters are used.
+	2.4.20:	No idea which topk to "directly" answer this query.
+			However, sum(l_quantity) grouped by (YEAR, SUPPLIER, PART) would help a lot for sure.
+			May have to consider how to handle the COLOR filter, or on a better index.
+	2.4.21:	topk(count(number of supplied orders that were delivered (receiptdate) after commitdate only due to this supplier))
+			This count only considers multi-supplier orders with current status of F in which only one supplier delivered late.
+			Group count by (NATION, SUPPLIER)
+			Group topk by NATION.
+	2.4.22:	count: (number of customers without orders for 7 years and above average positive account balance)
+			sum: (c_acctbal)
+			avg: (c_acctbal). Aditional filter: c_acctbal > 0.0
+			Considers customers who haven't placed orders for 7 years (i.e., entire DB? Query doesn't filter years) but that
+			have greater than average "positive" account balance.
+			The three indexes have the same filtering (apart from the aditional one on avg) and grouping rules.
+			Group by (substring(1, 2, c_phone))
+*/
+/*
+	Map CRDT:
+	Different types being concurrently assigned to the same key - assume this doesn't happen.
+	Remove/Update: likelly go with remove-wins, which seems to be the easier.
+*/
+/*
+	To select: 2.4.3 (topk with sum), 2.4.5 (sum, grouped by (country, year)),
+	2.4.11 (simple topk of a sum, along with a key (ID)), 2.4.14 (sum + count, no topk, no other data to show),
+	2.4.15, 2.4.18 (topk, but with multiple data to show)
+	2.4.2 seems to be more complicated than it is worth it.
+	Could be interesting if we found a good way to group it: 2.4.6, 2.4.10
+*/
