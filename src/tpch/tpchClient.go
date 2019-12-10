@@ -175,6 +175,7 @@ func loadConfigsFile() {
 		MAX_BUFF_PROTOS, QUERY_WAIT, FORCE_PROTO_CLEAN, TEST_ROUTINES, TEST_DURATION = 200, 5000, 10000, 10, 20000
 		PRINT_QUERY, QUERY_BENCH = true, false
 		INDEX_WITH_FULL_DATA, CRDT_PER_OBJ = true, false
+		queryFuncs = []func(QueryClient) int{sendQ3, sendQ5, sendQ11, sendQ14, sendQ15, sendQ18}
 	} else {
 		configs := &tools.ConfigLoader{}
 		configs.LoadConfigs(*configFolder)
@@ -190,6 +191,10 @@ func loadConfigsFile() {
 			configs.GetIntConfig("queryClients", 10), int64(configs.GetIntConfig("queryDuration", 20000))
 		PRINT_QUERY, QUERY_BENCH = configs.GetBoolConfig("queryPrint", true), configs.GetBoolConfig("queryBench", false)
 		INDEX_WITH_FULL_DATA, CRDT_PER_OBJ = configs.GetBoolConfig("indexFullData", true), configs.GetBoolConfig("crdtPerObj", false)
+
+		queryNumbers := strings.Split(configs.GetOrDefault("queries", "3, 5, 11, 14, 18"), " ")
+		queryFuncs = getQueryList(queryNumbers)
+
 		//Query wait is in nanoseconds!!!
 		fmt.Println(isMulti)
 		fmt.Println(isIndexGlobal)
@@ -510,6 +515,29 @@ func supplierToRegion(obj []string) int8 {
 
 func singleRegion(obj []string) int8 {
 	return 0
+}
+
+func getQueryList(queryStrings []string) (funcs []func(QueryClient) int) {
+	funcs = make([]func(QueryClient) int, len(queryStrings))
+	i := 0
+	for _, queryN := range queryStrings {
+		switch queryN {
+		case "3":
+			funcs[i] = sendQ3
+		case "5":
+			funcs[i] = sendQ5
+		case "11":
+			funcs[i] = sendQ11
+		case "14":
+			funcs[i] = sendQ14
+		case "15":
+			funcs[i] = sendQ15
+		case "18":
+			funcs[i] = sendQ18
+		}
+		i++
+	}
+	return
 }
 
 /*

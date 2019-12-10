@@ -2,7 +2,6 @@ package tpch
 
 import (
 	"antidote"
-	"clocksi"
 	"crdt"
 	"fmt"
 	"math/rand"
@@ -38,6 +37,7 @@ var (
 	TEST_ROUTINES            int
 	TEST_DURATION            int64
 	QUERY_WAIT               time.Duration
+	queryFuncs               []func(QueryClient) int //queries to execute
 )
 
 func startQueriesBench() {
@@ -50,25 +50,27 @@ func startQueriesBench() {
 	results := make([]QueryClientResult, TEST_ROUTINES)
 	for i := 0; i < TEST_ROUTINES; i++ {
 		serverN := rand.Intn(len(servers))
-		fmt.Println("Starting query client", i, "with index server", servers[serverN])
+		//fmt.Println("Starting query client", i, "with index server", servers[serverN])
 		chans[i] = make(chan QueryClientResult)
 		go queryBench(serverN, chans[i])
 	}
+	fmt.Println("Query clients started...")
 	for i, channel := range chans {
 		results[i] = <-channel
 	}
+	fmt.Println("All query clients have finished.")
 	totalQueries, totalReads, avgDuration := 0.0, 0.0, 0.0
 	for i, result := range results {
 		fmt.Printf("%d: QueryTxns: %f, Queries: %f, QueryTxns/s: %f, Query/s: %f, Reads: %f, Reads/s: %f\n", i,
-			result.nCycles, result.nCycles*QUERIES_PER_TXN, (result.nCycles/result.duration)*1000,
-			(result.nCycles*QUERIES_PER_TXN/result.duration)*1000, result.nReads, (result.nReads/result.duration)*1000)
+			result.nCycles, result.nCycles*float64(len(queryFuncs)), (result.nCycles/result.duration)*1000,
+			(result.nCycles*float64(len(queryFuncs))/result.duration)*1000, result.nReads, (result.nReads/result.duration)*1000)
 		totalQueries += result.nCycles
 		totalReads += result.nReads
 		avgDuration += result.duration
 	}
 	avgDuration /= float64(len(results))
-	fmt.Printf("Totals: QueryTxns: %f, Queries: %f, QueryTxns/s: %f, Query/s: %f, Reads: %f, Reads/s: %f\n", totalQueries, totalQueries*QUERIES_PER_TXN,
-		(totalQueries/avgDuration)*1000, (totalQueries*QUERIES_PER_TXN/avgDuration)*1000, totalReads, (totalReads/avgDuration)*1000)
+	fmt.Printf("Totals: QueryTxns: %f, Queries: %f, QueryTxns/s: %f, Query/s: %f, Reads: %f, Reads/s: %f\n", totalQueries, totalQueries*float64(len(queryFuncs)),
+		(totalQueries/avgDuration)*1000, (totalQueries*float64(len(queryFuncs))/avgDuration)*1000, totalReads, (totalReads/avgDuration)*1000)
 }
 
 func queryBench(defaultServer int, resultChan chan QueryClientResult) {
@@ -79,7 +81,9 @@ func queryBench(defaultServer int, resultChan chan QueryClientResult) {
 	client := QueryClient{serverConns: conns, indexServer: defaultServer}
 	cycles, reads := 0, 0
 	startTime := time.Now().UnixNano() / 1000000
-	endTime, lastPrint, printTime := int64(0), startTime, TEST_DURATION/5
+	//endTime, lastPrint, printTime := int64(0), startTime, TEST_DURATION/5
+	endTime := int64(0)
+
 	for endTime-startTime < TEST_DURATION {
 		reads += sendQ3(client)
 		reads += sendQ5(client)
@@ -87,14 +91,21 @@ func queryBench(defaultServer int, resultChan chan QueryClientResult) {
 		reads += sendQ14(client)
 		//reads += sendQ15(client)
 		reads += sendQ18(client)
+
+		/*
+			for _, query := range queryFuncs {
+				reads += query(client)
+			}
+		*/
 		cycles++
 		endTime = time.Now().UnixNano() / 1000000
-		//if cycles%10 == 0 {
-		if endTime-lastPrint > printTime {
-			//fmt.Printf("Query set number %d complete.\n", cycles)
-			fmt.Printf("Query sets done so far %d\n", cycles)
-			lastPrint = endTime
-		}
+		/*
+			if endTime-lastPrint > printTime {
+				//fmt.Printf("Query set number %d complete.\n", cycles)
+				fmt.Printf("Query sets done so far %d\n", cycles)
+				lastPrint = endTime
+			}
+		*/
 	}
 	resultChan <- QueryClientResult{duration: float64(endTime - startTime), nCycles: float64(cycles), nReads: float64(reads)}
 }
@@ -300,7 +311,6 @@ func sendQ15(client QueryClient) (nRequests int) {
 	date := strconv.FormatInt(rndYear, 10) + strconv.FormatInt(rndQuarter, 10)
 	//rndQuarter, rndYear := int64(1), int64(1995)
 	//date := strconv.FormatInt(rndYear, 10) + strconv.FormatInt(rndQuarter, 10)
-	fmt.Println(rndQuarter, rndYear)
 
 	readParam := []antidote.ReadObjectParams{antidote.ReadObjectParams{
 		KeyParams: antidote.KeyParams{Key: TOP_SUPPLIERS + date, CrdtType: proto.CRDTType_TOPK_RMV, Bucket: buckets[INDEX_BKT]},
@@ -675,15 +685,12 @@ func mergeQ14IndexReply(protos []*proto.ApbStaticReadObjectsResp) (merged []*pro
 
 //Q15 also needs merge.
 func mergeQ15IndexReply(protos []*proto.ApbStaticReadObjectsResp) (merged []*proto.ApbReadObjectResp) {
-	fmt.Println("Q15 reply", protos, clocksi.ClockSiTimestamp{}.FromBytes(protos[0].GetCommittime().GetCommitTime()))
 	protoObjs := getObjectsFromStaticReadResp(protos)
 	max, amount := int32(-1), 0
 	var currPairs []*proto.ApbIntPair
-	fmt.Println(protoObjs)
 	//Find max and count how many
 	for _, topProtos := range protoObjs {
 		currPairs = topProtos[0].GetTopk().GetValues()
-		//fmt.Println(len(currPairs))
 		if currPairs[0].GetScore() > max {
 			max = currPairs[0].GetScore()
 			amount = len(currPairs)

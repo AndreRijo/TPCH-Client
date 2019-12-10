@@ -62,8 +62,10 @@ With small; VM, disabled, replicaID of 2 bytes intead of 8: 1604MB
 */
 /*
 	TODO debug:
-	//TODO: Analyze how clocks returned in transactions are generated - seems like only the self replica is included.
-//TODO: For some reason, not only are clocks weird, but it seems like when there's only 1 op in a crdt it doesn't get propagated
+//TODO: Analyze how clocks returned in transactions are generated - seems like only the self replica is included (should be fixed now?)
+//TODO: For some reason, not only are clocks weird, but it seems like when there's only 1 op in a crdt it doesn't get propagated (is it fixed now?)
+//TODO: After all upds are sent, one thread (materializer?) gets stuck for quite a while on 100%
+	//This seems to increase exponentially with the number of upds. E.g., 0.1SF is a few (<10) seconds, 1SF is over 3min.
 */
 
 func main() {

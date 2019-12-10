@@ -106,12 +106,76 @@ func handlePrepareSend() {
 	}
 }
 
+func queueDataProto(currMap map[string]crdt.UpdateArguments, name string, bucket string, dataChan chan QueuedMsg) {
+	var updParams []antidote.UpdateObjectParams
+	if CRDT_PER_OBJ {
+		updParams = make([]antidote.UpdateObjectParams, len(currMap))
+		i := 0
+		for key, upd := range currMap {
+			updParams[i] = antidote.UpdateObjectParams{
+				KeyParams:  antidote.KeyParams{Key: key, CrdtType: proto.CRDTType_RRMAP, Bucket: bucket},
+				UpdateArgs: &upd,
+			}
+			i++
+		}
+	} else {
+		var currUpd crdt.UpdateArguments = crdt.EmbMapUpdateAll{Upds: currMap}
+		updParams = []antidote.UpdateObjectParams{antidote.UpdateObjectParams{
+			KeyParams:  antidote.KeyParams{Key: name, CrdtType: proto.CRDTType_RRMAP, Bucket: bucket},
+			UpdateArgs: &currUpd}}
+	}
+	dataChan <- QueuedMsg{code: antidote.StaticUpdateObjs, Message: antidote.CreateStaticUpdateObjs(nil, updParams)}
+}
+
+//Updates a table entry's key, depending on whenever each table entry should be in a separate CRDT or not.
+func getEntryKey(tableName string, entryKey string) (key string) {
+	if CRDT_PER_OBJ {
+		return tableName + entryKey
+	}
+	return entryKey
+}
+
+//Inner most updates: the object/entry itself (upd to an RWEmbMap, whose entries are LWWRegisters)
+func getEntryUpd(headers []string, primKeys []int, table []string, read []int8) (objKey string, entriesUpd *crdt.EmbMapUpdateAll) {
+	entries := make(map[string]crdt.UpdateArguments)
+	for _, tableI := range read {
+		entries[headers[tableI]] = crdt.SetValue{NewValue: table[tableI]}
+	}
+
+	var buf strings.Builder
+	for _, keyIndex := range primKeys {
+		buf.WriteString(table[keyIndex])
+		//TODO: Remove, just for easier debug
+		buf.WriteRune('_')
+	}
+	//TODO: Also remove the slicing after removing the "_"
+	return buf.String()[:buf.Len()-1], &crdt.EmbMapUpdateAll{Upds: entries}
+}
+
+//Inner most updates: the object/entry itself (upd to an RWEmbMap, whose entries are LWWRegisters)
+func getEntryORMapUpd(headers []string, primKeys []int, table []string, read []int8) (objKey string, entriesUpd *crdt.MapAddAll) {
+	entries := make(map[string]crdt.Element)
+	for _, tableI := range read {
+		entries[headers[tableI]] = crdt.Element(table[tableI])
+	}
+
+	var buf strings.Builder
+	for _, keyIndex := range primKeys {
+		buf.WriteString(table[keyIndex])
+		//TODO: Remove, just for easier debug
+		buf.WriteRune('_')
+	}
+	//TODO: Also remove the slicing after removing the "_"
+	return buf.String()[:buf.Len()-1], &crdt.MapAddAll{Values: entries}
+}
+
 func prepareSendPartitioned(tableIndex int) {
+	//TODO: Maybe have a method that does this initialization and returns a struct with all the fields?
 	regionFunc := regionFuncs[tableIndex]
 
 	updsPerServer := make([]map[string]crdt.UpdateArguments, len(procTables.Regions))
 	for i := range updsPerServer {
-		updsPerServer[i] = make(map[string]crdt.UpdateArguments)
+		updsPerServer[i] = make(map[string]crdt.UpdateArguments, maxUpdSize)
 	}
 	table, header, primKeys, read, name := tables[tableIndex], headers[tableIndex], keys[tableIndex], read[tableIndex], tableNames[tableIndex]
 
@@ -121,6 +185,7 @@ func prepareSendPartitioned(tableIndex int) {
 	var currMap map[string]crdt.UpdateArguments
 	for _, obj := range table {
 		key, upd = getEntryUpd(header, primKeys, obj, read)
+		key = getEntryKey(name, key)
 		region = regionFunc(obj)
 		currMap = updsPerServer[region]
 		currMap[key] = *upd
@@ -156,6 +221,7 @@ func prepareSendMultiplePartitioned(tableIndex int) {
 	printTarget := (len(table) / 10) / maxUpdSize
 	for _, obj := range table {
 		key, upd = getEntryUpd(header, primKeys, obj, read)
+		key = getEntryKey(name, key)
 		regions = regionFunc(obj)
 		for _, reg := range regions {
 			currMap = updsPerServer[reg]
@@ -188,6 +254,7 @@ func prepareSendAny(tableIndex int, bucketIndex int) {
 	var upd *crdt.EmbMapUpdateAll
 	for _, obj := range table {
 		key, upd = getEntryUpd(header, primKeys, obj, read)
+		key = getEntryKey(name, key)
 		upds[key] = *upd
 		if len(upds) == maxUpdSize {
 			queueDataProto(upds, name, buckets[bucketIndex], channels.dataChans[0])
@@ -200,47 +267,4 @@ func prepareSendAny(tableIndex int, bucketIndex int) {
 	}
 	//Clean table
 	tables[tableIndex] = nil
-}
-
-func queueDataProto(currMap map[string]crdt.UpdateArguments, name string, bucket string, dataChan chan QueuedMsg) {
-	var currUpd crdt.UpdateArguments = crdt.EmbMapUpdateAll{Upds: currMap}
-	dataChan <- QueuedMsg{
-		code: antidote.StaticUpdateObjs,
-		Message: antidote.CreateStaticUpdateObjs(nil, []antidote.UpdateObjectParams{antidote.UpdateObjectParams{
-			KeyParams:  antidote.KeyParams{Key: name, CrdtType: proto.CRDTType_RRMAP, Bucket: bucket},
-			UpdateArgs: &currUpd}})}
-}
-
-//Inner most updates: the object/entry itself (upd to an RWEmbMap, whose entries are LWWRegisters)
-func getEntryUpd(headers []string, primKeys []int, table []string, read []int8) (objKey string, entriesUpd *crdt.EmbMapUpdateAll) {
-	entries := make(map[string]crdt.UpdateArguments)
-	for _, tableI := range read {
-		entries[headers[tableI]] = crdt.SetValue{NewValue: table[tableI]}
-	}
-
-	var buf strings.Builder
-	for _, keyIndex := range primKeys {
-		buf.WriteString(table[keyIndex])
-		//TODO: Remove, just for easier debug
-		buf.WriteRune('_')
-	}
-	//TODO: Also remove the slicing after removing the "_"
-	return buf.String()[:buf.Len()-1], &crdt.EmbMapUpdateAll{Upds: entries}
-}
-
-//Inner most updates: the object/entry itself (upd to an RWEmbMap, whose entries are LWWRegisters)
-func getEntryORMapUpd(headers []string, primKeys []int, table []string, read []int8) (objKey string, entriesUpd *crdt.MapAddAll) {
-	entries := make(map[string]crdt.Element)
-	for _, tableI := range read {
-		entries[headers[tableI]] = crdt.Element(table[tableI])
-	}
-
-	var buf strings.Builder
-	for _, keyIndex := range primKeys {
-		buf.WriteString(table[keyIndex])
-		//TODO: Remove, just for easier debug
-		buf.WriteRune('_')
-	}
-	//TODO: Also remove the slicing after removing the "_"
-	return buf.String()[:buf.Len()-1], &crdt.MapAddAll{Values: entries}
 }
