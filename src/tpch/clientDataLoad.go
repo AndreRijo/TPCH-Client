@@ -47,6 +47,12 @@ func readProcessSendTable(i int) {
 	channels.procTableChan <- i
 }
 
+func readOrderUpdates() {
+	updOrders := ReadOrderUpdates(updsNames[0], updEntries[0], updParts[0], read[0], N_UPDATE_FILES)
+	procTables.FillOrdersToRegion(updOrders)
+	//procTables.FillOrdersToRegion(nil)
+}
+
 func handleTableProcessing() {
 	left := len(tableNames)
 	for ; left > 0; left-- {
@@ -70,17 +76,32 @@ func handleTableProcessing() {
 		case SUPPLIER:
 			procTables.CreateSuppliers(tables)
 		}
-		channels.prepSendChan <- i
+		if DOES_DATA_LOAD {
+			channels.prepSendChan <- i
+		}
 	}
 	times.clientTables = (time.Now().UnixNano() - times.startTime) / 1000000
 	fmt.Println("Finished creating all tables")
-	//Now we can start preparing the indexes
-	if isIndexGlobal {
-		prepareIndexesToSend()
-	} else {
-		prepareIndexesLocalToSend()
+	//If we're only doing queries, we can clean the unprocessed tables right now, as no further processing will be done
+	if !DOES_DATA_LOAD && !DOES_UPDATES {
+		tables = nil
+	} else if DOES_DATA_LOAD {
+		//Start preparing the indexes
+		if isIndexGlobal {
+			prepareIndexesToSend()
+		} else {
+			prepareIndexesLocalToSend()
+		}
+	} else if DOES_UPDATES {
+		//For the case of DOES_DATA_LOAD && DOES_UPDATES, updates will start after indexes are prepared.
+		//Also, preparing Q15 index is necessary for the updates to work.
+		prepareQ15Index()
+		go startUpdates()
 	}
-
+	if DOES_QUERIES && withUpdates && !DOES_UPDATES {
+		//Read only order updates in order to know the new orderIDs added by the update client.
+		go readOrderUpdates()
+	}
 }
 
 func handlePrepareSend() {

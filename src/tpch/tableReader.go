@@ -107,41 +107,47 @@ func processHeaderLine(line string, headers [][]string, toRead [][]int8, keys []
 
 //File order: orders, lineitem, delete
 //fileLocs and nEntries are required for the 3 files. nParts is only required for the first two.
-func ReadUpdates(fileLocs []string, nEntries []int, nParts []int, toRead [][]int8) (ordersUpds [][]string, lineItemUpds [][]string, deleteKeys []string) {
-	ordersUpds = processUpdFile(fileLocs[0], nEntries[0], nParts[0], toRead[0])
-	lineItemUpds = processUpdFile(fileLocs[1], nEntries[1], nParts[1], toRead[1])
-	deleteKeys = processDeleteFile(fileLocs[2], nEntries[2])
+func ReadUpdates(fileLocs []string, nEntries []int, nParts []int, toRead [][]int8, nFiles int) (ordersUpds [][]string,
+	lineItemUpds [][]string, deleteKeys []string, lineItemSizes []int) {
+	ordersUpds, lineItemUpds, deleteKeys = make([][]string, nEntries[0]*nFiles), make([][]string, nEntries[1]*nFiles), make([]string, nEntries[2]*nFiles)
+	lineItemSizes = make([]int, nFiles)
+	orderI, lineI, deleteI := 0, 0, 0
+	i, nFiles64 := int64(1), int64(nFiles)
+	for ; i <= nFiles64; i, deleteI = i+1, deleteI+nEntries[2] {
+		orderI += processUpdFile(fileLocs[0]+strconv.FormatInt(i, 10), nEntries[0], nParts[0], toRead[0], ordersUpds[orderI:])
+		lineItemSizes[i-1] = processUpdFile(fileLocs[1]+strconv.FormatInt(i, 10), nEntries[1], nParts[1], toRead[1], lineItemUpds[lineI:])
+		lineI += lineItemSizes[i-1]
+		processDeleteFile(fileLocs[2]+strconv.FormatInt(i, 10), nEntries[2], deleteKeys[deleteI:])
+	}
+	ordersUpds, lineItemUpds = ordersUpds[:orderI], lineItemUpds[:lineI]
 	return
 }
 
-func processUpdFile(fileLoc string, nEntries int, nParts int, toRead []int8) (tableUpds [][]string) {
+//Lineitems has a random number of entries
+func processUpdFile(fileLoc string, nEntries int, nParts int, toRead []int8, tableUpds [][]string) (linesRead int) {
 	if file, err := getFile(fileLoc); err == nil {
 		defer file.Close()
-		tableUpds = make([][]string, nEntries, nEntries)
 		scanner := bufio.NewScanner(file)
-		i := 0
-		for ; scanner.Scan(); i++ {
-			tableUpds[i] = processLine(scanner.Text(), nParts, toRead)
+		linesRead = 0
+		for ; scanner.Scan(); linesRead++ {
+			tableUpds[linesRead] = processLine(scanner.Text(), nParts, toRead)
 		}
 	}
 	return
 }
 
-func processDeleteFile(fileLoc string, nEntries int) (deleteKeys []string) {
+func processDeleteFile(fileLoc string, nEntries int, deleteKeys []string) {
 	if file, err := getFile(fileLoc); err == nil {
 		defer file.Close()
-		deleteKeys = make([]string, nEntries, nEntries)
 		scanner := bufio.NewScanner(file)
 		i := 0
 		currLine := ""
 		for ; scanner.Scan(); i++ {
 			currLine = scanner.Text()
-			//deleteKeys[i], _ = strconv.Atoi(currLine[:len(currLine)-1])
 			//Removing the "|" at the end
 			deleteKeys[i] = currLine[:len(currLine)-1]
 		}
 	}
-	return
 }
 
 func getFile(fileLoc string) (file *os.File, err error) {
@@ -151,4 +157,27 @@ func getFile(fileLoc string) (file *os.File, err error) {
 		fmt.Println(err)
 	}
 	return
+}
+
+func ReadOrderUpdates(baseFileName string, nEntries int, nParts int, toRead []int8, nFiles int) (ordersUpds [][]string) {
+	fileType := ".tbl.u"
+	ordersUpds = make([][]string, nEntries*int(nFiles))
+	nextStart, nFiles64 := 0, int64(nFiles)
+	var i int64
+	for i = 1; i <= nFiles64; i++ {
+		processUpdFileWithSlice(baseFileName+fileType+strconv.FormatInt(i, 10), nEntries, nParts, toRead, ordersUpds, nextStart)
+		nextStart += nEntries
+	}
+	return
+}
+
+func processUpdFileWithSlice(fileLoc string, nEntries int, nParts int, toRead []int8, upds [][]string, startPos int) {
+	if file, err := getFile(fileLoc); err == nil {
+		defer file.Close()
+		scanner := bufio.NewScanner(file)
+		i := startPos
+		for ; scanner.Scan(); i++ {
+			upds[i] = processLine(scanner.Text(), nParts, toRead)
+		}
+	}
 }

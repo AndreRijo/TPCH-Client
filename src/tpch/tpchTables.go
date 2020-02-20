@@ -137,6 +137,10 @@ type Tables struct {
 	LastAddedLineItems [][]*LineItem
 	//Index helpers
 	PromoParts map[int32]struct{}
+	//Used by queries to know where to download the order from
+	OrdersRegion []int8
+	//Stores the current order to region function.
+	orderToRegionFun func(int32) int8
 }
 
 //*****Auxiliary data types*****//
@@ -209,9 +213,26 @@ func CreateClientTables(rawData [][][]string) (tables *Tables) {
 		Segments:          createSegmentsList(),
 	}
 	tables.PromoParts = calculatePromoParts(tables.Parts)
+	tables.orderToRegionFun = tables.orderkeyToRegionkeyMultiple
 	endTime := time.Now().UnixNano() / 1000000
 	fmt.Println("Time taken to process tables:", endTime-startTime, "ms")
 	return
+}
+
+func (tab *Tables) FillOrdersToRegion(updOrders [][]string) {
+	//Note: processing updOrders could be more efficient if we assume the IDs are ordered (i.e., we could avoid having to do ParseInt of orderKey))
+	//Total orders is *4 the initial size, but we need to remove the "+1" existent in Orders due to the first entry being empty
+	tab.OrdersRegion = make([]int8, (len(tab.Orders)-1)*4+1)
+	for _, order := range tab.Orders[1:] {
+		tab.OrdersRegion[order.O_ORDERKEY] = tab.Nations[tab.Customers[order.O_CUSTKEY].C_NATIONKEY].N_REGIONKEY
+	}
+	var custKey int64
+	var orderKey int64
+	for _, updOrder := range updOrders {
+		custKey, _ = strconv.ParseInt(updOrder[O_CUSTKEY], 10, 32)
+		orderKey, _ = strconv.ParseInt(updOrder[O_ORDERKEY], 10, 32)
+		tab.OrdersRegion[orderKey] = tab.Nations[tab.Customers[custKey].C_NATIONKEY].N_REGIONKEY
+	}
 }
 
 func createCustomerTable(cTable [][]string) (customers []*Customer) {
@@ -598,6 +619,7 @@ func (tab *Tables) UpdateOrderLineitems(order []string, lineItems [][]string) (o
 
 func (tab *Tables) InitConstants() {
 	tab.Segments = createSegmentsList()
+	tab.orderToRegionFun = tab.orderkeyToRegionkeyMultiple
 }
 
 func (tab *Tables) CreateCustomers(table [][][]string) {
@@ -649,5 +671,16 @@ func (tab *Tables) Custkey32ToRegionkey(custKey int32) int8 {
 }
 
 func (tab *Tables) OrderkeyToRegionkey(orderKey int32) int8 {
+	return tab.orderToRegionFun(orderKey)
+}
+
+func (tab *Tables) orderkeyToRegionkeyMultiple(orderKey int32) int8 {
 	return tab.Nations[tab.Customers[tab.Orders[GetOrderIndex(orderKey)].O_CUSTKEY].C_NATIONKEY].N_REGIONKEY
+}
+
+//Uses special array instead of consulting customers and nations tab.
+//TODO: On places where OrderkeyToRegionkey is referred, replace with OrderkeyToRegionkeyDirect once it's ready.
+//Maybe store the function to use in a variable and replace it once appropriate?
+func (tab *Tables) orderkeyToRegionkeyDirect(orderKey int32) int8 {
+	return tab.OrdersRegion[orderKey]
 }

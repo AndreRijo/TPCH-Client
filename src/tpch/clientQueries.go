@@ -10,6 +10,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	pb "github.com/golang/protobuf/proto"
@@ -48,20 +49,40 @@ func startQueriesBench() {
 
 	chans := make([]chan QueryClientResult, TEST_ROUTINES)
 	results := make([]QueryClientResult, TEST_ROUTINES)
+	serverPerClient := make([]int, TEST_ROUTINES)
 	for i := 0; i < TEST_ROUTINES; i++ {
-		serverN := rand.Intn(len(servers))
+		//serverN := rand.Intn(len(servers))
+		serverN := 0
 		//fmt.Println("Starting query client", i, "with index server", servers[serverN])
 		chans[i] = make(chan QueryClientResult)
+		serverPerClient[i] = serverN
 		go queryBench(serverN, chans[i])
 	}
 	fmt.Println("Query clients started...")
+
+	//TODO: Go back on this
+	j := int32(0)
 	for i, channel := range chans {
-		results[i] = <-channel
+		go func(x int, channel chan QueryClientResult) {
+			results[x] = <-channel
+			fmt.Printf("Query client %d finished |", x)
+			atomic.AddInt32(&j, 1)
+		}(i, channel)
+		//fmt.Printf("Query client %d finished |", i)
+		//results[i] = <-channel
 	}
+	for j < int32(len(results)) {
+		time.Sleep(100 * time.Millisecond)
+	}
+
+	//for i, channel := range chans {
+	//results[i] = <-channel
+	//}
+	fmt.Println()
 	fmt.Println("All query clients have finished.")
 	totalQueries, totalReads, avgDuration := 0.0, 0.0, 0.0
 	for i, result := range results {
-		fmt.Printf("%d: QueryTxns: %f, Queries: %f, QueryTxns/s: %f, Query/s: %f, Reads: %f, Reads/s: %f\n", i,
+		fmt.Printf("%d[%d]: QueryTxns: %f, Queries: %f, QueryTxns/s: %f, Query/s: %f, Reads: %f, Reads/s: %f\n", i, serverPerClient[i],
 			result.nCycles, result.nCycles*float64(len(queryFuncs)), (result.nCycles/result.duration)*1000,
 			(result.nCycles*float64(len(queryFuncs))/result.duration)*1000, result.nReads, (result.nReads/result.duration)*1000)
 		totalQueries += result.nCycles
@@ -89,7 +110,7 @@ func queryBench(defaultServer int, resultChan chan QueryClientResult) {
 		reads += sendQ5(client)
 		reads += sendQ11(client)
 		reads += sendQ14(client)
-		//reads += sendQ15(client)
+		reads += sendQ15(client)
 		reads += sendQ18(client)
 
 		/*
@@ -220,15 +241,14 @@ func sendQ5(client QueryClient) (nRequests int) {
 	rndRegion := rand.Intn(len(procTables.Regions))
 	rndRegionN := procTables.Regions[rndRegion].R_NAME
 	rndYear := 1993 + rand.Int63n(5)
-	bktI := getIndexOffset(rndRegion)
+	bktI, serverI := getIndexOffset(client, rndRegion)
 
-	readParam := []antidote.ReadObjectParams{antidote.ReadObjectParams{
-		KeyParams: antidote.KeyParams{
-			Key: NATION_REVENUE + rndRegionN + strconv.FormatInt(rndYear, 10), CrdtType: proto.CRDTType_RRMAP, Bucket: buckets[bktI]},
-	},
+	readParam := []antidote.ReadObjectParams{antidote.ReadObjectParams{KeyParams: antidote.KeyParams{
+		Key: NATION_REVENUE + rndRegionN + strconv.FormatInt(rndYear, 10), CrdtType: proto.CRDTType_RRMAP, Bucket: buckets[bktI]}},
 	}
 
-	replyProto := sendReceiveReadObjsProto(client, readParam, bktI-INDEX_BKT)
+	//replyProto := sendReceiveReadObjsProto(client, readParam, bktI-INDEX_BKT)
+	replyProto := sendReceiveReadObjsProto(client, readParam, serverI)
 	mapState := crdt.ReadRespProtoToAntidoteState(replyProto.GetObjects().GetObjects()[0], proto.CRDTType_RRMAP, proto.READType_FULL).(crdt.EmbMapEntryState)
 
 	if PRINT_QUERY {
@@ -245,14 +265,15 @@ func sendQ11(client QueryClient) (nRequests int) {
 	//Unfortunatelly we can't use the topk query of "only values above min" here as we need to fetch the min from the database first.
 	rndNation := procTables.Nations[rand.Intn(len(procTables.Nations))]
 	rndNationN, rndNationR := rndNation.N_NAME, rndNation.N_REGIONKEY
-	bktI := getIndexOffset(int(rndNationR))
+	bktI, serverI := getIndexOffset(client, int(rndNationR))
 
 	readParam := []antidote.ReadObjectParams{
 		antidote.ReadObjectParams{KeyParams: antidote.KeyParams{Key: IMP_SUPPLY + rndNationN, CrdtType: proto.CRDTType_TOPK_RMV, Bucket: buckets[bktI]}},
 		antidote.ReadObjectParams{KeyParams: antidote.KeyParams{Key: SUM_SUPPLY + rndNationN, CrdtType: proto.CRDTType_COUNTER, Bucket: buckets[bktI]}},
 	}
 
-	replyProto := sendReceiveReadObjsProto(client, readParam, bktI-INDEX_BKT)
+	//replyProto := sendReceiveReadObjsProto(client, readParam, bktI-INDEX_BKT)
+	replyProto := sendReceiveReadObjsProto(client, readParam, serverI)
 	objsProto := replyProto.GetObjects().GetObjects()
 	topkProto, counterProto := objsProto[0].GetTopk(), objsProto[1].GetCounter()
 
@@ -274,10 +295,8 @@ func sendQ11(client QueryClient) (nRequests int) {
 
 func sendQ14(client QueryClient) (nRequests int) {
 	rndForDate := rand.Int63n(60) //60 months from 1993 to 1997 (5 years)
-	var year int64 = 1993 + rndForDate/12
-	var month int64 = 1 + rndForDate%12
-	var date string
-	date = strconv.FormatInt(year, 10) + strconv.FormatInt(month, 10)
+	year, month := 1993+rndForDate/12, 1+rndForDate%12
+	date := strconv.FormatInt(year, 10) + strconv.FormatInt(month, 10)
 	var avgProto *proto.ApbGetAverageResp
 
 	//Need to send AvgFullRead instead of state reads in case the index is local. The merge function will return the reply as if it was a single average though.
@@ -301,16 +320,10 @@ func sendQ14(client QueryClient) (nRequests int) {
 	return len(client.serverConns)
 }
 
-//Seems like some quarters don't have anything? I'll need to check (1, 94)
-//More specifically the issue seems to be only on the first query execution.
-//E.g., (1, 94) is fine if it's not the first one
 func sendQ15(client QueryClient) (nRequests int) {
 	rndQuarter := 1 + 3*rand.Int63n(4)
 	rndYear := 1993 + rand.Int63n(5)
-	//rndQuarter, rndYear := int64(1), int64(1994)
 	date := strconv.FormatInt(rndYear, 10) + strconv.FormatInt(rndQuarter, 10)
-	//rndQuarter, rndYear := int64(1), int64(1995)
-	//date := strconv.FormatInt(rndYear, 10) + strconv.FormatInt(rndQuarter, 10)
 
 	readParam := []antidote.ReadObjectParams{antidote.ReadObjectParams{
 		KeyParams: antidote.KeyParams{Key: TOP_SUPPLIERS + date, CrdtType: proto.CRDTType_TOPK_RMV, Bucket: buckets[INDEX_BKT]},
@@ -514,6 +527,7 @@ func getReadArgsPerBucket(tableIndex int) (readParams map[int8]antidote.ReadObje
 	return
 }
 
+//nConn will ALWAYS be 0 when indexes aren't partitioned!
 func sendReceiveReadObjsProto(client QueryClient, fullReads []antidote.ReadObjectParams, nConn int) (replyProto *proto.ApbStaticReadObjectsResp) {
 	antidote.SendProto(antidote.StaticReadObjs, antidote.CreateStaticReadObjs(nil, fullReads), client.serverConns[nConn])
 	_, tmpProto, _ := antidote.ReceiveProto(client.serverConns[nConn])
@@ -754,11 +768,13 @@ func getObjectsFromStaticReadResp(protos []*proto.ApbStaticReadObjectsResp) (pro
 	return
 }
 
-func getIndexOffset(region int) int {
+func getIndexOffset(client QueryClient, region int) (bucketI, serverI int) {
 	if !isIndexGlobal {
-		return INDEX_BKT + region
+		//return INDEX_BKT + region
+		return INDEX_BKT + region, region
 	}
-	return INDEX_BKT
+	//return INDEX_BKT
+	return INDEX_BKT, client.indexServer
 }
 
 func unpackIndexExtraData(data []byte, nEntries int) (parts []string) {

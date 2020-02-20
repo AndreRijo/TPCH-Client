@@ -60,6 +60,11 @@ func prepareIndexesToSend() {
 
 	//Signal the end
 	channels.indexChans[0] <- QueuedMsg{code: QUEUE_COMPLETE}
+
+	//Start reading updates data
+	if DOES_UPDATES {
+		go startUpdates()
+	}
 }
 
 func queueIndex(upds []antidote.UpdateObjectParams) {
@@ -101,6 +106,11 @@ func prepareIndexesLocalToSend() {
 	//Signal the end
 	for _, channel := range channels.indexChans {
 		channel <- QueuedMsg{code: QUEUE_COMPLETE}
+	}
+
+	//Start reading updates data
+	if DOES_UPDATES {
+		go startUpdates()
 	}
 }
 
@@ -184,6 +194,13 @@ func prepareQ3Index() (upds []antidote.UpdateObjectParams) {
 	nUpds := 0
 	for orderI, order := range procTables.Orders[1:] {
 		nUpds += q3CalcHelper(sumMap, order, orderI)
+	}
+	//Override nUpds if useTopKAll
+	if useTopKAll {
+		nUpds = 0
+		for _, segMap := range sumMap {
+			nUpds += len(segMap)
+		}
 	}
 
 	return makeQ3IndexUpds(sumMap, nUpds, INDEX_BKT)
@@ -654,11 +671,11 @@ func q18CalcHelper(quantityMap map[int32]map[int32]*PairInt, order *Orders, inde
 }
 
 func makeQ3IndexUpds(sumMap map[string]map[int8]map[int32]*float64, nUpds int, bucketI int) (upds []antidote.UpdateObjectParams) {
-	//TODO: TopKAddAll for optimization purposes?
 	upds = make([]antidote.UpdateObjectParams, nUpds)
 	var keyArgs antidote.KeyParams
 	i := 0
-	if !INDEX_WITH_FULL_DATA {
+	j := 0
+	if INDEX_WITH_FULL_DATA {
 		for mktSeg, segMap := range sumMap {
 			for day, dayMap := range segMap {
 				//A topK per pair (mktsegment, orderdate)
@@ -668,12 +685,25 @@ func makeQ3IndexUpds(sumMap map[string]map[int8]map[int32]*float64, nUpds int, b
 					Bucket:   buckets[bucketI],
 				}
 				//TODO: Actually use float
-				for orderKey, sum := range dayMap {
-					var currUpd crdt.UpdateArguments = crdt.TopKAdd{TopKScore: crdt.TopKScore{Id: orderKey, Score: int32(*sum),
-						Data: packQ3IndexExtraData(orderKey)}}
+				if !useTopKAll {
+					for orderKey, sum := range dayMap {
+						var currUpd crdt.UpdateArguments = crdt.TopKAdd{TopKScore: crdt.TopKScore{Id: orderKey, Score: int32(*sum),
+							Data: packQ3IndexExtraData(orderKey)}}
+						upds[i] = antidote.UpdateObjectParams{KeyParams: keyArgs, UpdateArgs: &currUpd}
+						i++
+					}
+				} else {
+					adds := make([]crdt.TopKScore, len(dayMap))
+					j := 0
+					for orderKey, sum := range dayMap {
+						adds[j] = crdt.TopKScore{Id: orderKey, Score: int32(*sum), Data: packQ3IndexExtraData(orderKey)}
+						j++
+					}
+					var currUpd crdt.UpdateArguments = crdt.TopKAddAll{Scores: adds}
 					upds[i] = antidote.UpdateObjectParams{KeyParams: keyArgs, UpdateArgs: &currUpd}
 					i++
 				}
+				j++
 			}
 		}
 	} else {
@@ -686,16 +716,27 @@ func makeQ3IndexUpds(sumMap map[string]map[int8]map[int32]*float64, nUpds int, b
 					Bucket:   buckets[bucketI],
 				}
 				//TODO: Actually use float
-				for orderKey, sum := range dayMap {
-					var currUpd crdt.UpdateArguments = crdt.TopKAdd{TopKScore: crdt.TopKScore{Id: orderKey, Score: int32(*sum)}}
+				if !useTopKAll {
+					for orderKey, sum := range dayMap {
+						var currUpd crdt.UpdateArguments = crdt.TopKAdd{TopKScore: crdt.TopKScore{Id: orderKey, Score: int32(*sum)}}
+						upds[i] = antidote.UpdateObjectParams{KeyParams: keyArgs, UpdateArgs: &currUpd}
+						i++
+					}
+				} else {
+					adds := make([]crdt.TopKScore, len(dayMap))
+					j := 0
+					for orderKey, sum := range dayMap {
+						adds[j] = crdt.TopKScore{Id: orderKey, Score: int32(*sum)}
+						j++
+					}
+					var currUpd crdt.UpdateArguments = crdt.TopKAddAll{Scores: adds}
 					upds[i] = antidote.UpdateObjectParams{KeyParams: keyArgs, UpdateArgs: &currUpd}
-					i++
 				}
+				j++
 			}
 		}
 	}
-
-	fmt.Println(nUpds)
+	fmt.Println(nUpds, j)
 	return
 }
 
@@ -782,15 +823,18 @@ func makeQ14IndexUpds(mapPromo map[string]*float64, mapTotal map[string]*float64
 		i++
 	}
 	fmt.Println(len(mapPromo))
+	//upds = upds[:40]
 	return
 }
 
 func makeQ15IndexUpds(yearMap map[int16]map[int8]map[int32]*float64, nUpds int, bucketI int) (upds []antidote.UpdateObjectParams) {
-	//Create the updates
+	//Create the updates. Always 20 updates if doing with TopKAddAll (5 years * 4 months)
+	if useTopKAll {
+		nUpds = 20
+	}
 	upds = make([]antidote.UpdateObjectParams, nUpds)
 	var keyArgs antidote.KeyParams
 
-	//TODO: TopK with multipleAdd
 	i, month := 0, int8(0)
 	for year, monthMap := range yearMap {
 		for month = 1; month <= 12; month += 3 {
@@ -799,15 +843,29 @@ func makeQ15IndexUpds(yearMap map[int16]map[int8]map[int32]*float64, nUpds int, 
 				CrdtType: proto.CRDTType_TOPK_RMV,
 				Bucket:   buckets[bucketI],
 			}
-			for suppKey, value := range monthMap[month] {
-				//TODO: Not use int32 for value
-				var currUpd crdt.UpdateArguments = crdt.TopKAdd{TopKScore: crdt.TopKScore{
-					Id:    suppKey,
-					Score: int32(*value),
-				}}
+			if !useTopKAll {
+				for suppKey, value := range monthMap[month] {
+					//TODO: Not use int32 for value
+					var currUpd crdt.UpdateArguments = crdt.TopKAdd{TopKScore: crdt.TopKScore{
+						Id:    suppKey,
+						Score: int32(*value),
+					}}
+					upds[i] = antidote.UpdateObjectParams{KeyParams: keyArgs, UpdateArgs: &currUpd}
+					i++
+				}
+			} else {
+				adds := make([]crdt.TopKScore, len(monthMap[month]))
+				j := 0
+				for suppKey, value := range monthMap[month] {
+					//TODO: Not use int32 for value
+					adds[j] = crdt.TopKScore{Id: suppKey, Score: int32(*value)}
+					j++
+				}
+				var currUpd crdt.UpdateArguments = crdt.TopKAddAll{Scores: adds}
 				upds[i] = antidote.UpdateObjectParams{KeyParams: keyArgs, UpdateArgs: &currUpd}
 				i++
 			}
+
 		}
 	}
 	fmt.Println(nUpds)
@@ -815,9 +873,14 @@ func makeQ15IndexUpds(yearMap map[int16]map[int8]map[int32]*float64, nUpds int, 
 }
 
 func makeQ18IndexUpds(quantityMap map[int32]map[int32]*PairInt, bucketI int) (upds []antidote.UpdateObjectParams) {
+	nUpds := 0
+	if useTopKAll {
+		nUpds = 4
+	} else {
+		nUpds = len(quantityMap[312]) + len(quantityMap[313]) + len(quantityMap[314]) + len(quantityMap[315])
+	}
 	//Create the updates
-	upds = make([]antidote.UpdateObjectParams, len(quantityMap[312])+len(quantityMap[313])+
-		len(quantityMap[314])+len(quantityMap[315]))
+	upds = make([]antidote.UpdateObjectParams, nUpds)
 	var keyArgs antidote.KeyParams
 
 	//TODO: TopK with multipleAdd
@@ -829,12 +892,24 @@ func makeQ18IndexUpds(quantityMap map[int32]map[int32]*PairInt, bucketI int) (up
 				CrdtType: proto.CRDTType_TOPK_RMV,
 				Bucket:   buckets[bucketI],
 			}
-			for orderKey, pair := range orderMap {
-				//TODO: Store the customerKey also
-				var currUpd crdt.UpdateArguments = crdt.TopKAdd{TopKScore: crdt.TopKScore{
-					Id:    orderKey,
-					Score: pair.second,
-				}}
+			if !useTopKAll {
+				for orderKey, pair := range orderMap {
+					//TODO: Store the customerKey also
+					var currUpd crdt.UpdateArguments = crdt.TopKAdd{TopKScore: crdt.TopKScore{
+						Id:    orderKey,
+						Score: pair.second,
+					}}
+					upds[i] = antidote.UpdateObjectParams{KeyParams: keyArgs, UpdateArgs: &currUpd}
+					i++
+				}
+			} else {
+				adds := make([]crdt.TopKScore, len(orderMap))
+				j := 0
+				for orderKey, pair := range orderMap {
+					adds[j] = crdt.TopKScore{Id: orderKey, Score: pair.second}
+					j++
+				}
+				var currUpd crdt.UpdateArguments = crdt.TopKAddAll{Scores: adds}
 				upds[i] = antidote.UpdateObjectParams{KeyParams: keyArgs, UpdateArgs: &currUpd}
 				i++
 			}
@@ -846,19 +921,31 @@ func makeQ18IndexUpds(quantityMap map[int32]map[int32]*PairInt, bucketI int) (up
 				CrdtType: proto.CRDTType_TOPK_RMV,
 				Bucket:   buckets[bucketI],
 			}
-			for orderKey, pair := range orderMap {
-				//TODO: Store the customerKey also
-				var currUpd crdt.UpdateArguments = crdt.TopKAdd{TopKScore: crdt.TopKScore{
-					Id:    orderKey,
-					Score: pair.second,
-					Data:  packQ18IndexExtraData(orderKey),
-				}}
+			if !useTopKAll {
+				for orderKey, pair := range orderMap {
+					//TODO: Store the customerKey also
+					var currUpd crdt.UpdateArguments = crdt.TopKAdd{TopKScore: crdt.TopKScore{
+						Id:    orderKey,
+						Score: pair.second,
+						Data:  packQ18IndexExtraData(orderKey),
+					}}
+					upds[i] = antidote.UpdateObjectParams{KeyParams: keyArgs, UpdateArgs: &currUpd}
+					i++
+				}
+			} else {
+				adds := make([]crdt.TopKScore, len(orderMap))
+				j := 0
+				for orderKey, pair := range orderMap {
+					adds[j] = crdt.TopKScore{Id: orderKey, Score: pair.second, Data: packQ18IndexExtraData(orderKey)}
+					j++
+				}
+				var currUpd crdt.UpdateArguments = crdt.TopKAddAll{Scores: adds}
 				upds[i] = antidote.UpdateObjectParams{KeyParams: keyArgs, UpdateArgs: &currUpd}
 				i++
 			}
 		}
 	}
-	fmt.Println(len(quantityMap[312]) + len(quantityMap[313]) + len(quantityMap[314]) + len(quantityMap[315]))
+	fmt.Println(nUpds)
 
 	return
 }

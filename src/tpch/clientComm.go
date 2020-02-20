@@ -49,11 +49,19 @@ var (
 	MAX_BUFF_PROTOS, FORCE_PROTO_CLEAN int
 )
 
-func handleServerComm(connIndex int) {
-	conn, err := net.Dial("tcp", servers[connIndex])
-	tools.CheckErr("Network connection establishment err", err)
-	conns[connIndex] = conn
+func connectToServers() {
+	for i, server := range servers {
+		conn, err := net.Dial("tcp", server)
+		tools.CheckErr("Network connection establishment err", err)
+		conns[i] = conn
+		if DOES_DATA_LOAD {
+			go handleServerComm(i)
+		}
+	}
+}
 
+func handleServerComm(connIndex int) {
+	conn := conns[connIndex]
 	start := time.Now().UnixNano() / 1000000
 	fmt.Println("Starting to send data protos for server", servers[connIndex], "...")
 	complete := false
@@ -107,11 +115,8 @@ func handleIndexComm(connIndex int) {
 			complete = true
 		} else {
 			msg.Message.(*proto.ApbUpdateObjects).TransactionDescriptor = txnId
-			fmt.Println("Starting to send index proto...")
 			antidote.SendProto(msg.code, msg.Message, conn)
-			fmt.Println("Send index proto...")
 			antidote.ReceiveProto(conn)
-			fmt.Println("Received index proto reply...")
 		}
 	}
 
@@ -128,12 +133,57 @@ func handleIndexComm(connIndex int) {
 	if connIndex == 0 {
 		runtime.GC()
 		debug.FreeOSMemory()
-		if QUERY_BENCH {
-			startQueriesBench()
-		} else {
-			sendQueries(conn)
-		}
+		/*
+			if QUERY_BENCH {
+				startQueriesBench()
+			} else {
+				sendQueries(conn)
+			}
+		*/
 	}
 	//sendQueriesNoIndex(conn)
 	//printExecutionTimes()
+}
+
+//Note: Assumes updatesComm and serverComm aren't running at the same time!
+//It's safe to run updates after data ends though.
+func handleUpdatesComm(connIndex int) {
+	fmt.Println("Started updates comm for", connIndex)
+	conn := conns[connIndex]
+	channel := channels.dataChans[connIndex]
+	//var txnId []byte
+	//var txnProto pb.Message
+	complete := false
+	for !complete {
+		msg := <-channel
+		if msg.code == QUEUE_COMPLETE {
+			complete = true
+		} else {
+			antidote.SendProto(msg.code, msg.Message, conn)
+			antidote.ReceiveProto(conn)
+		}
+		/*else if msg.code == antidote.StartTrans {
+			fmt.Println("Starting to send startTxn update proto")
+			antidote.SendProto(msg.code, msg.Message, conn)
+			fmt.Println("Sent startTxn update proto")
+			_, txnProto, _ = antidote.ReceiveProto(conn)
+			fmt.Println("Received startTxn proto reply")
+			txnId = txnProto.(*proto.ApbStartTransactionResp).TransactionDescriptor
+		} else if msg.code == antidote.CommitTrans {
+			fmt.Println("Starting to send commitTxn update proto")
+			antidote.SendProto(msg.code, msg.Message, conn)
+			fmt.Println("Sent commitTxn update proto")
+			antidote.ReceiveProto(conn)
+			fmt.Println("Received commitTxn proto reply")
+		} else {
+			msg.Message.(*proto.ApbUpdateObjects).TransactionDescriptor = txnId
+			fmt.Println("Starting to send update data proto...")
+			antidote.SendProto(msg.code, msg.Message, conn)
+			fmt.Println("Sent update data proto...")
+			antidote.ReceiveProto(conn)
+			fmt.Println("Received update proto reply...")
+		}*/
+	}
+
+	fmt.Println("All update protos have been sent.")
 }

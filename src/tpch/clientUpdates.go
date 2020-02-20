@@ -7,14 +7,62 @@ import (
 	"proto"
 	"strconv"
 	"strings"
+	"time"
 )
 
-func readUpds() (ordersUpds [][]string, lineItemUpds [][]string, deleteKeys []string) {
-	updPartsRead := [][]int8{read[ORDERS], read[LINEITEM]}
-	return ReadUpdates(updCompleteFilename[:], updEntries[:], updParts[:], updPartsRead)
+var (
+	//Filled by configLoader
+	N_UPDATE_FILES int
+
+	updsNames = [...]string{"orders", "lineitem", "delete"}
+	//Orders and delete follow SF, except for SF = 0.01. It's filled automatically in tpchClient.go
+	updEntries []int
+	updParts   = [...]int{9, 16}
+)
+
+//TODO: updates for local indexes?
+//TODO: removes/updates for individual objects (i.e., option in which each customer has its own CRDT)?
+//TODO: extra data for indexes (high priority!)
+
+func startUpdates() {
+	fmt.Println("Reading updates...")
+	readStart := time.Now().UnixNano()
+	ordersUpds, lineItemUpds, deleteKeys, lineItemSizes := readUpds()
+	readFinish := time.Now().UnixNano()
+	fmt.Println("Finished reading updates. Time taken for read:", (readFinish-readStart)/1000000, "ms")
+
+	//Start server communication for update sending
+	for i := range channels.dataChans {
+		go handleUpdatesComm(i)
+	}
+	//Sleep until query clients start. We need to offset the time spent on sending base data/indexes, plus reading time
+	//QUERY_WAIT is in ms.
+	fmt.Println("Waiting to start updates...")
+	time.Sleep(QUERY_WAIT*1000000 - time.Duration(time.Now().UnixNano()-times.startTime))
+	fmt.Println("Starting updates...")
+	updateStart := time.Now().UnixNano()
+
+	orderStart, lineStart, orderFinish, lineFinish := 0, 0, 0, 0
+	for i := 0; i < N_UPDATE_FILES; i++ {
+		fmt.Println("Update", i)
+		orderFinish, lineFinish = orderFinish+updEntries[0], lineFinish+lineItemSizes[i]
+		sendDataChangesV2(ordersUpds[orderStart:orderFinish], lineItemUpds[lineStart:lineFinish], deleteKeys[orderStart:orderFinish], lineItemSizes)
+		orderStart, lineStart = orderStart+updEntries[0], lineStart+lineItemSizes[i]
+	}
+	for i := 0; i < len(channels.dataChans); i++ {
+		channels.dataChans[i] <- QueuedMsg{code: QUEUE_COMPLETE}
+	}
+
+	updateFinish := time.Now().UnixNano()
+	fmt.Println("Finished updates. Time taken for updating:", (updateFinish-updateStart)/1000000)
 }
 
-func sendDataChangesV2(ordersUpds [][]string, lineItemUpds [][]string, deleteKeys []string) {
+func readUpds() (ordersUpds [][]string, lineItemUpds [][]string, deleteKeys []string, lineItemSizes []int) {
+	updPartsRead := [][]int8{read[ORDERS], read[LINEITEM]}
+	return ReadUpdates(updCompleteFilename[:], updEntries[:], updParts[:], updPartsRead, N_UPDATE_FILES)
+}
+
+func sendDataChangesV2(ordersUpds [][]string, lineItemUpds [][]string, deleteKeys []string, lineItemSizes []int) {
 	//Maybe I can do like this:
 	//1st - deletes
 	//2nd - updates
@@ -143,21 +191,31 @@ func sendUpdates(ordersUpds [][]string, lineItemUpds [][]string) {
 
 func sendIndexUpdates(deleteKeys []string, ordersUpds [][]string, lineItemUpds [][]string) {
 	indexUpds := make([][]antidote.UpdateObjectParams, 7)
+	//indexUpds := make([][]antidote.UpdateObjectParams, 6)
 	remOrders, remItems := getDeleteClientTables(deleteKeys)
 	procTables.UpdateOrderLineitems(ordersUpds, lineItemUpds)
 
 	newOrders, newItems := procTables.LastAddedOrders, procTables.LastAddedLineItems
-	indexUpds[0], indexUpds[1] = getQ3UpdsV2(remOrders, remItems, newOrders, newItems)
-	indexUpds[2] = getQ5UpdsV2(remOrders, remItems, newOrders, newItems)
+	//indexUpds[0], indexUpds[1] = getQ3UpdsV2(remOrders, remItems, newOrders, newItems)
+	//indexUpds[2] = getQ5UpdsV2(remOrders, remItems, newOrders, newItems)
 	//Query 11 doesn't need updates (Nation/Supply only, which are never updated.)
-	//q11Upds := getQ11Upds(order, lineItems)
-	indexUpds[3] = getQ14UpdsV2(remOrders, remItems, newOrders, newItems)
-	indexUpds[4] = getQ15UpdsV2(remOrders, remItems, newOrders, newItems)
-	indexUpds[5], indexUpds[6] = getQ18UpdsV2(remOrders, remItems, newOrders, newItems)
+	//indexUpds[3] = getQ14UpdsV2(remOrders, remItems, newOrders, newItems)
+	//indexUpds[4] = getQ15UpdsV2(remOrders, remItems, newOrders, newItems)
+	//indexUpds[5], indexUpds[6] = getQ18UpdsV2(remOrders, remItems, newOrders, newItems)
+
+	indexUpds[6] = getQ14UpdsV2(remOrders, remItems, newOrders, newItems)
+	//indexUpds[0] = getQ14UpdsV2(remOrders, remItems, newOrders, newItems)
+
+	indexUpds[0] = getQ15UpdsV2(remOrders, remItems, newOrders, newItems)
+	indexUpds[1] = getQ5UpdsV2(remOrders, remItems, newOrders, newItems)
+	indexUpds[2], indexUpds[3] = getQ18UpdsV2(remOrders, remItems, newOrders, newItems)
+	//Works but it's very slow! (added ~50s overhead instead of like 2-4s as each other did)
+	indexUpds[4], indexUpds[5] = getQ3UpdsV2(remOrders, remItems, newOrders, newItems)
 
 	for _, upds := range indexUpds {
-		//Might want to send this to a different channel? And group?
-		channels.indexChans[0] <- QueuedMsg{code: antidote.StaticUpdateObjs,
+		//TODO: Smarter sending?
+		//channels.dataChans[rand.Intn(len(channels.dataChans))] <- QueuedMsg{code: antidote.StaticUpdateObjs,
+		channels.dataChans[0] <- QueuedMsg{code: antidote.StaticUpdateObjs,
 			Message: antidote.CreateStaticUpdateObjs(nil, upds),
 		}
 	}
@@ -205,9 +263,15 @@ func getQ3UpdsV2(remOrders []*Orders, remItems [][]*LineItem, newOrders []*Order
 		}
 	}
 	nUpds := 0
-	for _, segMap := range remMap {
-		for _, dayMap := range segMap {
-			nUpds += len(dayMap)
+	if !useTopKAll {
+		for _, segMap := range remMap {
+			for _, dayMap := range segMap {
+				nUpds += len(dayMap)
+			}
+		}
+	} else {
+		for _, segMap := range remMap {
+			nUpds += len(segMap)
 		}
 	}
 
@@ -253,7 +317,6 @@ func getQ5UpdsV2(remOrders []*Orders, remItems [][]*LineItem, newOrders []*Order
 	//Same processing for removed and new, just with opposite signals
 	procOrders, procItems, multiplier := newOrders[1:], newItems[1:], 1.0
 	for j := 0; j < 2; j++ {
-		fmt.Println(j)
 		for i, orderItems := range procItems {
 			order = procOrders[i]
 			year = order.O_ORDERDATE.YEAR
@@ -372,9 +435,15 @@ func getQ15UpdsV2(remOrders []*Orders, remItems [][]*LineItem, newOrders []*Orde
 	}
 
 	nUpds := 0
-	for _, monthMap := range updEntries {
-		for _, suppMap := range monthMap {
-			nUpds += len(suppMap)
+	if !useTopKAll {
+		for _, monthMap := range updEntries {
+			for _, suppMap := range monthMap {
+				nUpds += len(suppMap)
+			}
+		}
+	} else {
+		for _, monthMap := range updEntries {
+			nUpds += 2 * len(monthMap)
 		}
 	}
 
@@ -409,6 +478,13 @@ func getQ18UpdsV2(remOrders []*Orders, remItems [][]*LineItem, newOrders []*Orde
 		}
 	}
 
+	if useTopKAll {
+		nRems = 0
+		for _, orderMap := range toRemove {
+			nRems += len(orderMap)
+		}
+	}
+
 	rems = makeQ18IndexRemoves(toRemove, nRems)
 	existingOrders, existingItems := procTables.Orders, procTables.LineItems
 	procTables.Orders, procTables.LineItems = newOrders, newItems
@@ -418,7 +494,6 @@ func getQ18UpdsV2(remOrders []*Orders, remItems [][]*LineItem, newOrders []*Orde
 }
 
 func makeQ3IndexRemoves(remMap map[string]map[int8]map[int32]struct{}, nUpds int) (rems []antidote.UpdateObjectParams) {
-	//TODO: TopKRemoveAll for optimization purposes?
 	rems = make([]antidote.UpdateObjectParams, nUpds)
 	var keyArgs antidote.KeyParams
 	i := 0
@@ -430,12 +505,24 @@ func makeQ3IndexRemoves(remMap map[string]map[int8]map[int32]struct{}, nUpds int
 				CrdtType: proto.CRDTType_TOPK_RMV,
 				Bucket:   buckets[INDEX_BKT],
 			}
-			for orderKey := range dayMap {
-				var currUpd crdt.UpdateArguments = crdt.TopKRemove{Id: orderKey}
+			if !useTopKAll {
+				for orderKey := range dayMap {
+					var currUpd crdt.UpdateArguments = crdt.TopKRemove{Id: orderKey}
+					rems[i] = antidote.UpdateObjectParams{KeyParams: keyArgs, UpdateArgs: &currUpd}
+					i++
+				}
+			} else {
+				dayRems := make([]int32, len(dayMap))
+				j := 0
+				for orderKey := range dayMap {
+					dayRems[j] = orderKey
+					j++
+				}
+				var currUpd crdt.UpdateArguments = crdt.TopKRemoveAll{Ids: dayRems}
 				rems[i] = antidote.UpdateObjectParams{KeyParams: keyArgs, UpdateArgs: &currUpd}
-				fmt.Println(rems[i])
 				i++
 			}
+
 		}
 	}
 	return
@@ -460,20 +547,48 @@ func makeQ15IndexUpdsDeletes(yearMap map[int16]map[int8]map[int32]*float64, updE
 					CrdtType: proto.CRDTType_TOPK_RMV,
 					Bucket:   buckets[INDEX_BKT],
 				}
-				for suppKey, _ := range sUpd {
-					value = suppMap[suppKey]
-					var currUpd crdt.UpdateArguments
-					if *value == 0.0 {
-						currUpd = crdt.TopKRemove{Id: suppKey}
-					} else {
-						currUpd = crdt.TopKAdd{TopKScore: crdt.TopKScore{Id: suppKey, Score: int32(*value)}}
+				if !useTopKAll {
+					for suppKey, _ := range sUpd {
+						value = suppMap[suppKey]
+						var currUpd crdt.UpdateArguments
+						if *value == 0.0 {
+							currUpd = crdt.TopKRemove{Id: suppKey}
+						} else {
+							currUpd = crdt.TopKAdd{TopKScore: crdt.TopKScore{Id: suppKey, Score: int32(*value)}}
+						}
+						upds[i] = antidote.UpdateObjectParams{KeyParams: keyArgs, UpdateArgs: &currUpd}
+						i++
 					}
-					upds[i] = antidote.UpdateObjectParams{KeyParams: keyArgs, UpdateArgs: &currUpd}
-					i++
+				} else {
+					adds, rems := make([]crdt.TopKScore, len(suppMap)), make([]int32, len(suppMap))
+					j, k := 0, 0
+					for suppKey, _ := range sUpd {
+						value = suppMap[suppKey]
+						if *value == 0.0 {
+							rems[k] = suppKey
+							k++
+						} else {
+							adds[j] = crdt.TopKScore{Id: suppKey, Score: int32(*value)}
+							j++
+						}
+					}
+					if j > 0 {
+						adds = adds[:j]
+						var currUpd crdt.UpdateArguments = crdt.TopKAddAll{Scores: adds}
+						upds[i] = antidote.UpdateObjectParams{KeyParams: keyArgs, UpdateArgs: &currUpd}
+						i++
+					}
+					if k > 0 {
+						rems = rems[:k]
+						var currUpd crdt.UpdateArguments = crdt.TopKRemoveAll{Ids: rems}
+						upds[i] = antidote.UpdateObjectParams{KeyParams: keyArgs, UpdateArgs: &currUpd}
+						i++
+					}
 				}
 			}
 		}
 	}
+	upds = upds[:i]
 	return
 }
 
@@ -481,7 +596,6 @@ func makeQ18IndexRemoves(toRemove []map[int32]struct{}, nRems int) (rems []antid
 	rems = make([]antidote.UpdateObjectParams, nRems)
 	var keyArgs antidote.KeyParams
 
-	//TODO: TopK with multipleRemove
 	i := 0
 	for baseQ, orderMap := range toRemove {
 		keyArgs = antidote.KeyParams{
@@ -489,8 +603,20 @@ func makeQ18IndexRemoves(toRemove []map[int32]struct{}, nRems int) (rems []antid
 			CrdtType: proto.CRDTType_TOPK_RMV,
 			Bucket:   buckets[INDEX_BKT],
 		}
-		for orderKey := range orderMap {
-			var currUpd crdt.UpdateArguments = crdt.TopKRemove{Id: orderKey}
+		if !useTopKAll {
+			for orderKey := range orderMap {
+				var currUpd crdt.UpdateArguments = crdt.TopKRemove{Id: orderKey}
+				rems[i] = antidote.UpdateObjectParams{KeyParams: keyArgs, UpdateArgs: &currUpd}
+				i++
+			}
+		} else if len(orderMap) > 0 {
+			ids := make([]int32, len(orderMap))
+			j := 0
+			for orderKey := range orderMap {
+				ids[j] = orderKey
+				j++
+			}
+			var currUpd crdt.UpdateArguments = crdt.TopKRemoveAll{Ids: ids}
 			rems[i] = antidote.UpdateObjectParams{KeyParams: keyArgs, UpdateArgs: &currUpd}
 			i++
 		}

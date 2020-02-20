@@ -16,6 +16,20 @@ import (
 	"tools"
 )
 
+//TODO: Support on the benchmark thing coupling multiple queries in one txn? That may lead to higher (or lower) queries/s.
+/*
+	A possible solution:
+	- Prepare index readArgs.
+		- If the query requires subsequent gets, return whatever information is necessary for that. Likelly also needs to know how many read replies it's expected
+		for each query to have.
+	- Send those args as a single transaction (or a static read?). Store the information generated alongside the args. Wait for the reply
+	- For each txn reply... (need to consult the stored information to decide that)
+		- If there's any subsequent get to be done, do it. Likelly needs to do similar steps to above (might be an issue if there's a 3 level query)
+		- Otherwise, just process the result
+		- It might be wise to divide this in categories. E.g., Q3, Q5, Q11, Q11A (part 2 of Q11), etc.
+		- Likelly do this in a different file.
+*/
+
 /*
 	Server types:
 	A) Multi-server, global views (default PotionDB)
@@ -94,22 +108,24 @@ const (
 
 	//commonFolder                                  = "/Users/a.rijo/Documents/University_6th_year/potionDB docs/"
 	tableFormat, updFormat, header                = "2.18.0_rc2/tables/%sSF/", "2.18.0_rc2/upds/%sSF/", "tpc_h/tpch_headers_min.txt"
-	tableExtension, updExtension, deleteExtension = ".tbl", ".tbl.u1", ".1"
+	tableExtension, updExtension, deleteExtension = ".tbl", ".tbl.u", "."
 
 	PROMO_PERCENTAGE, IMP_SUPPLY, SUM_SUPPLY, NATION_REVENUE, TOP_SUPPLIERS, LARGE_ORDERS, SEGM_DELAY = "q14pp", "q11iss", "q11sum", "q5nr", "q15ts", "q18lo", "q3sd"
 
 	C_NATIONKEY, L_SUPPKEY, L_ORDERKEY, N_REGIONKEY, O_CUSTKEY, PS_SUPPKEY, S_NATIONKEY, R_REGIONKEY = 3, 2, 0, 2, 1, 1, 3, 0
 	PART_BKT, INDEX_BKT                                                                              = 5, 6
-	O_ORDERDATE, C_MKTSEGMENT, L_SHIPDATE, L_EXTENDEDPRICE, L_DISCOUNT, O_SHIPPRIOTITY               = 4, 6, 10, 5, 6, 5
+	O_ORDERDATE, C_MKTSEGMENT, L_SHIPDATE, L_EXTENDEDPRICE, L_DISCOUNT, O_SHIPPRIOTITY, O_ORDERKEY   = 4, 6, 10, 5, 6, 5, 0
 )
 
 var (
 	//Filled dinamically by prepareConfigs()
-	tableFolder, updFolder, commonFolder, headerLoc string
-	scaleFactor                                     float64
-	isIndexGlobal, isMulti, memDebug, profiling     bool
-	maxUpdSize                                      int //Max number of entries for a single upd msg. To avoid sending the whole table in one request...
-	INDEX_WITH_FULL_DATA, CRDT_PER_OBJ              bool
+	tableFolder, updFolder, commonFolder, headerLoc                                string
+	scaleFactor                                                                    float64
+	isIndexGlobal, isMulti, memDebug, profiling, splitIndexLoad, useTopKAll        bool
+	maxUpdSize                                                                     int //Max number of entries for a single upd msg. To avoid sending the whole table in one request...
+	INDEX_WITH_FULL_DATA, CRDT_PER_OBJ, DOES_DATA_LOAD, DOES_QUERIES, DOES_UPDATES bool
+	withUpdates                                                                    bool //Also loads the necessary update data in order to still be able to do the queries with updates.
+	updCompleteFilename                                                            [3]string
 
 	//Constants...
 	tableNames = [...]string{"customer", "lineitem", "nation", "orders", "part", "partsupp", "region", "supplier"}
@@ -122,15 +138,6 @@ var (
 	tableEntries = [...]int{150000, 60175, 25, 1500000, 200000, 800000, 5, 10000}
 	tableParts   = [...]int{8, 16, 4, 9, 9, 5, 3, 7}
 	tableUsesSF  = [...]bool{true, false, false, true, true, true, false, true}
-	updsNames    = [...]string{"orders", "lineitem", "delete"}
-	//Orders and delete follow SF, except for SF = 0.01. It's easier to just put it manually
-	//updEntries = [...]int{10, 37, 10}
-	updEntries []int
-	//updEntries = [...]int{150, 592, 150}
-	//updEntries   = [...]int{1500, 5822, 1500}
-	updParts            = [...]int{9, 16}
-	updCompleteFilename = [...]string{updFolder + updsNames[0] + updExtension, updFolder + updsNames[1] + updExtension,
-		updFolder + updsNames[2] + deleteExtension}
 
 	//Just for debugging
 	nProtosSent = 0
@@ -170,16 +177,18 @@ func loadConfigsFile() {
 	flag.Parse()
 	fmt.Println("Using configFolder:", *configFolder)
 	if *configFolder == "none" {
-		isMulti, isIndexGlobal, memDebug, profiling, scaleFactor, maxUpdSize = true, true, true, true, 0.1, 2000
+		isMulti, isIndexGlobal, splitIndexLoad, memDebug, profiling, scaleFactor, maxUpdSize, useTopKAll = true, true, true, true, true, 0.1, 2000, false
 		commonFolder = "/Users/a.rijo/Documents/University_6th_year/potionDB docs/"
 		MAX_BUFF_PROTOS, QUERY_WAIT, FORCE_PROTO_CLEAN, TEST_ROUTINES, TEST_DURATION = 200, 5000, 10000, 10, 20000
 		PRINT_QUERY, QUERY_BENCH = true, false
-		INDEX_WITH_FULL_DATA, CRDT_PER_OBJ = true, false
+		INDEX_WITH_FULL_DATA, CRDT_PER_OBJ, DOES_DATA_LOAD, DOES_QUERIES, DOES_UPDATES = true, false, true, true, false
+		withUpdates, N_UPDATE_FILES = false, 1000
 		queryFuncs = []func(QueryClient) int{sendQ3, sendQ5, sendQ11, sendQ14, sendQ15, sendQ18}
 	} else {
 		configs := &tools.ConfigLoader{}
 		configs.LoadConfigs(*configFolder)
-		isMulti, isIndexGlobal = configs.GetBoolConfig("multiServer", true), configs.GetBoolConfig("globalIndex", true)
+		isMulti, isIndexGlobal, splitIndexLoad, useTopKAll = configs.GetBoolConfig("multiServer", true), configs.GetBoolConfig("globalIndex", true),
+			configs.GetBoolConfig("splitIndexLoad", true), configs.GetBoolConfig("useTopKAll", false)
 		memDebug, profiling = configs.GetBoolConfig("memDebug", true), configs.GetBoolConfig("profiling", false)
 		scaleFactor, _ = strconv.ParseFloat(configs.GetConfig("scale"), 64)
 		maxUpdSize64, _ := strconv.ParseInt(configs.GetOrDefault("updsPerProto", "100"), 10, 64)
@@ -190,7 +199,9 @@ func loadConfigsFile() {
 			time.Duration(configs.GetIntConfig("queryWait", 5000)), configs.GetIntConfig("forceMemClean", 10000),
 			configs.GetIntConfig("queryClients", 10), int64(configs.GetIntConfig("queryDuration", 20000))
 		PRINT_QUERY, QUERY_BENCH = configs.GetBoolConfig("queryPrint", true), configs.GetBoolConfig("queryBench", false)
-		INDEX_WITH_FULL_DATA, CRDT_PER_OBJ = configs.GetBoolConfig("indexFullData", true), configs.GetBoolConfig("crdtPerObj", false)
+		INDEX_WITH_FULL_DATA, CRDT_PER_OBJ, DOES_DATA_LOAD, DOES_QUERIES, DOES_UPDATES = configs.GetBoolConfig("indexFullData", true), configs.GetBoolConfig("crdtPerObj", false),
+			configs.GetBoolConfig("doDataLoad", true), configs.GetBoolConfig("doQueries", true), configs.GetBoolConfig("doUpdates", false)
+		withUpdates, N_UPDATE_FILES = configs.GetBoolConfig("withUpdates", false), configs.GetIntConfig("nUpdateFiles", 1000)
 
 		queryNumbers := strings.Split(configs.GetOrDefault("queries", "3, 5, 11, 14, 18"), " ")
 		queryFuncs = getQueryList(queryNumbers)
@@ -198,6 +209,8 @@ func loadConfigsFile() {
 		//Query wait is in nanoseconds!!!
 		fmt.Println(isMulti)
 		fmt.Println(isIndexGlobal)
+		fmt.Println(splitIndexLoad)
+		fmt.Println(useTopKAll)
 		fmt.Println(memDebug)
 		fmt.Println(profiling)
 		fmt.Println(scaleFactor)
@@ -213,20 +226,26 @@ func loadConfigsFile() {
 		fmt.Println(QUERY_BENCH)
 		fmt.Println(INDEX_WITH_FULL_DATA)
 		fmt.Println(CRDT_PER_OBJ)
+		fmt.Println(withUpdates)
+		fmt.Println(N_UPDATE_FILES)
 	}
 }
 
 func prepareConfigs() {
 	scaleFactorS := strconv.FormatFloat(scaleFactor, 'f', -1, 64)
 	tableFolder, updFolder = commonFolder+fmt.Sprintf(tableFormat, scaleFactorS), commonFolder+fmt.Sprintf(updFormat, scaleFactorS)
+	updCompleteFilename = [3]string{updFolder + updsNames[0] + updExtension, updFolder + updsNames[1] + updExtension,
+		updFolder + updsNames[2] + deleteExtension}
 	headerLoc = commonFolder + header
 	if isMulti {
 		//servers = []string{"127.0.0.1:8087", "127.0.0.1:8088", "127.0.0.1:8089", "127.0.0.1:8090", "127.0.0.1:8091"}
 		times.sendDataProtos = make([]int64, len(servers))
-		if isIndexGlobal {
+		if !isIndexGlobal {
+			buckets = []string{"R1", "R2", "R3", "R4", "R5", "PART", "I1", "I2", "I3", "I4", "I5"}
+		} else if !splitIndexLoad {
 			buckets = []string{"R1", "R2", "R3", "R4", "R5", "PART", "INDEX"}
 		} else {
-			buckets = []string{"R1", "R2", "R3", "R4", "R5", "PART", "I1", "I2", "I3", "I4", "I5"}
+			buckets = []string{"R1", "R2", "R3", "R4", "R5", "PART", "INDEX", "INDEX", "INDEX", "INDEX", "INDEX"}
 		}
 		//Note: Part isn't partitioned and lineItem uses multiRegionFunc
 		regionFuncs = [8]func([]string) int8{custToRegion, nil, nationToRegion, ordersToRegion, nil, partSuppToRegion, regionToRegion, supplierToRegion}
@@ -250,13 +269,15 @@ func prepareConfigs() {
 	}
 	conns = make([]net.Conn, len(servers))
 
+	//Note: All lineitems apart from 0.1SF need to be updated
 	switch scaleFactor {
 	case 0.01:
 		tableEntries[LINEITEM] = 60175
 		updEntries = []int{10, 37, 10}
 	case 0.1:
 		tableEntries[LINEITEM] = 600572
-		updEntries = []int{150, 592, 150}
+		//updEntries = []int{150, 592, 150}
+		updEntries = []int{150, 601, 150}
 	case 0.2:
 		tableEntries[LINEITEM] = 1800093
 		updEntries = []int{300, 1164, 300} //NOTE: FAKE VALUES!
@@ -272,7 +293,9 @@ func prepareConfigs() {
 
 func StartClient() {
 	loadConfigs()
-	go debugMemory()
+	if memDebug {
+		go debugMemory()
+	}
 	go func() {
 		i := int64(10)
 		for {
@@ -284,16 +307,28 @@ func StartClient() {
 		}
 	}()
 
+	if DOES_QUERIES {
+		if QUERY_BENCH {
+			go startQueriesBench()
+		} else {
+			go sendQueries(conns[0])
+		}
+	}
+
 	startTime := time.Now().UnixNano()
 	rand.Seed(startTime)
 	times.startTime = startTime
 	handleHeaders()
 
-	for i := range channels.dataChans {
-		go handleServerComm(i)
-	}
 	go handleTableProcessing()
-	go handlePrepareSend()
+	if DOES_DATA_LOAD || DOES_UPDATES {
+		//Start tcp connection to each server for data loading. Query clients create and manage their own connections
+		go connectToServers()
+	}
+	if DOES_DATA_LOAD {
+		//Prepare to send initial data protos
+		go handlePrepareSend()
+	}
 
 	tables = make([][][]string, len(tableNames))
 	procTables = &Tables{}
