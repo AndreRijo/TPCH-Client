@@ -4,23 +4,28 @@ import (
 	"antidote"
 	"crdt"
 	"fmt"
+	"math/rand"
 	"proto"
 	"strconv"
 	"strings"
 	"time"
 )
 
+//TODO: Maybe remake clientIndex, clientUpdates and clientQueries to have a file per query?
+
 type PairInt struct {
 	first  int32
 	second int32
 }
 
-var (
-	//"Constants"
-	MIN_DATE_Q3, MAX_DATE_Q3          = &Date{YEAR: 1995, MONTH: 03, DAY: 01}, &Date{YEAR: 1995, MONTH: 03, DAY: 31}
+const (
 	MIN_MONTH_DAY, MAX_MONTH_DAY      = int8(1), int8(31)
 	Q3_N_EXTRA_DATA, Q18_N_EXTRA_DATA = 2, 4
+)
 
+var (
+	//"Constants"
+	MIN_DATE_Q3, MAX_DATE_Q3 = &Date{YEAR: 1995, MONTH: 03, DAY: 01}, &Date{YEAR: 1995, MONTH: 03, DAY: 31}
 	//Need to store this in order to avoid on updates having to recalculate everything
 	q15Map      map[int16]map[int8]map[int32]*float64
 	q15LocalMap []map[int16]map[int8]map[int32]*float64
@@ -59,7 +64,13 @@ func prepareIndexesToSend() {
 	times.totalIndex = endTime - startTime
 
 	//Signal the end
-	channels.indexChans[0] <- QueuedMsg{code: QUEUE_COMPLETE}
+	if splitIndexLoad {
+		for _, channel := range channels.indexChans {
+			channel <- QueuedMsg{code: QUEUE_COMPLETE}
+		}
+	} else {
+		channels.indexChans[0] <- QueuedMsg{code: QUEUE_COMPLETE}
+	}
 
 	//Start reading updates data
 	if DOES_UPDATES {
@@ -68,7 +79,9 @@ func prepareIndexesToSend() {
 }
 
 func queueIndex(upds []antidote.UpdateObjectParams) {
-	channels.indexChans[0] <- QueuedMsg{Message: antidote.CreateUpdateObjs(nil, upds), code: antidote.UpdateObjs}
+	//Sends to a random server if using splitIndexLoad, otherwise defaults to 0
+	//channels.indexChans[0] <- QueuedMsg{Message: antidote.CreateUpdateObjs(nil, upds), code: antidote.UpdateObjs}
+	channels.indexChans[rand.Intn(len(channels.indexChans))] <- QueuedMsg{Message: antidote.CreateUpdateObjs(nil, upds), code: antidote.UpdateObjs}
 }
 
 func prepareIndexesLocalToSend() {
@@ -136,26 +149,24 @@ func prepareQ2Index() (upds []antidote.UpdateObjectParams) {
 */
 
 func prepareQ3IndexLocal() (upds [][]antidote.UpdateObjectParams) {
+	//Segment -> orderDate (day) -> orderKey
 	sumMap := make([]map[string]map[int8]map[int32]*float64, len(procTables.Regions))
 	nUpds := make([]int, len(sumMap))
-
-	var j int8
 	for i := range sumMap {
-		serverMap := make(map[string]map[int8]map[int32]*float64)
-		for _, seg := range procTables.Segments {
-			segMap := make(map[int8]map[int32]*float64)
-			for j = 1; j <= 31; j++ {
-				segMap[j] = make(map[int32]*float64)
-			}
-			serverMap[seg] = segMap
-		}
-		sumMap[i] = serverMap
+		sumMap[i] = createQ3Map()
 	}
 
 	regionI := int8(0)
-	for orderI, order := range procTables.Orders[1:] {
-		regionI = procTables.OrderkeyToRegionkey(order.O_ORDERKEY)
-		nUpds[regionI] += q3CalcHelper(sumMap[regionI], order, orderI)
+	orders := procTables.Orders
+	if orders[0] == nil {
+		//Happens only for the initial data
+		orders = orders[1:]
+	}
+	for orderI, order := range orders {
+		if order.O_ORDERDATE.isSmallerOrEqual(MAX_DATE_Q3) {
+			regionI = procTables.OrderkeyToRegionkey(order.O_ORDERKEY)
+			nUpds[regionI] += q3CalcHelper(sumMap[regionI], order, orderI)
+		}
 	}
 
 	upds = make([][]antidote.UpdateObjectParams, len(nUpds))
@@ -179,21 +190,20 @@ func prepareQ3Index() (upds []antidote.UpdateObjectParams) {
 	//Orderdate will need to be retrieved separatelly.
 
 	//segment -> orderDate -> orderkey -> sum
-	sumMap := make(map[string]map[int8]map[int32]*float64)
-
-	var j int8
-	//Preparing maps
-	for _, seg := range procTables.Segments {
-		segMap := make(map[int8]map[int32]*float64)
-		for j = 1; j <= 31; j++ {
-			segMap[j] = make(map[int32]*float64)
-		}
-		sumMap[seg] = segMap
-	}
+	sumMap := createQ3Map()
 
 	nUpds := 0
-	for orderI, order := range procTables.Orders[1:] {
-		nUpds += q3CalcHelper(sumMap, order, orderI)
+	orders := procTables.Orders
+	if orders[0] == nil {
+		//Happens only for the initial data
+		orders = orders[1:]
+	}
+	for orderI, order := range orders {
+		//To be in range for the maps, o_orderDate must be <= than the highest date 1995-03-31
+		//And l_shipdate must be >= than the smallest date 1995-03-01
+		if order.O_ORDERDATE.isSmallerOrEqual(MAX_DATE_Q3) {
+			nUpds += q3CalcHelper(sumMap, order, orderI)
+		}
 	}
 	//Override nUpds if useTopKAll
 	if useTopKAll {
@@ -212,35 +222,47 @@ func q3CalcHelper(sumMap map[string]map[int8]map[int32]*float64, order *Orders, 
 	var currSum *float64
 	var has bool
 	var j int8
-	//To be in range for the maps, o_orderDate must be <= than the highest date 1995-03-31
-	//And l_shipdate must be >= than the smallest date 1995-03-01
-	if order.O_ORDERDATE.isSmallerOrEqual(MAX_DATE_Q3) {
-		//fmt.Println("OrderDate:", *order.O_ORDERDATE, ". Compare result:", order.O_ORDERDATE.isSmallerOrEqual(maxDate))
-		//Get the customer's market segment
-		segMap := sumMap[procTables.Customers[order.O_CUSTKEY].C_MKTSEGMENT]
-		orderLineItems := procTables.LineItems[orderI]
-		for _, item := range orderLineItems {
-			//Check if L_SHIPDATE is higher than minDate and, if it is, check month/year. If month/year > march 1995, then add to all entries. Otherwise, use day to know which entries.
-			if item.L_SHIPDATE.isHigherOrEqual(MIN_DATE_Q3) {
-				if item.L_SHIPDATE.MONTH > 3 || item.L_SHIPDATE.YEAR > 1995 {
-					//All days
-					minDay = 1
-				} else {
-					minDay = item.L_SHIPDATE.DAY + 1
+
+	//fmt.Println("OrderDate:", *order.O_ORDERDATE, ". Compare result:", order.O_ORDERDATE.isSmallerOrEqual(maxDate))
+	//Get the customer's market segment
+	segMap := sumMap[procTables.Customers[order.O_CUSTKEY].C_MKTSEGMENT]
+	orderLineItems := procTables.LineItems[orderI]
+	for _, item := range orderLineItems {
+		//Check if L_SHIPDATE is higher than minDate and, if it is, check month/year. If month/year > march 1995, then add to all entries. Otherwise, use day to know which entries.
+		if item.L_SHIPDATE.isHigherOrEqual(MIN_DATE_Q3) {
+			if item.L_SHIPDATE.MONTH > 3 || item.L_SHIPDATE.YEAR > 1995 {
+				//All days
+				minDay = 1
+			} else {
+				minDay = item.L_SHIPDATE.DAY + 1
+			}
+			//fmt.Println("OrderDate:", *order.O_ORDERDATE, "ShipDate:", *item.L_SHIPDATE)
+			//Make a for from minDay to 31 to fill the map
+			for j = minDay; j <= MAX_MONTH_DAY; j++ {
+				currSum, has = segMap[j][order.O_ORDERKEY]
+				if !has {
+					currSum = new(float64)
+					segMap[j][order.O_ORDERKEY] = currSum
+					nUpds++
 				}
-				//fmt.Println("OrderDate:", *order.O_ORDERDATE, "ShipDate:", *item.L_SHIPDATE)
-				//Make a for from minDay to 31 to fill the map
-				for j = minDay; j <= MAX_MONTH_DAY; j++ {
-					currSum, has = segMap[j][order.O_ORDERKEY]
-					if !has {
-						currSum = new(float64)
-						segMap[j][order.O_ORDERKEY] = currSum
-						nUpds++
-					}
-					*currSum += item.L_EXTENDEDPRICE * (1.0 - item.L_DISCOUNT)
-				}
+				*currSum += item.L_EXTENDEDPRICE * (1.0 - item.L_DISCOUNT)
 			}
 		}
+	}
+	return
+}
+
+//Segment -> orderDate (day) -> orderKey
+func createQ3Map() (sumMap map[string]map[int8]map[int32]*float64) {
+	sumMap = make(map[string]map[int8]map[int32]*float64)
+	var j int8
+	for _, seg := range procTables.Segments {
+		segMap := make(map[int8]map[int32]*float64)
+		//Days
+		for j = 1; j <= 31; j++ {
+			segMap[j] = make(map[int32]*float64)
+		}
+		sumMap[seg] = segMap
 	}
 	return
 }
@@ -274,7 +296,11 @@ func prepareQ5Index() (upds []antidote.UpdateObjectParams, multiUpds [][]antidot
 	}
 
 	//Actually collecting the data
-	orders := procTables.Orders[1:]
+	orders := procTables.Orders
+	if orders[0] == nil {
+		//Happens only for the initial data
+		orders = orders[1:]
+	}
 	var order *Orders
 	var customer *Customer
 	var supplier *Supplier
@@ -282,7 +308,8 @@ func prepareQ5Index() (upds []antidote.UpdateObjectParams, multiUpds [][]antidot
 	var nationKey, regionKey int8
 	var value *float64
 
-	for i, orderItems := range procTables.LineItems[1:] {
+	//for i, orderItems := range procTables.LineItems[1:] {
+	for i, orderItems := range procTables.LineItems {
 		order = orders[i]
 		year = order.O_ORDERDATE.YEAR
 		if year >= 1993 && year <= 1997 {
@@ -401,24 +428,20 @@ func prepareQ14IndexLocal() (upds [][]antidote.UpdateObjectParams) {
 	mapPromo, mapTotal := make([]map[string]*float64, len(procTables.Regions)), make([]map[string]*float64, len(procTables.Regions))
 	inPromo := procTables.PromoParts
 
-	var currMapP, currMapT map[string]*float64
-	iString, fullKey := "", ""
-	var j, k int64
 	for i := range mapPromo {
-		currMapP, currMapT = make(map[string]*float64), make(map[string]*float64)
-		for j = 1993; j <= 1997; j++ {
-			iString = strconv.FormatInt(j, 10)
-			for k = 1; k <= 12; k++ {
-				fullKey = iString + strconv.FormatInt(k, 10)
-				currMapP[fullKey], currMapT[fullKey] = new(float64), new(float64)
-			}
-		}
-		mapPromo[i], mapTotal[i] = currMapP, currMapT
+		mapPromo[i], mapTotal[i] = createQ14Maps()
 	}
 
 	regionKey := int8(0)
-	for i, orderItems := range procTables.LineItems[1:] {
-		regionKey = procTables.OrderkeyToRegionkey(procTables.Orders[i+1].O_ORDERKEY)
+	orders := procTables.Orders
+	if orders[0] == nil {
+		//Happens only for the initial data
+		orders = orders[1:]
+	}
+	//for i, orderItems := range procTables.LineItems[1:] {
+	for i, orderItems := range procTables.LineItems {
+		//regionKey = procTables.OrderkeyToRegionkey(procTables.Orders[i+1].O_ORDERKEY)
+		regionKey = procTables.OrderkeyToRegionkey(orders[i].O_ORDERKEY)
 		q14CalcHelper(orderItems, mapPromo[regionKey], mapTotal[regionKey], inPromo)
 	}
 
@@ -440,22 +463,12 @@ func prepareQ14Index() (upds []antidote.UpdateObjectParams) {
 	//Likelly we should even go through all the parts first to achieve that
 	//Then go through lineItem, check with the map, and update the correct sums
 
-	mapPromo, mapTotal := make(map[string]*float64), make(map[string]*float64)
 	inPromo := procTables.PromoParts
-
-	var i, j int64
-	iString, fullKey := "", ""
-	//Preparing the maps that'll hold the results for each month between 1993 and 1997
-	for i = 1993; i <= 1997; i++ {
-		iString = strconv.FormatInt(i, 10)
-		for j = 1; j <= 12; j++ {
-			fullKey = iString + strconv.FormatInt(j, 10)
-			mapPromo[fullKey], mapTotal[fullKey] = new(float64), new(float64)
-		}
-	}
+	mapPromo, mapTotal := createQ14Maps()
 
 	//Going through lineitem and updating the totals
-	for _, orderItems := range procTables.LineItems[1:] {
+	for _, orderItems := range procTables.LineItems {
+		//for _, orderItems := range procTables.LineItems[1:] {
 		q14CalcHelper(orderItems, mapPromo, mapTotal, inPromo)
 	}
 
@@ -479,28 +492,40 @@ func q14CalcHelper(orderItems []*LineItem, mapPromo map[string]*float64, mapTota
 	}
 }
 
+func createQ14Maps() (mapPromo map[string]*float64, mapTotal map[string]*float64) {
+	mapPromo, mapTotal = make(map[string]*float64), make(map[string]*float64)
+	var i, j int64
+	iString, fullKey := "", ""
+	//Preparing the maps that'll hold the results for each month between 1993 and 1997
+	for i = 1993; i <= 1997; i++ {
+		iString = strconv.FormatInt(i, 10)
+		for j = 1; j <= 12; j++ {
+			fullKey = iString + strconv.FormatInt(j, 10)
+			mapPromo[fullKey], mapTotal[fullKey] = new(float64), new(float64)
+		}
+	}
+	return
+}
+
 func prepareQ15IndexLocal() (upds [][]antidote.UpdateObjectParams) {
 	yearMap := make([]map[int16]map[int8]map[int32]*float64, len(procTables.Regions))
 	nUpds := make([]int, len(procTables.Regions))
 	q15LocalMap = yearMap
 
-	var year int16 = 1993
-	var regionMap map[int16]map[int8]map[int32]*float64
-	var mMap map[int8]map[int32]*float64
 	for i := range yearMap {
-		regionMap = make(map[int16]map[int8]map[int32]*float64)
-		for year = 1993; year <= 1997; year++ {
-			mMap = make(map[int8]map[int32]*float64)
-			mMap[1], mMap[4], mMap[7], mMap[10] = make(map[int32]*float64),
-				make(map[int32]*float64), make(map[int32]*float64), make(map[int32]*float64)
-			regionMap[year] = mMap
-		}
-		yearMap[i] = regionMap
+		yearMap[i] = createQ15Map()
 	}
 
 	rKey := int8(0)
-	for i, orderItems := range procTables.LineItems[1:] {
-		rKey = procTables.OrderkeyToRegionkey(procTables.Orders[i+1].O_ORDERKEY)
+	orders := procTables.Orders
+	if orders[0] == nil {
+		//Happens only for the initial data
+		orders = orders[1:]
+	}
+	for i, orderItems := range procTables.LineItems {
+		//for i, orderItems := range procTables.LineItems[1:] {
+		//rKey = procTables.OrderkeyToRegionkey(procTables.Orders[i+1].O_ORDERKEY)
+		rKey = procTables.OrderkeyToRegionkey(orders[i].O_ORDERKEY)
 		nUpds[rKey] += q15CalcHelper(orderItems, yearMap[rKey])
 	}
 
@@ -519,22 +544,12 @@ func prepareQ15Index() (upds []antidote.UpdateObjectParams) {
 	//Date can start between first month of 1993 and 10th month of 1997 (first day always)
 	//Have one topK per quarter
 	//year -> month -> supplierID -> sum
-	yearMap := make(map[int16]map[int8]map[int32]*float64)
+	yearMap := createQ15Map()
 	q15Map = yearMap
-	var mMap map[int8]map[int32]*float64
-
-	//Preparing map instances for each quarter between 1993 and 1997
-	var year int16 = 1993
-	for ; year <= 1997; year++ {
-		mMap = make(map[int8]map[int32]*float64)
-		mMap[1], mMap[4], mMap[7], mMap[10] = make(map[int32]*float64),
-			make(map[int32]*float64), make(map[int32]*float64), make(map[int32]*float64)
-		yearMap[year] = mMap
-	}
 
 	nUpds := 0 //Assuming each quarter has at least one supplier
 
-	for _, orderItems := range procTables.LineItems[1:] {
+	for _, orderItems := range procTables.LineItems {
 		nUpds += q15CalcHelper(orderItems, yearMap)
 	}
 
@@ -564,6 +579,21 @@ func q15CalcHelper(orderItems []*LineItem, yearMap map[int16]map[int8]map[int32]
 	return
 }
 
+func createQ15Map() (yearMap map[int16]map[int8]map[int32]*float64) {
+	yearMap = make(map[int16]map[int8]map[int32]*float64)
+	var mMap map[int8]map[int32]*float64
+
+	//Preparing map instances for each quarter between 1993 and 1997
+	var year int16 = 1993
+	for ; year <= 1997; year++ {
+		mMap = make(map[int8]map[int32]*float64)
+		mMap[1], mMap[4], mMap[7], mMap[10] = make(map[int32]*float64),
+			make(map[int32]*float64), make(map[int32]*float64), make(map[int32]*float64)
+		yearMap[year] = mMap
+	}
+	return
+}
+
 func prepareQ18IndexLocal() (upds [][]antidote.UpdateObjectParams) {
 	quantityMap := make([]map[int32]map[int32]*PairInt, len(procTables.Regions))
 	for i := range quantityMap {
@@ -572,7 +602,13 @@ func prepareQ18IndexLocal() (upds [][]antidote.UpdateObjectParams) {
 	}
 
 	regionKey := int8(0)
-	for i, order := range procTables.Orders[1:] {
+	orders := procTables.Orders
+	if orders[0] == nil {
+		//Happens only for the initial data
+		orders = orders[1:]
+	}
+	for i, order := range orders {
+		//for i, order := range procTables.Orders[1:] {
 		regionKey = procTables.OrderkeyToRegionkey(order.O_ORDERKEY)
 		q18CalcHelper(quantityMap[regionKey], order, i)
 	}
@@ -599,10 +635,16 @@ func prepareQ18Index() (upds []antidote.UpdateObjectParams) {
 	quantityMap[314] = make(map[int32]*PairInt)
 	quantityMap[315] = make(map[int32]*PairInt)
 
+	orders := procTables.Orders
+	if orders[0] == nil {
+		//Happens only for the initial data
+		orders = orders[1:]
+	}
 	//Going through orders and, for each order, checking all its lineitems
 	//Doing the other way around is possible but would require a map of order -> quantity.
 	//Let's do both and then choose one
-	for i, order := range procTables.Orders[1:] {
+	//for i, order := range procTables.Orders[1:] {
+	for i, order := range orders {
 		q18CalcHelper(quantityMap, order, i)
 	}
 
@@ -674,7 +716,6 @@ func makeQ3IndexUpds(sumMap map[string]map[int8]map[int32]*float64, nUpds int, b
 	upds = make([]antidote.UpdateObjectParams, nUpds)
 	var keyArgs antidote.KeyParams
 	i := 0
-	j := 0
 	if INDEX_WITH_FULL_DATA {
 		for mktSeg, segMap := range sumMap {
 			for day, dayMap := range segMap {
@@ -703,7 +744,6 @@ func makeQ3IndexUpds(sumMap map[string]map[int8]map[int32]*float64, nUpds int, b
 					upds[i] = antidote.UpdateObjectParams{KeyParams: keyArgs, UpdateArgs: &currUpd}
 					i++
 				}
-				j++
 			}
 		}
 	} else {
@@ -731,12 +771,12 @@ func makeQ3IndexUpds(sumMap map[string]map[int8]map[int32]*float64, nUpds int, b
 					}
 					var currUpd crdt.UpdateArguments = crdt.TopKAddAll{Scores: adds}
 					upds[i] = antidote.UpdateObjectParams{KeyParams: keyArgs, UpdateArgs: &currUpd}
+					i++
 				}
-				j++
 			}
 		}
 	}
-	fmt.Println(nUpds, j)
+	fmt.Println(nUpds)
 	return
 }
 
@@ -781,9 +821,21 @@ func makeQ11IndexUpds(nationMap map[int8]map[int32]*float64, totalSumMap map[int
 			CrdtType: proto.CRDTType_TOPK_RMV,
 			Bucket:   buckets[bucketI],
 		}
-		for partKey, value := range partMap {
-			//TODO: Not use int32
-			var currUpd crdt.UpdateArguments = crdt.TopKAdd{TopKScore: crdt.TopKScore{Id: partKey, Score: int32(*value)}}
+		if !useTopKAll {
+			for partKey, value := range partMap {
+				//TODO: Not use int32
+				var currUpd crdt.UpdateArguments = crdt.TopKAdd{TopKScore: crdt.TopKScore{Id: partKey, Score: int32(*value)}}
+				upds[i] = antidote.UpdateObjectParams{KeyParams: keyArgs, UpdateArgs: &currUpd}
+				i++
+			}
+		} else {
+			adds := make([]crdt.TopKScore, len(partMap))
+			j := 0
+			for partKey, value := range partMap {
+				adds[j] = crdt.TopKScore{Id: partKey, Score: int32(*value)}
+				j++
+			}
+			var currUpd crdt.UpdateArguments = crdt.TopKAddAll{Scores: adds}
 			upds[i] = antidote.UpdateObjectParams{KeyParams: keyArgs, UpdateArgs: &currUpd}
 			i++
 		}
@@ -951,7 +1003,7 @@ func makeQ18IndexUpds(quantityMap map[int32]map[int32]*PairInt, bucketI int) (up
 }
 
 func packQ3IndexExtraData(orderKey int32) (data *[]byte) {
-	order := procTables.Orders[GetOrderIndex(orderKey)]
+	order := procTables.Orders[procTables.GetOrderIndex(orderKey)]
 	date := order.O_ORDERDATE
 	var build strings.Builder
 	build.WriteString(strconv.FormatInt(int64(date.YEAR), 10))
@@ -966,7 +1018,7 @@ func packQ3IndexExtraData(orderKey int32) (data *[]byte) {
 }
 
 func packQ18IndexExtraData(orderKey int32) (data *[]byte) {
-	order := procTables.Orders[GetOrderIndex(orderKey)]
+	order := procTables.Orders[procTables.GetOrderIndex(orderKey)]
 	customer := procTables.Customers[order.O_CUSTKEY]
 	date := order.O_ORDERDATE
 	var build strings.Builder

@@ -119,7 +119,31 @@ func ReadUpdates(fileLocs []string, nEntries []int, nParts []int, toRead [][]int
 		lineI += lineItemSizes[i-1]
 		processDeleteFile(fileLocs[2]+strconv.FormatInt(i, 10), nEntries[2], deleteKeys[deleteI:])
 	}
-	ordersUpds, lineItemUpds = ordersUpds[:orderI], lineItemUpds[:lineI]
+
+	lineItemPos, previous, orderIndex := 0, 0, 0
+	orderID := ""
+	//Fixing lineItemSizes
+	for k := 1; k <= nFiles; k++ {
+		orderIndex = k*nEntries[0] - k + (k-1)*2
+		if orderIndex >= orderI {
+			k--
+			orderI = k*nEntries[0] - k + (k-1)*2 + 1
+			lineI = lineItemPos
+			N_UPDATE_FILES = k
+			break
+		}
+		orderID = ordersUpds[k*nEntries[0]-k+(k-1)*2][0]
+		lineItemPos += int(float64(nEntries[0]) * 2)
+		//Use below for 0.1SF
+		//lineItemPos += int(float64(nEntries[0]) * 3) //Always safe to skip this amount at least
+		for ; len(lineItemUpds[lineItemPos][0]) < len(orderID) || lineItemUpds[lineItemPos][0] <= orderID; lineItemPos++ {
+			//Note: We're comparing strings and not ints here, thus we must compare the len to deal with cases like 999 < 1000
+		}
+		lineItemSizes[k-1] = lineItemPos - previous
+		previous = lineItemPos
+		//fmt.Println(orderID, lineItemUpds[lineItemPos-1][0], k, lineItemSizes[k-1])
+	}
+	ordersUpds, lineItemUpds, deleteKeys = ordersUpds[:orderI], lineItemUpds[:lineI], deleteKeys[:orderI]
 	return
 }
 

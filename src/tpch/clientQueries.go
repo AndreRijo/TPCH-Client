@@ -51,8 +51,8 @@ func startQueriesBench() {
 	results := make([]QueryClientResult, TEST_ROUTINES)
 	serverPerClient := make([]int, TEST_ROUTINES)
 	for i := 0; i < TEST_ROUTINES; i++ {
-		//serverN := rand.Intn(len(servers))
-		serverN := 0
+		serverN := rand.Intn(len(servers))
+		//serverN := 0
 		//fmt.Println("Starting query client", i, "with index server", servers[serverN])
 		chans[i] = make(chan QueryClientResult)
 		serverPerClient[i] = serverN

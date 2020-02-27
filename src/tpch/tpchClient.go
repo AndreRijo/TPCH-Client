@@ -261,11 +261,11 @@ func prepareConfigs() {
 		channels.dataChans = []chan QueuedMsg{make(chan QueuedMsg, MAX_BUFF_PROTOS)}
 	}
 
-	if isIndexGlobal {
-		channels.indexChans = []chan QueuedMsg{make(chan QueuedMsg, MAX_BUFF_PROTOS)}
-	} else {
+	if !isIndexGlobal || splitIndexLoad {
 		channels.indexChans = []chan QueuedMsg{make(chan QueuedMsg, MAX_BUFF_PROTOS), make(chan QueuedMsg, MAX_BUFF_PROTOS),
 			make(chan QueuedMsg, MAX_BUFF_PROTOS), make(chan QueuedMsg, MAX_BUFF_PROTOS), make(chan QueuedMsg, MAX_BUFF_PROTOS)}
+	} else {
+		channels.indexChans = []chan QueuedMsg{make(chan QueuedMsg, MAX_BUFF_PROTOS)}
 	}
 	conns = make([]net.Conn, len(servers))
 
@@ -273,11 +273,13 @@ func prepareConfigs() {
 	switch scaleFactor {
 	case 0.01:
 		tableEntries[LINEITEM] = 60175
-		updEntries = []int{10, 37, 10}
+		//updEntries = []int{10, 37, 10}
+		updEntries = []int{15, 41, 16}
 	case 0.1:
 		tableEntries[LINEITEM] = 600572
 		//updEntries = []int{150, 592, 150}
-		updEntries = []int{150, 601, 150}
+		//updEntries = []int{150, 601, 150}
+		updEntries = []int{151, 601, 150}
 	case 0.2:
 		tableEntries[LINEITEM] = 1800093
 		updEntries = []int{300, 1164, 300} //NOTE: FAKE VALUES!

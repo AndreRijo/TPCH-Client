@@ -91,7 +91,7 @@ func handleServerComm(connIndex int) {
 	times.sendDataProtos[connIndex] = end - start
 	fmt.Printf("Time to send dataProtos for %d: %d\n", connIndex, end-start)
 
-	if !isIndexGlobal || connIndex == 0 {
+	if !isIndexGlobal || splitIndexLoad || connIndex == 0 {
 		handleIndexComm(connIndex)
 	}
 }
@@ -159,9 +159,12 @@ func handleUpdatesComm(connIndex int) {
 		if msg.code == QUEUE_COMPLETE {
 			complete = true
 		} else {
+			/*	ignore(conn)
+				}*/
 			antidote.SendProto(msg.code, msg.Message, conn)
 			antidote.ReceiveProto(conn)
 		}
+
 		/*else if msg.code == antidote.StartTrans {
 			fmt.Println("Starting to send startTxn update proto")
 			antidote.SendProto(msg.code, msg.Message, conn)

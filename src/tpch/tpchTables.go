@@ -132,15 +132,18 @@ type Tables struct {
 	Prepositions []string
 	Auxiliaries  []string
 	Terminators  []rune
-	//Latest added orders and lineitems. May be nil if no upds besides the initial data loading have been done
-	LastAddedOrders    []*Orders
-	LastAddedLineItems [][]*LineItem
 	//Index helpers
 	PromoParts map[int32]struct{}
 	//Used by queries to know where to download the order from
 	OrdersRegion []int8
 	//Stores the current order to region function.
 	orderToRegionFun func(int32) int8
+	orderIndexFun    func(int32) int32
+	//Latest added orders and lineitems. May be nil if no upds besides the initial data loading have been done
+	LastAddedOrders    []*Orders
+	LastAddedLineItems [][]*LineItem
+	//Pos of the last order that was deleted from the original table
+	LastDeletedPos int
 }
 
 //*****Auxiliary data types*****//
@@ -214,6 +217,8 @@ func CreateClientTables(rawData [][][]string) (tables *Tables) {
 	}
 	tables.PromoParts = calculatePromoParts(tables.Parts)
 	tables.orderToRegionFun = tables.orderkeyToRegionkeyMultiple
+	tables.orderIndexFun = tables.getFullOrderIndex
+	tables.LastDeletedPos = 0
 	endTime := time.Now().UnixNano() / 1000000
 	fmt.Println("Time taken to process tables:", endTime-startTime, "ms")
 	return
@@ -257,7 +262,7 @@ func createCustomerTable(cTable [][]string) (customers []*Customer) {
 }
 
 func createLineitemTable(liTable [][]string, nOrders int) (lineItems [][]*LineItem, maxLineItem int32) {
-	fmt.Println("Creating lineItem table")
+	fmt.Println("Creating lineItem table with size", nOrders)
 	maxLineItem = 8
 
 	lineItems = make([][]*LineItem, nOrders)
@@ -268,7 +273,9 @@ func createLineitemTable(liTable [][]string, nOrders int) (lineItems [][]*LineIt
 	var convLineNumber int8
 	var convOrderKey int32
 	var extendedPrice, discount float64
-	bufI, bufOrder, currOrderID := 0, 0, int32(1)
+	bufI, bufOrder := 0, 0
+	tmpOrderID, _ := strconv.ParseInt(liTable[0][0], 10, 32)
+	currOrderID := int32(tmpOrderID)
 	for _, entry := range liTable {
 		//Create lineitem
 		orderKey, _ = strconv.ParseInt(entry[0], 10, 32)
@@ -301,6 +308,9 @@ func createLineitemTable(liTable [][]string, nOrders int) (lineItems [][]*LineIt
 
 		//Check if it belongs to a new order
 		if convOrderKey != currOrderID {
+			if nOrders < 1000 {
+				fmt.Println(currOrderID, bufOrder)
+			}
 			//Add everything in the buffer apart from the new one to the table
 			newLine = make([]*LineItem, bufI)
 			for k, item := range bufItems[:bufI] {
@@ -314,8 +324,12 @@ func createLineitemTable(liTable [][]string, nOrders int) (lineItems [][]*LineIt
 		}
 
 		bufI++
+		//fmt.Println(orderKey)
 	}
 
+	fmt.Println("Last order for lineitemTable: ", bufItems[bufI-1])
+	fmt.Println("Last order already in table:", lineItems[bufOrder-1][len(lineItems[bufOrder-1])-1])
+	fmt.Println(currOrderID, bufOrder)
 	//Last order
 	newLine = make([]*LineItem, bufI)
 	for k, item := range bufItems[:bufI] {
@@ -389,7 +403,7 @@ func createNationTable(nTable [][]string) (nations []*Nation) {
 }
 
 func createOrdersTable(oTable [][]string) (orders []*Orders) {
-	fmt.Println("Creating orders table")
+	fmt.Println("Creating orders table with size", len(oTable)+1)
 	orders = make([]*Orders, len(oTable)+1)
 	var orderKey, customerKey int64
 	for i, entry := range oTable {
@@ -406,6 +420,10 @@ func createOrdersTable(oTable [][]string) (orders []*Orders) {
 			O_SHIPPRIORITY:  entry[7],
 			O_COMMENT:       entry[8],
 		}
+	}
+	if orders[1].O_ORDERKEY != 1 {
+		//If it's not the initial data, hide the empty position
+		orders = orders[1:]
 	}
 	return
 }
@@ -497,7 +515,11 @@ func calculatePromoParts(parts []*Part) (inPromo map[int32]struct{}) {
 	return
 }
 
-func GetOrderIndex(orderKey int32) (indexKey int32) {
+func (tab *Tables) GetOrderIndex(orderKey int32) (indexKey int32) {
+	return tab.orderIndexFun(orderKey)
+}
+
+func (tab *Tables) getFullOrderIndex(orderKey int32) (indexKey int32) {
 	//1 -> 7: 1 -> 7
 	//9 -> 15: 1 -> 7
 	//32 -> 39: 8 -> 15
@@ -505,6 +527,10 @@ func GetOrderIndex(orderKey int32) (indexKey int32) {
 	//64 -> 71: 16 -> 23
 	//72 -> 79: 16 -> 23
 	return orderKey%8 + 8*(orderKey/32)
+}
+
+func (tab *Tables) getUpdateOrderIndex(orderKey int32) (indexKey int32) {
+	return (orderKey%8 + 8*(orderKey/32)) % int32(len(tab.Orders))
 }
 
 /*
@@ -554,7 +580,7 @@ func createSegmentsList() []string {
 func (tab *Tables) UpdateOrderLineitems(order [][]string, lineItems [][]string) {
 	//Just call createOrder and createLineitem and store them
 	tab.LastAddedOrders = createOrdersTable(order)
-	tab.LastAddedLineItems, _ = createLineitemTable(lineItems, len(order)+1)
+	tab.LastAddedLineItems, _ = createLineitemTable(lineItems, len(order))
 }
 
 /*
@@ -620,6 +646,8 @@ func (tab *Tables) UpdateOrderLineitems(order []string, lineItems [][]string) (o
 func (tab *Tables) InitConstants() {
 	tab.Segments = createSegmentsList()
 	tab.orderToRegionFun = tab.orderkeyToRegionkeyMultiple
+	tab.orderIndexFun = tab.getFullOrderIndex
+	tab.LastDeletedPos = 0
 }
 
 func (tab *Tables) CreateCustomers(table [][][]string) {
@@ -627,7 +655,7 @@ func (tab *Tables) CreateCustomers(table [][][]string) {
 }
 
 func (tab *Tables) CreateLineitems(table [][][]string) {
-	tab.LineItems, tab.MaxOrderLineitems = createLineitemTable(table[LINEITEM], len(tab.Orders))
+	tab.LineItems, tab.MaxOrderLineitems = createLineitemTable(table[LINEITEM], len(tab.Orders)-1)
 }
 
 func (tab *Tables) CreateNations(table [][][]string) {
@@ -675,7 +703,7 @@ func (tab *Tables) OrderkeyToRegionkey(orderKey int32) int8 {
 }
 
 func (tab *Tables) orderkeyToRegionkeyMultiple(orderKey int32) int8 {
-	return tab.Nations[tab.Customers[tab.Orders[GetOrderIndex(orderKey)].O_CUSTKEY].C_NATIONKEY].N_REGIONKEY
+	return tab.Nations[tab.Customers[tab.Orders[tab.GetOrderIndex(orderKey)].O_CUSTKEY].C_NATIONKEY].N_REGIONKEY
 }
 
 //Uses special array instead of consulting customers and nations tab.

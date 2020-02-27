@@ -95,7 +95,11 @@ func handleTableProcessing() {
 	} else if DOES_UPDATES {
 		//For the case of DOES_DATA_LOAD && DOES_UPDATES, updates will start after indexes are prepared.
 		//Also, preparing Q15 index is necessary for the updates to work.
-		prepareQ15Index()
+		if isIndexGlobal {
+			prepareQ15Index()
+		} else {
+			prepareQ15IndexLocal()
+		}
 		go startUpdates()
 	}
 	if DOES_QUERIES && withUpdates && !DOES_UPDATES {
