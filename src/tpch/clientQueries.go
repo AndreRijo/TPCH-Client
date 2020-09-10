@@ -3,14 +3,16 @@ package tpch
 import (
 	"antidote"
 	"crdt"
+	"encoding/csv"
 	"fmt"
+	"math"
 	"math/rand"
 	"net"
+	"os"
 	"proto"
 	"sort"
 	"strconv"
 	"strings"
-	"sync/atomic"
 	"time"
 
 	pb "github.com/golang/protobuf/proto"
@@ -22,28 +24,45 @@ import (
 type QueryClient struct {
 	serverConns []net.Conn
 	indexServer int
+	rng         *rand.Rand
 }
 
 type QueryClientResult struct {
-	duration, nReads, nCycles float64
+	duration, nReads, nQueries float64
+	intermediateResults        []QueryStats
 }
-
-const (
-	QUERIES_PER_TXN = 6
-)
 
 var (
 	//Filled automatically by configLoader
 	PRINT_QUERY, QUERY_BENCH bool
 	TEST_ROUTINES            int
 	TEST_DURATION            int64
+	STOP_QUERIES             bool //Becomes true when the execution time for the queries is over
+	READS_PER_TXN            int
 	QUERY_WAIT               time.Duration
 	queryFuncs               []func(QueryClient) int //queries to execute
+	collectQueryStats        []bool                  //Becomes true when enough time has passed to collect statistics again. One entry per queryClient
+	getReadsFuncs            []func(QueryClient, []antidote.ReadObjectParams, []antidote.ReadObjectParams, []int, int) int
+	processReadReplies       []func(QueryClient, []*proto.ApbReadObjectResp, []int, int) int //int[]: fullReadPos, partialReadPos. int: reads done
 )
 
 func startQueriesBench() {
 	printExecutionTimes()
-	fmt.Println("Waiting to start for queries...")
+	maxServers := len(servers)
+	if SINGLE_INDEX_SERVER {
+		maxServers = 1
+	}
+	fmt.Printf("Waiting to start for queries with %d clients...\n", TEST_ROUTINES)
+	collectQueryStats = make([]bool, TEST_ROUTINES)
+	for i := range collectQueryStats {
+		collectQueryStats[i] = false
+	}
+	rngs := make([]*rand.Rand, TEST_ROUTINES)
+	seed := time.Now().UnixNano()
+	for i := range rngs {
+		rngs[i] = rand.New(rand.NewSource(seed + int64(i)))
+	}
+	selfRng := rand.New(rand.NewSource(seed + int64(2*TEST_ROUTINES)))
 	time.Sleep(QUERY_WAIT * time.Millisecond)
 	fmt.Println("Starting queries")
 
@@ -51,88 +70,137 @@ func startQueriesBench() {
 	results := make([]QueryClientResult, TEST_ROUTINES)
 	serverPerClient := make([]int, TEST_ROUTINES)
 	for i := 0; i < TEST_ROUTINES; i++ {
-		serverN := rand.Intn(len(servers))
+		serverN := selfRng.Intn(maxServers)
 		//serverN := 0
 		//fmt.Println("Starting query client", i, "with index server", servers[serverN])
 		chans[i] = make(chan QueryClientResult)
 		serverPerClient[i] = serverN
-		go queryBench(serverN, chans[i])
+		go queryBench(i, serverN, rngs[i], chans[i])
 	}
 	fmt.Println("Query clients started...")
+	if statisticsInterval > 0 {
+		go doQueryStatsInterval()
+	}
+	time.Sleep(time.Duration(TEST_DURATION) * time.Millisecond)
+	STOP_QUERIES = true
 
-	//TODO: Go back on this
-	j := int32(0)
+	/*
+		j := int32(0)
+		for i, channel := range chans {
+			go func(x int, channel chan QueryClientResult) {
+				results[x] = <-channel
+				fmt.Printf("Query client %d finished |", x)
+				atomic.AddInt32(&j, 1)
+			}(i, channel)
+			//fmt.Printf("Query client %d finished |", i)
+			//results[i] = <-channel
+		}
+		for j < int32(len(results)) {
+			time.Sleep(100 * time.Millisecond)
+		}
+	*/
+
 	for i, channel := range chans {
-		go func(x int, channel chan QueryClientResult) {
-			results[x] = <-channel
-			fmt.Printf("Query client %d finished |", x)
-			atomic.AddInt32(&j, 1)
-		}(i, channel)
-		//fmt.Printf("Query client %d finished |", i)
-		//results[i] = <-channel
+		results[i] = <-channel
 	}
-	for j < int32(len(results)) {
-		time.Sleep(100 * time.Millisecond)
-	}
-
-	//for i, channel := range chans {
-	//results[i] = <-channel
-	//}
 	fmt.Println()
 	fmt.Println("All query clients have finished.")
-	totalQueries, totalReads, avgDuration := 0.0, 0.0, 0.0
+	totalQueries, totalReads, avgDuration, nFuns := 0.0, 0.0, 0.0, float64(len(queryFuncs))
 	for i, result := range results {
 		fmt.Printf("%d[%d]: QueryTxns: %f, Queries: %f, QueryTxns/s: %f, Query/s: %f, Reads: %f, Reads/s: %f\n", i, serverPerClient[i],
-			result.nCycles, result.nCycles*float64(len(queryFuncs)), (result.nCycles/result.duration)*1000,
-			(result.nCycles*float64(len(queryFuncs))/result.duration)*1000, result.nReads, (result.nReads/result.duration)*1000)
-		totalQueries += result.nCycles
+			result.nQueries/nFuns, result.nQueries, (result.nQueries/(nFuns*result.duration))*1000,
+			(result.nQueries/result.duration)*1000, result.nReads, (result.nReads/result.duration)*1000)
+		totalQueries += result.nQueries
 		totalReads += result.nReads
 		avgDuration += result.duration
 	}
 	avgDuration /= float64(len(results))
-	fmt.Printf("Totals: QueryTxns: %f, Queries: %f, QueryTxns/s: %f, Query/s: %f, Reads: %f, Reads/s: %f\n", totalQueries, totalQueries*float64(len(queryFuncs)),
-		(totalQueries/avgDuration)*1000, (totalQueries*float64(len(queryFuncs))/avgDuration)*1000, totalReads, (totalReads/avgDuration)*1000)
+	fmt.Printf("Totals: QueryTxns: %f, Queries: %f, QueryTxns/s: %f, Query/s: %f, Reads: %f, Reads/s: %f\n", totalQueries/nFuns, totalQueries,
+		(totalQueries/(avgDuration*nFuns))*1000, (totalQueries/avgDuration)*1000, totalReads, (totalReads/avgDuration)*1000)
+
+	writeQueriesStatsFile(results)
+	os.Exit(0)
 }
 
-func queryBench(defaultServer int, resultChan chan QueryClientResult) {
+func updateQueryStats(stats []QueryStats, nReads, lastStatReads, nQueries, lastStatQueries int, lastStatTime int64) (newStats []QueryStats,
+	newNReads, newNQueries int, newLastStatTime int64) {
+	currStatTime, currQueryStats := time.Now().UnixNano()/1000000, QueryStats{}
+	diffT, diffR, diffQ := currStatTime-lastStatTime, nReads-lastStatReads, nQueries-lastStatQueries
+	if diffT < int64(statisticsInterval/100) {
+		//Replace
+		lastStatI := len(stats) - 1
+		stats[lastStatI].nReads += diffR
+		stats[lastStatI].nQueries += diffQ
+		stats[lastStatI].timeSpent += diffT
+	} else {
+		currQueryStats.nReads, currQueryStats.nQueries, currQueryStats.timeSpent = diffR, diffQ, diffT
+		stats = append(stats, currQueryStats)
+	}
+	return stats, nReads, nQueries, currStatTime
+}
+
+func queryBench(clientN int, defaultServer int, rng *rand.Rand, resultChan chan QueryClientResult) {
+	queryStats := make([]QueryStats, 0, TEST_DURATION/int64(statisticsInterval)+1)
 	conns := make([]net.Conn, len(servers))
 	for i := range conns {
 		conns[i], _ = net.Dial("tcp", servers[i])
 	}
-	client := QueryClient{serverConns: conns, indexServer: defaultServer}
-	cycles, reads := 0, 0
+	client := QueryClient{serverConns: conns, indexServer: defaultServer, rng: rng}
+	lastStatQueries, lastStatReads, cycleQueries := 0, 0, len(queryFuncs)
+	queries, reads := 0, 0
 	startTime := time.Now().UnixNano() / 1000000
-	//endTime, lastPrint, printTime := int64(0), startTime, TEST_DURATION/5
-	endTime := int64(0)
+	lastStatTime := startTime
 
-	for endTime-startTime < TEST_DURATION {
-		reads += sendQ3(client)
-		reads += sendQ5(client)
-		reads += sendQ11(client)
-		reads += sendQ14(client)
-		reads += sendQ15(client)
-		reads += sendQ18(client)
+	funcs := make([]func(QueryClient) int, len(queryFuncs))
+	for i, fun := range queryFuncs {
+		funcs[i] = fun
+	}
 
-		/*
-			for _, query := range queryFuncs {
+	if READS_PER_TXN > 1 {
+		queryPos, nOpsTxn, previousQueryPos, replyPos, bufI := 0, 0, 0, 0, make([]int, 2)
+		fullRBuf, partialRBuf := make([]antidote.ReadObjectParams, READS_PER_TXN+1),
+			make([]antidote.ReadObjectParams, READS_PER_TXN+1) //+1 as one of the queries has 2 reads.
+		for !STOP_QUERIES {
+			if collectQueryStats[clientN] {
+				queryStats, lastStatReads, lastStatQueries, lastStatTime = updateQueryStats(queryStats, reads, lastStatReads, queries, lastStatQueries, lastStatTime)
+				collectQueryStats[clientN] = false
+			}
+			for nOpsTxn < READS_PER_TXN {
+				nOpsTxn = getReadsFuncs[queryPos%cycleQueries](client, fullRBuf, partialRBuf, bufI, nOpsTxn)
+				queries++
+				queryPos++
+			}
+			readReplies := sendReceiveReadProto(client, fullRBuf[:bufI[0]], partialRBuf[:bufI[1]], client.indexServer).GetObjects().GetObjects()
+			bufI[1] = bufI[0] //partial reads start when full reads end
+			bufI[0] = 0
+			for replyPos < len(readReplies) {
+				replyPos = processReadReplies[previousQueryPos%cycleQueries](client, readReplies, bufI, replyPos)
+				previousQueryPos++
+			}
+			reads += nOpsTxn
+			previousQueryPos, nOpsTxn, replyPos, bufI[0], bufI[1] = queryPos, 0, 0, 0, 0
+		}
+	} else {
+		for !STOP_QUERIES {
+			if collectQueryStats[clientN] {
+				queryStats, lastStatReads, lastStatQueries, lastStatTime = updateQueryStats(queryStats, reads, lastStatReads, queries, lastStatQueries, lastStatTime)
+				collectQueryStats[clientN] = false
+			}
+			for _, query := range funcs {
 				reads += query(client)
 			}
-		*/
-		cycles++
-		endTime = time.Now().UnixNano() / 1000000
-		/*
-			if endTime-lastPrint > printTime {
-				//fmt.Printf("Query set number %d complete.\n", cycles)
-				fmt.Printf("Query sets done so far %d\n", cycles)
-				lastPrint = endTime
-			}
-		*/
+			queries += cycleQueries
+		}
 	}
-	resultChan <- QueryClientResult{duration: float64(endTime - startTime), nCycles: float64(cycles), nReads: float64(reads)}
+
+	endTime := time.Now().UnixNano() / 1000000
+	queryStats, _, _, _ = updateQueryStats(queryStats, reads, lastStatReads, queries, lastStatReads, lastStatTime)
+	resultChan <- QueryClientResult{duration: float64(endTime - startTime), nQueries: float64(queries), nReads: float64(reads),
+		intermediateResults: queryStats}
 }
 
 func sendQueries(conn net.Conn) {
-	client := QueryClient{serverConns: conns, indexServer: DEFAULT_REPLICA}
+	client := QueryClient{serverConns: conns, indexServer: DEFAULT_REPLICA, rng: rand.New(rand.NewSource(time.Now().UnixNano()))}
 	time.Sleep(QUERY_WAIT * time.Millisecond)
 	fmt.Println("Starting to send queries")
 	startTime := time.Now().UnixNano() / 1000000
@@ -167,13 +235,34 @@ func sendQueries(conn net.Conn) {
 	fmt.Println("All queries have been executed")
 	printExecutionTimes()
 	fmt.Println()
-	fmt.Println("Starting to prepare and send upds")
+	//fmt.Println("Starting to prepare and send upds")
 	//sendDataChangesV2(readUpds())
 }
 
+//Assuming global-only for now
+func getQ3Reads(client QueryClient, fullR, partialR []antidote.ReadObjectParams, bufI []int, reads int) (newReads int) {
+	rndSeg, rndDay := procTables.Segments[client.rng.Intn(5)], 1+client.rng.Int63n(31)
+	partialR[bufI[1]] = antidote.ReadObjectParams{
+		KeyParams: antidote.KeyParams{Key: SEGM_DELAY + rndSeg + strconv.FormatInt(rndDay, 10), CrdtType: proto.CRDTType_TOPK_RMV, Bucket: buckets[INDEX_BKT]},
+		ReadArgs:  crdt.GetTopNArguments{NumberEntries: 10},
+	}
+	bufI[1]++
+	return reads + 1
+}
+
+func processQ3Reply(client QueryClient, replies []*proto.ApbReadObjectResp, bufI []int, reads int) (newReads int) {
+	topKProto := replies[bufI[1]].GetTopk()
+	values := topKProto.GetValues()
+	for _, pair := range values {
+		unpackIndexExtraData(pair.GetData(), Q3_N_EXTRA_DATA)
+	}
+	bufI[1]++
+	return reads + 1
+}
+
 func sendQ3(client QueryClient) (nRequests int) {
-	rndSeg := procTables.Segments[rand.Intn(5)]
-	rndDay := 1 + rand.Int63n(31)
+	rndSeg := procTables.Segments[client.rng.Intn(5)]
+	rndDay := 1 + client.rng.Int63n(31)
 
 	readParam := []antidote.ReadObjectParams{antidote.ReadObjectParams{
 		KeyParams: antidote.KeyParams{Key: SEGM_DELAY + rndSeg + strconv.FormatInt(rndDay, 10), CrdtType: proto.CRDTType_TOPK_RMV, Bucket: buckets[INDEX_BKT]},
@@ -237,10 +326,28 @@ func sendQ3(client QueryClient) (nRequests int) {
 	return len(client.serverConns)
 }
 
-func sendQ5(client QueryClient) (nRequests int) {
-	rndRegion := rand.Intn(len(procTables.Regions))
+func getQ5Reads(client QueryClient, fullR, partialR []antidote.ReadObjectParams, bufI []int, reads int) (newReads int) {
+	rndRegion, rndYear := client.rng.Intn(len(procTables.Regions)), 1993+client.rng.Int63n(5)
 	rndRegionN := procTables.Regions[rndRegion].R_NAME
-	rndYear := 1993 + rand.Int63n(5)
+	fullR[bufI[0]] = antidote.ReadObjectParams{KeyParams: antidote.KeyParams{
+		Key: NATION_REVENUE + rndRegionN + strconv.FormatInt(rndYear, 10), CrdtType: proto.CRDTType_RRMAP, Bucket: buckets[INDEX_BKT]},
+		ReadArgs: crdt.StateReadArguments{},
+	}
+	bufI[0]++
+	return reads + 1
+}
+
+func processQ5Reply(client QueryClient, replies []*proto.ApbReadObjectResp, bufI []int, reads int) (newReads int) {
+	//Just to force usual processing
+	ignore(crdt.ReadRespProtoToAntidoteState(replies[bufI[0]], proto.CRDTType_RRMAP, proto.READType_FULL).(crdt.EmbMapEntryState))
+	bufI[0]++
+	return reads + 1
+}
+
+func sendQ5(client QueryClient) (nRequests int) {
+	rndRegion := client.rng.Intn(len(procTables.Regions))
+	rndRegionN := procTables.Regions[rndRegion].R_NAME
+	rndYear := 1993 + client.rng.Int63n(5)
 	bktI, serverI := getIndexOffset(client, rndRegion)
 
 	readParam := []antidote.ReadObjectParams{antidote.ReadObjectParams{KeyParams: antidote.KeyParams{
@@ -261,15 +368,40 @@ func sendQ5(client QueryClient) (nRequests int) {
 	return 1
 }
 
+func getQ11Reads(client QueryClient, fullR, partialR []antidote.ReadObjectParams, bufI []int, reads int) (newReads int) {
+	rndNation := procTables.Nations[client.rng.Intn(len(procTables.Nations))]
+	rndNationN := rndNation.N_NAME
+	fullR[bufI[0]] = antidote.ReadObjectParams{KeyParams: antidote.KeyParams{Key: IMP_SUPPLY + rndNationN, CrdtType: proto.CRDTType_TOPK_RMV, Bucket: buckets[INDEX_BKT]},
+		ReadArgs: crdt.StateReadArguments{},
+	}
+	fullR[bufI[0]+1] = antidote.ReadObjectParams{KeyParams: antidote.KeyParams{Key: IMP_SUPPLY + rndNationN, CrdtType: proto.CRDTType_TOPK_RMV, Bucket: buckets[INDEX_BKT]},
+		ReadArgs: crdt.StateReadArguments{},
+	}
+	bufI[0] += 2
+	return reads + 2
+}
+
+func processQ11Reply(client QueryClient, replies []*proto.ApbReadObjectResp, bufI []int, reads int) (newReads int) {
+	topKProto, counterProto := replies[bufI[0]].GetTopk(), replies[bufI[0]+1].GetCounter()
+	ignore(counterProto.GetValue(), topKProto)
+	bufI[0] += 2
+	return reads + 2
+}
+
 func sendQ11(client QueryClient) (nRequests int) {
 	//Unfortunatelly we can't use the topk query of "only values above min" here as we need to fetch the min from the database first.
-	rndNation := procTables.Nations[rand.Intn(len(procTables.Nations))]
+	rndNation := procTables.Nations[client.rng.Intn(len(procTables.Nations))]
+	//rndNation := procTables.Nations[0]
 	rndNationN, rndNationR := rndNation.N_NAME, rndNation.N_REGIONKEY
 	bktI, serverI := getIndexOffset(client, int(rndNationR))
 
 	readParam := []antidote.ReadObjectParams{
-		antidote.ReadObjectParams{KeyParams: antidote.KeyParams{Key: IMP_SUPPLY + rndNationN, CrdtType: proto.CRDTType_TOPK_RMV, Bucket: buckets[bktI]}},
-		antidote.ReadObjectParams{KeyParams: antidote.KeyParams{Key: SUM_SUPPLY + rndNationN, CrdtType: proto.CRDTType_COUNTER, Bucket: buckets[bktI]}},
+		antidote.ReadObjectParams{KeyParams: antidote.KeyParams{Key: IMP_SUPPLY + rndNationN, CrdtType: proto.CRDTType_TOPK_RMV, Bucket: buckets[bktI]},
+			ReadArgs: crdt.StateReadArguments{},
+		},
+		antidote.ReadObjectParams{KeyParams: antidote.KeyParams{Key: SUM_SUPPLY + rndNationN, CrdtType: proto.CRDTType_COUNTER, Bucket: buckets[bktI]},
+			ReadArgs: crdt.StateReadArguments{},
+		},
 	}
 
 	//replyProto := sendReceiveReadObjsProto(client, readParam, bktI-INDEX_BKT)
@@ -293,8 +425,29 @@ func sendQ11(client QueryClient) (nRequests int) {
 	return 2
 }
 
+func getQ14Reads(client QueryClient, fullR, partialR []antidote.ReadObjectParams, bufI []int, reads int) (newReads int) {
+	rndForDate := client.rng.Int63n(60)
+	year, month := 1993+rndForDate/12, 1+rndForDate%12
+	date := strconv.FormatInt(year, 10) + strconv.FormatInt(month, 10)
+	fullR[bufI[0]] = antidote.ReadObjectParams{KeyParams: antidote.KeyParams{Key: PROMO_PERCENTAGE + date, CrdtType: proto.CRDTType_AVG, Bucket: buckets[INDEX_BKT]},
+		ReadArgs: crdt.StateReadArguments{},
+	}
+	bufI[0]++
+	return reads + 1
+}
+
+func processQ14Reply(client QueryClient, replies []*proto.ApbReadObjectResp, bufI []int, reads int) (newReads int) {
+	topKProto := replies[bufI[0]].GetTopk()
+	values := topKProto.GetValues()
+	for _, pair := range values {
+		unpackIndexExtraData(pair.GetData(), Q3_N_EXTRA_DATA)
+	}
+	bufI[0]++
+	return reads + 1
+}
+
 func sendQ14(client QueryClient) (nRequests int) {
-	rndForDate := rand.Int63n(60) //60 months from 1993 to 1997 (5 years)
+	rndForDate := client.rng.Int63n(60) //60 months from 1993 to 1997 (5 years)
 	year, month := 1993+rndForDate/12, 1+rndForDate%12
 	date := strconv.FormatInt(year, 10) + strconv.FormatInt(month, 10)
 	var avgProto *proto.ApbGetAverageResp
@@ -317,12 +470,35 @@ func sendQ14(client QueryClient) (nRequests int) {
 		fmt.Printf("Q14: %d_%d: %f.\n", year, month, avgProto.GetAvg())
 	}
 
+	if isIndexGlobal {
+		return 1
+	}
 	return len(client.serverConns)
 }
 
+func getQ15Reads(client QueryClient, fullR, partialR []antidote.ReadObjectParams, bufI []int, reads int) (newReads int) {
+	rndQuarter, rndYear := 1+3*client.rng.Int63n(4), 1993+client.rng.Int63n(5)
+	date := strconv.FormatInt(rndYear, 10) + strconv.FormatInt(rndQuarter, 10)
+	partialR[bufI[1]] = antidote.ReadObjectParams{
+		KeyParams: antidote.KeyParams{Key: TOP_SUPPLIERS + date, CrdtType: proto.CRDTType_TOPK_RMV, Bucket: buckets[INDEX_BKT]},
+		ReadArgs:  crdt.GetTopNArguments{NumberEntries: 1},
+	}
+	bufI[1]++
+	return reads + 1
+}
+
+func processQ15Reply(client QueryClient, replies []*proto.ApbReadObjectResp, bufI []int, reads int) (newReads int) {
+	values := replies[bufI[1]].GetTopk().GetValues()
+	if len(values) > 1 {
+		sort.Slice(values, func(i, j int) bool { return values[i].GetScore() > values[j].GetScore() })
+	}
+	bufI[1]++
+	return reads + 1
+}
+
 func sendQ15(client QueryClient) (nRequests int) {
-	rndQuarter := 1 + 3*rand.Int63n(4)
-	rndYear := 1993 + rand.Int63n(5)
+	rndQuarter := 1 + 3*client.rng.Int63n(4)
+	rndYear := 1993 + client.rng.Int63n(5)
 	date := strconv.FormatInt(rndYear, 10) + strconv.FormatInt(rndQuarter, 10)
 
 	readParam := []antidote.ReadObjectParams{antidote.ReadObjectParams{
@@ -351,11 +527,31 @@ func sendQ15(client QueryClient) (nRequests int) {
 	return len(client.serverConns)
 }
 
+func getQ18Reads(client QueryClient, fullR, partialR []antidote.ReadObjectParams, bufI []int, reads int) (newReads int) {
+	rndQuantity := 312 + client.rng.Int31n(4)
+	fullR[bufI[0]+1] = antidote.ReadObjectParams{
+		KeyParams: antidote.KeyParams{Key: LARGE_ORDERS + strconv.FormatInt(int64(rndQuantity), 10), CrdtType: proto.CRDTType_TOPK_RMV, Bucket: buckets[INDEX_BKT]},
+		ReadArgs:  crdt.StateReadArguments{},
+	}
+	bufI[0]++
+	return reads + 1
+}
+
+func processQ18Reply(client QueryClient, replies []*proto.ApbReadObjectResp, bufI []int, reads int) (newReads int) {
+	values := replies[bufI[0]].GetTopk().GetValues()
+	sort.Slice(values, func(i, j int) bool { return values[i].GetScore() > values[j].GetScore() })
+	for _, pair := range values {
+		unpackIndexExtraData(pair.GetData(), Q18_N_EXTRA_DATA)
+	}
+	bufI[0]++
+	return reads + 1
+}
+
 func sendQ18(client QueryClient) (nRequests int) {
 	//Might be worth to optimize this to download customers simultaneously with orders
 	//However, this requires for the ID in the topK to refer to both keys
 	//Also, theoretically this should be a single transaction instead of a static.
-	rndQuantity := 312 + rand.Int31n(4)
+	rndQuantity := 312 + client.rng.Int31n(4)
 
 	//Should ask for a GetTopN if we ever change the topK to not be top 100
 	readParam := []antidote.ReadObjectParams{antidote.ReadObjectParams{
@@ -527,7 +723,6 @@ func getReadArgsPerBucket(tableIndex int) (readParams map[int8]antidote.ReadObje
 	return
 }
 
-//nConn will ALWAYS be 0 when indexes aren't partitioned!
 func sendReceiveReadObjsProto(client QueryClient, fullReads []antidote.ReadObjectParams, nConn int) (replyProto *proto.ApbStaticReadObjectsResp) {
 	antidote.SendProto(antidote.StaticReadObjs, antidote.CreateStaticReadObjs(nil, fullReads), client.serverConns[nConn])
 	_, tmpProto, _ := antidote.ReceiveProto(client.serverConns[nConn])
@@ -539,6 +734,14 @@ func sendReceiveReadProto(client QueryClient, fullReads []antidote.ReadObjectPar
 	_, tmpProto, _ := antidote.ReceiveProto(client.serverConns[nConn])
 	return tmpProto.(*proto.ApbStaticReadObjectsResp)
 }
+
+/*
+func sendReceiveMultipleReads(client QueryClient, reads []antidote.ReadObjectParams, nConn int) (replyProto *proto.ApbStaticReadObjectsResp) {
+	antidote.SendProto(antidote.StaticRead, antidote.CreateStaticRead(nil, nil, reads), client.serverConns[nConn])
+	_, tmpProto, _ := antidote.ReceiveProto(client.serverConns[nConn])
+	return tmpProto.(*proto.ApbStaticReadObjectsResp)
+}
+*/
 
 //Note: assumes only partial reads, for simplicity
 func sendReceiveBucketReadProtos(client QueryClient, partReads map[int8]antidote.ReadObjectParams) (replyProtos map[int8]*proto.ApbStaticReadObjectsResp) {
@@ -661,6 +864,10 @@ func sendReceiveIndexQuery(client QueryClient, fullReads []antidote.ReadObjectPa
 }
 
 func mergeIndex(protos []*proto.ApbStaticReadObjectsResp, queryN int) []*proto.ApbReadObjectResp {
+	if isIndexGlobal {
+		//No merging to be done
+		return protos[0].Objects.Objects
+	}
 	switch queryN {
 	case 3:
 		return mergeQ3IndexReply(protos)
@@ -733,7 +940,7 @@ func mergeQ18IndexReply(protos []*proto.ApbStaticReadObjectsResp) (merged []*pro
 
 func mergeTopKProtos(protos []*proto.ApbStaticReadObjectsResp, target int) (merged []*proto.ApbReadObjectResp) {
 	protoObjs := getObjectsFromStaticReadResp(protos)
-	values := make([]*proto.ApbIntPair, 10)
+	values := make([]*proto.ApbIntPair, target)
 	currI := make([]int, len(protos))
 	end, max, playerId, replicaI := true, int32(-1), int32(-1), 0
 	var currPair *proto.ApbIntPair
@@ -779,6 +986,157 @@ func getIndexOffset(client QueryClient, region int) (bucketI, serverI int) {
 
 func unpackIndexExtraData(data []byte, nEntries int) (parts []string) {
 	return strings.SplitN(string(data), "_", nEntries)
+}
+
+func doQueryStatsInterval() {
+	for {
+		time.Sleep(statisticsInterval * time.Millisecond)
+		newBoolSlice := make([]bool, TEST_ROUTINES)
+		for i := range newBoolSlice {
+			newBoolSlice[i] = true
+		}
+		collectQueryStats = newBoolSlice
+	}
+}
+
+func writeQueriesStatsFile(stats []QueryClientResult) {
+	//I should write the total, avg, best and worse for each part.
+	//Also write the total, avg, best and worse for the "final"
+
+	statsPerPart := convertQueryStats(stats)
+	nClients, nFuncs := float64(len(stats)), len(queryFuncs)
+
+	//+10: header(1), 5 spaces(5), finalStats(4)
+	//data := make([][]string, len(statsPerPart)*4+10)
+	totalData := make([][]string, len(statsPerPart)+1) //space for final data as well
+	avgData := make([][]string, len(statsPerPart))
+	bestData := make([][]string, len(statsPerPart))
+	worseData := make([][]string, len(statsPerPart))
+
+	header := []string{"Total time", "Section time", "Queries txns", "Queries", "Reads", "Query txns/s", "Query/s", "Read/s",
+		"Average latency (ms)"}
+
+	partQueries, partReads, partTime, partQueryTxns := 0, 0, int64(0), 0
+	totalQueries, totalReads, totalTime := 0, 0, int64(0)
+	queryTxnsS, queryS, readS, latency := 0.0, 0.0, 0.0, 0.0
+	avgQueryTxn, avgQuery, avgRead, avgQueryTxnS, avgQueryS, avgReadS := 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
+	maxClientPos, minClientPos := 0, 0
+	maxClientQueryS, minClientQueryS, currClientQueryS := 0.0, math.MaxFloat64, 0.0
+	var maxQueryTxnS, maxQueryS, maxReadS, minQueryTxnS, minQueryS, minReadS, maxLatency, minLatency float64
+	var maxClient, minClient QueryStats
+
+	for i, partStats := range statsPerPart {
+		for j, clientStat := range partStats {
+			partQueries += clientStat.nQueries
+			partReads += clientStat.nReads
+			partTime += clientStat.timeSpent
+			currClientQueryS = float64(clientStat.nQueries) / float64(clientStat.timeSpent)
+			if currClientQueryS > maxClientQueryS {
+				maxClientPos = j
+				maxClientQueryS = currClientQueryS
+			}
+			if currClientQueryS < minClientQueryS {
+				minClientPos = j
+				minClientQueryS = currClientQueryS
+			}
+		}
+		partQueryTxns = partQueries / nFuncs
+		partTime /= int64(TEST_ROUTINES)
+		queryTxnsS, queryS = (float64(partQueryTxns)/float64(partTime))*1000, (float64(partQueries)/float64(partTime))*1000
+		readS, latency = (float64(partReads)/float64(partTime))*1000, float64(partTime*int64(TEST_ROUTINES))/float64(partQueries)
+		totalQueries += partQueries
+		totalReads += partReads
+		totalTime += partTime
+
+		avgQueryTxn, avgQuery, avgRead = float64(partQueryTxns)/nClients, float64(partQueries)/nClients, float64(partReads)/nClients
+		avgQueryTxnS, avgQueryS, avgReadS = float64(queryTxnsS)/nClients, float64(queryS)/nClients, float64(readS)/nClients
+		maxClient, minClient = partStats[maxClientPos], partStats[minClientPos]
+		maxQueryTxnS, maxQueryS = (float64(maxClient.nQueries/nFuncs)/float64(partTime))*1000, (float64(maxClient.nQueries)/float64(partTime))*1000
+		maxReadS, minQueryTxnS = (float64(maxClient.nReads)/float64(partTime))*1000, (float64(minClient.nQueries/nFuncs)/float64(partTime))*1000
+		minQueryS, minReadS = (float64(minClient.nQueries)/float64(partTime))*1000, (float64(minClient.nReads/nFuncs)/float64(partTime))*1000
+		maxLatency, minLatency = float64(maxClient.timeSpent)/float64(maxClient.nQueries), float64(minClient.timeSpent)/float64(minClient.nQueries)
+
+		totalData[i] = []string{strconv.FormatInt(totalTime, 10), strconv.FormatInt(partTime, 10),
+			strconv.FormatInt(int64(partQueryTxns), 10), strconv.FormatInt(int64(partQueries), 10), strconv.FormatInt(int64(partReads), 10),
+			strconv.FormatFloat(queryTxnsS, 'f', 10, 64), strconv.FormatFloat(queryS, 'f', 10, 64),
+			strconv.FormatFloat(readS, 'f', 10, 64), strconv.FormatFloat(latency, 'f', 10, 64)}
+
+		avgData[i] = []string{strconv.FormatInt(totalTime, 10), strconv.FormatInt(partTime, 10),
+			strconv.FormatFloat(avgQueryTxn, 'f', 10, 64), strconv.FormatFloat(avgQuery, 'f', 10, 64), strconv.FormatFloat(avgRead, 'f', 10, 64),
+			strconv.FormatFloat(avgQueryTxnS, 'f', 10, 64), strconv.FormatFloat(avgQueryS, 'f', 10, 64),
+			strconv.FormatFloat(avgReadS, 'f', 10, 64), strconv.FormatFloat(latency, 'f', 10, 64)}
+
+		bestData[i] = []string{strconv.FormatInt(totalTime, 10), strconv.FormatInt(maxClient.timeSpent, 10),
+			strconv.FormatInt(int64(maxClient.nQueries/nFuncs), 10), strconv.FormatInt(int64(maxClient.nQueries), 10), strconv.FormatInt(int64(maxClient.nReads), 10),
+			strconv.FormatFloat(maxQueryTxnS, 'f', 10, 64), strconv.FormatFloat(maxQueryS, 'f', 10, 64),
+			strconv.FormatFloat(maxReadS, 'f', 10, 64), strconv.FormatFloat(maxLatency, 'f', 10, 64)}
+
+		worseData[i] = []string{strconv.FormatInt(totalTime, 10), strconv.FormatInt(minClient.timeSpent, 10),
+			strconv.FormatInt(int64(minClient.nQueries/nFuncs), 10), strconv.FormatInt(int64(minClient.nQueries), 10), strconv.FormatInt(int64(minClient.nReads), 10),
+			strconv.FormatFloat(minQueryTxnS, 'f', 10, 64), strconv.FormatFloat(minQueryS, 'f', 10, 64),
+			strconv.FormatFloat(minReadS, 'f', 10, 64), strconv.FormatFloat(minLatency, 'f', 10, 64)}
+
+		partQueryTxns, partQueries, partReads, partTime = 0, 0, 0, 0
+	}
+
+	for _, clientFinal := range stats {
+		partQueryTxns += int(clientFinal.nQueries)
+		partReads += int(clientFinal.nReads)
+		partTime += int64(clientFinal.duration)
+	}
+	partQueries, partQueryTxns = partQueryTxns, partQueryTxns/nFuncs
+	partTime /= int64(TEST_ROUTINES)
+	queryTxnsS, queryS = (float64(partQueryTxns)/float64(partTime))*1000, (float64(partQueries)/float64(partTime))*1000
+	readS, latency = (float64(partReads)/float64(partTime))*1000, float64(partTime*int64(TEST_ROUTINES))/float64(partQueries)
+	//TODO: Fix final data
+	finalData := []string{strconv.FormatInt(partTime, 10), strconv.FormatInt(partTime, 10),
+		strconv.FormatInt(int64(partQueryTxns), 10), strconv.FormatInt(int64(partQueries), 10), strconv.FormatInt(int64(partReads), 10),
+		strconv.FormatFloat(queryTxnsS, 'f', 10, 64), strconv.FormatFloat(queryS, 'f', 10, 64),
+		strconv.FormatFloat(readS, 'f', 10, 64), strconv.FormatFloat(latency, 'f', 10, 64)}
+	totalData[len(totalData)-1] = finalData
+
+	file := getStatsFileToWrite("queryStats")
+	if file == nil {
+		return
+	}
+	defer file.Close()
+	writer := csv.NewWriter(file)
+	writer.Comma = ';'
+	defer writer.Flush()
+
+	writer.Write(header)
+	toWrite := [][][]string{totalData, avgData, bestData, worseData}
+	emptyLine := []string{"", "", "", "", "", "", "", "", ""}
+	for _, data := range toWrite {
+		for _, line := range data {
+			writer.Write(line)
+		}
+		writer.Write(emptyLine)
+	}
+	writer.Write(finalData)
+
+	fmt.Println("Query statistics saved successfully.")
+}
+
+func convertQueryStats(stats []QueryClientResult) (convStats [][]QueryStats) {
+	sizeToUse := int(math.MaxInt32)
+	for _, queryStats := range stats {
+		if len(queryStats.intermediateResults) < sizeToUse {
+			sizeToUse = len(queryStats.intermediateResults)
+		}
+	}
+	convStats = make([][]QueryStats, sizeToUse)
+	var currStatSlice []QueryStats
+
+	for i := range convStats {
+		currStatSlice = make([]QueryStats, len(stats))
+		for j, stat := range stats {
+			currStatSlice[j] = stat.intermediateResults[i]
+		}
+		convStats[i] = currStatSlice
+	}
+
+	return
 }
 
 //OBSOLETE

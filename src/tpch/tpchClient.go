@@ -1,16 +1,20 @@
 package tpch
 
 import (
+	"antidote"
 	"flag"
 	"fmt"
 	"math/rand"
 	"net"
 	"os"
 	"os/signal"
+	"proto"
 	"runtime"
 	"runtime/pprof"
+	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 	"tools"
@@ -96,6 +100,34 @@ type ExecutionTimes struct {
 	queries            []int64
 	totalQueries       int64
 	finishTime         int64
+	nLineItemsSent     int
+}
+
+//Only one
+type DataloadStats struct {
+	nDataUpds      int
+	nIndexUpds     int
+	dataTimeSpent  int64
+	indexTimeSpent int64
+	nSendersDone   int
+	sync.Mutex     //Used for dataTimeSpent, indexTimeSpent and nServersDone, as there's one goroutine per server.
+}
+
+//One every x seconds.
+type UpdatesStats struct {
+	newDataUpds         int
+	removeDataUpds      int
+	indexUpds           int
+	newDataTimeSpent    int64
+	removeDataTimeSpent int64
+	indexTimeSpent      int64
+}
+
+//One every x seconds.
+type QueryStats struct {
+	nQueries  int
+	nReads    int
+	timeSpent int64
 }
 
 const (
@@ -119,13 +151,16 @@ const (
 
 var (
 	//Filled dinamically by prepareConfigs()
-	tableFolder, updFolder, commonFolder, headerLoc                                string
-	scaleFactor                                                                    float64
-	isIndexGlobal, isMulti, memDebug, profiling, splitIndexLoad, useTopKAll        bool
-	maxUpdSize                                                                     int //Max number of entries for a single upd msg. To avoid sending the whole table in one request...
-	INDEX_WITH_FULL_DATA, CRDT_PER_OBJ, DOES_DATA_LOAD, DOES_QUERIES, DOES_UPDATES bool
-	withUpdates                                                                    bool //Also loads the necessary update data in order to still be able to do the queries with updates.
-	updCompleteFilename                                                            [3]string
+	tableFolder, updFolder, commonFolder, headerLoc                         string
+	scaleFactor                                                             float64
+	isIndexGlobal, isMulti, memDebug, profiling, splitIndexLoad, useTopKAll bool
+	maxUpdSize                                                              int //Max number of entries for a single upd msg. To avoid sending the whole table in one request...
+	INDEX_WITH_FULL_DATA, CRDT_PER_OBJ, SINGLE_INDEX_SERVER                 bool
+	DOES_DATA_LOAD, DOES_QUERIES, DOES_UPDATES, CRDT_BENCH                  bool
+	withUpdates                                                             bool //Also loads the necessary update data in order to still be able to do the queries with updates.
+	updCompleteFilename                                                     [3]string
+	statisticsInterval                                                      time.Duration //Milliseconds. A negative number means that no statistics need to be collected.
+	statsSaveLocation                                                       string
 
 	//Constants...
 	tableNames = [...]string{"customer", "lineitem", "nation", "orders", "part", "partsupp", "region", "supplier"}
@@ -154,8 +189,9 @@ var (
 	//nil, partSuppToRegion, regionToRegion, supplierToRegion}
 	//multiRegionFunc = [...]func([]string) []int8{nil, lineitemToRegion, nil, nil, nil, nil, nil, nil}
 
-	regionFuncs     [8]func([]string) int8
-	multiRegionFunc [8]func([]string) []int8
+	regionFuncs         [8]func([]string) int8
+	multiRegionFunc     [8]func([]string) []int8
+	specialLineItemFunc func(order []string, item []string) []int8 //Uses customer key instead of order key
 
 	conns   []net.Conn
 	buckets []string
@@ -165,29 +201,126 @@ var (
 		prepareIndexProtos: make([]int64, 6),
 		queries:            make([]int64, 6),
 	}
+
+	dataloadStats                                                                                                    = DataloadStats{}
+	configFolder, indexGlobalString, testRoutinesString, statsSaveLocationString, singleIndexString, updRateString   *string
+	idString, updateIndexString, splitUpdatesString, splitUpdatesNoWaitString, updateBaseString, notifyAddressString *string
+	nReadsTxn, updateSpecificIndex                                                                                   *string
+	//Bench
+	nKeysString, keysTypeString, addRateString, partReadRateString, queryRatesString, opsPerTxnString, nTxnsBeforeWaitString, nElemsString,
+	maxIDString, maxScoreString, topNString, topAboveString, rndDataSizeString, minChangeString, maxChangeString, maxSumString, maxNAddsString *string
+
+	id     string     //id for statistics files
+	idLock sync.Mutex //Statistics files may be written concurrently, thus this lock protects the ID from being changed concurrently.
 )
 
 func loadConfigs() {
-	loadConfigsFile()
+	configs := loadFlags()
+	loadConfigsFile(configs)
 	prepareConfigs()
 }
 
-func loadConfigsFile() {
-	configFolder := flag.String("config", "none", "sub-folder in configs folder that contains the configuration files to be used.")
+func loadFlags() (configs *tools.ConfigLoader) {
+	reset := flag.String("reset", "none", "set this flag to true for resetting the server status. The program will exit afterwards.")
+	configFolder = flag.String("config", "none", "sub-folder in configs folder that contains the configuration files to be used.")
+	indexGlobalString = flag.String("global_index", "none", "if indexes are global (i.e., data from all servers) or local (only data in the server)")
+	testRoutinesString = flag.String("query_clients", "none", "number of query client processes (ignored if this isn't a query client)")
+	statsSaveLocationString = flag.String("test_name", "none", "name of the test/path to write statistics to.")
+	singleIndexString = flag.String("single_index_server", "none", "if only the first server has the index, or all have the index. Ignored if global_index is false.")
+	updRateString = flag.String("upd_rate", "none", "rate of updates for mix clients. Ignored if this is a query only client or update only client")
+	idString = flag.String("id", "none", "id to use for statistics file. Should be set when multiple client instances are running on the same disk.")
+	updateIndexString = flag.String("updateIndex", "none", "if indexes should be updated or not. Dataload client ignores this.")
+	updateBaseString = flag.String("updateBase", "none", "if base data should be updated or not. Dataload client ignores this.")
+	splitUpdatesString = flag.String("split_updates", "none", "if each update should be sent in its own transaction or not. Only mix clients support this.")
+	splitUpdatesNoWaitString = flag.String("split_updates_no_wait", "none", "if true, all updates related to an order are sent before waiting for a reply.")
+	notifyAddressString = flag.String("notify_address", "none", "ip:port to notify when test is complete. 'none' (or don't provide this flag) if notification isn't desired.")
+	nReadsTxn = flag.String("n_reads_txn", "none", "number of reads (not queries) per transaction. Works for both mix and query clients.")
+	updateSpecificIndex = flag.String("update_specific_index", "none", "if only the indexes correspondent to the queries in the config file should be updated.")
+
+	registerBenchFlags()
+
 	flag.Parse()
-	fmt.Println("Using configFolder:", *configFolder)
-	if *configFolder == "none" {
-		isMulti, isIndexGlobal, splitIndexLoad, memDebug, profiling, scaleFactor, maxUpdSize, useTopKAll = true, true, true, true, true, 0.1, 2000, false
-		commonFolder = "/Users/a.rijo/Documents/University_6th_year/potionDB docs/"
-		MAX_BUFF_PROTOS, QUERY_WAIT, FORCE_PROTO_CLEAN, TEST_ROUTINES, TEST_DURATION = 200, 5000, 10000, 10, 20000
-		PRINT_QUERY, QUERY_BENCH = true, false
-		INDEX_WITH_FULL_DATA, CRDT_PER_OBJ, DOES_DATA_LOAD, DOES_QUERIES, DOES_UPDATES = true, false, true, true, false
-		withUpdates, N_UPDATE_FILES = false, 1000
-		queryFuncs = []func(QueryClient) int{sendQ3, sendQ5, sendQ11, sendQ14, sendQ15, sendQ18}
-	} else {
-		configs := &tools.ConfigLoader{}
+
+	configs = &tools.ConfigLoader{}
+	if isFlagValid(configFolder) {
 		configs.LoadConfigs(*configFolder)
-		isMulti, isIndexGlobal, splitIndexLoad, useTopKAll = configs.GetBoolConfig("multiServer", true), configs.GetBoolConfig("globalIndex", true),
+	} else {
+		configs.InitEmptyConfig()
+	}
+	if isFlagValid(reset) {
+		resetServers(configs)
+		os.Exit(0)
+	}
+
+	if isFlagValid(indexGlobalString) {
+		configs.ReplaceConfig("globalIndex", *indexGlobalString)
+	}
+	if isFlagValid(testRoutinesString) {
+		configs.ReplaceConfig("queryClients", *testRoutinesString)
+	}
+	if isFlagValid(statsSaveLocationString) {
+		configs.ReplaceConfig("statsLocation", *statsSaveLocationString)
+	}
+	if isFlagValid(singleIndexString) {
+		configs.ReplaceConfig("singleIndexServer", *singleIndexString)
+	}
+	if isFlagValid(updRateString) {
+		configs.ReplaceConfig("updRate", *updRateString)
+	}
+	if isFlagValid(idString) {
+		configs.ReplaceConfig("id", *idString)
+	}
+	if isFlagValid(updateIndexString) {
+		configs.ReplaceConfig("updateIndex", *updateIndexString)
+	}
+	if isFlagValid(updateBaseString) {
+		configs.ReplaceConfig("updateBase", *updateIndexString)
+	}
+	if isFlagValid(splitUpdatesString) {
+		configs.ReplaceConfig("splitUpdates", *splitUpdatesString)
+	}
+	if isFlagValid(splitUpdatesNoWaitString) {
+		configs.ReplaceConfig("splitUpdatesNoWait", *splitUpdatesNoWaitString)
+	}
+	if isFlagValid(notifyAddressString) {
+		configs.ReplaceConfig("notifyAddress", *notifyAddressString)
+	}
+	if isFlagValid(nReadsTxn) {
+		configs.ReplaceConfig("nReadsTxn", *nReadsTxn)
+	}
+	if isFlagValid(updateSpecificIndex) {
+		configs.ReplaceConfig("updateSpecificIndex", *updateSpecificIndex)
+	}
+	loadBenchFlags(configs)
+	return
+}
+
+func loadConfigsFile(configs *tools.ConfigLoader) {
+
+	fmt.Println("Using configFolder:", *configFolder)
+	//These configs may have been defined via flags
+	isIndexGlobal = configs.GetBoolConfig("globalIndex", true)
+	TEST_ROUTINES = configs.GetIntConfig("queryClients", 10)
+	statsSaveLocation = configs.GetOrDefault("statsLocation", "unknownStats/")
+	SINGLE_INDEX_SERVER = configs.GetBoolConfig("singleIndexServer", false)
+	UPD_RATE = configs.GetFloatConfig("updRate", 0.1)
+	id = configs.GetOrDefault("id", "0")
+
+	//All remaining are non-flag configs
+	if *configFolder == "none" {
+		isMulti, splitIndexLoad, memDebug, profiling, scaleFactor, maxUpdSize, useTopKAll = true, true, false, false, 0.1, 2000, false
+		commonFolder = "/Users/a.rijo/Documents/University_6th_year/potionDB docs/"
+		MAX_BUFF_PROTOS, QUERY_WAIT, FORCE_PROTO_CLEAN, TEST_DURATION = 200, 5000, 10000, 20000
+
+		PRINT_QUERY, QUERY_BENCH, CRDT_BENCH = true, false, false
+		INDEX_WITH_FULL_DATA, CRDT_PER_OBJ, DOES_DATA_LOAD, DOES_QUERIES, DOES_UPDATES = true, false, true, true, false
+		withUpdates, N_UPDATE_FILES, START_UPD_FILE, FINISH_UPD_FILE = false, 1000, 1, 1000
+		queryFuncs = []func(QueryClient) int{sendQ3, sendQ5, sendQ11, sendQ14, sendQ15, sendQ18}
+		statisticsInterval = -1
+		MAX_LINEITEM_GOROUTINES, UPDATES_GOROUTINES, READS_PER_TXN = 16, 16, 1
+		UPDATE_INDEX, UPDATE_SPECIFIC_INDEX_ONLY = true, false
+	} else {
+		isMulti, splitIndexLoad, useTopKAll = configs.GetBoolConfig("multiServer", true),
 			configs.GetBoolConfig("splitIndexLoad", true), configs.GetBoolConfig("useTopKAll", false)
 		memDebug, profiling = configs.GetBoolConfig("memDebug", true), configs.GetBoolConfig("profiling", false)
 		scaleFactor, _ = strconv.ParseFloat(configs.GetConfig("scale"), 64)
@@ -195,39 +328,51 @@ func loadConfigsFile() {
 		maxUpdSize = int(maxUpdSize64)
 		commonFolder = configs.GetConfig("folder")
 		servers = strings.Split(configs.GetConfig("servers"), " ")
-		MAX_BUFF_PROTOS, QUERY_WAIT, FORCE_PROTO_CLEAN, TEST_ROUTINES, TEST_DURATION = configs.GetIntConfig("maxBuffProtos", 100),
+		MAX_BUFF_PROTOS, QUERY_WAIT, FORCE_PROTO_CLEAN, TEST_DURATION = configs.GetIntConfig("maxBuffProtos", 100),
 			time.Duration(configs.GetIntConfig("queryWait", 5000)), configs.GetIntConfig("forceMemClean", 10000),
-			configs.GetIntConfig("queryClients", 10), int64(configs.GetIntConfig("queryDuration", 20000))
-		PRINT_QUERY, QUERY_BENCH = configs.GetBoolConfig("queryPrint", true), configs.GetBoolConfig("queryBench", false)
+			int64(configs.GetIntConfig("queryDuration", 20000))
+		PRINT_QUERY, QUERY_BENCH, CRDT_BENCH = configs.GetBoolConfig("queryPrint", true), configs.GetBoolConfig("queryBench", false), configs.GetBoolConfig("crdtBench", false)
 		INDEX_WITH_FULL_DATA, CRDT_PER_OBJ, DOES_DATA_LOAD, DOES_QUERIES, DOES_UPDATES = configs.GetBoolConfig("indexFullData", true), configs.GetBoolConfig("crdtPerObj", false),
 			configs.GetBoolConfig("doDataLoad", true), configs.GetBoolConfig("doQueries", true), configs.GetBoolConfig("doUpdates", false)
 		withUpdates, N_UPDATE_FILES = configs.GetBoolConfig("withUpdates", false), configs.GetIntConfig("nUpdateFiles", 1000)
+		statisticsInterval = time.Duration(configs.GetIntConfig("statisticsInterval", 5000))
+		MAX_LINEITEM_GOROUTINES, UPDATES_GOROUTINES = configs.GetIntConfig("maxLineitemGoroutines", 16), configs.GetIntConfig("updGoroutines", 16)
+		START_UPD_FILE, FINISH_UPD_FILE = configs.GetIntConfig("startUpdFile", 1), configs.GetIntConfig("finishUpdFile", 1000)
+		UPDATE_INDEX, SPLIT_UPDATES, SPLIT_UPDATES_NO_WAIT, UPDATE_BASE_DATA, NOTIFY_ADDRESS = configs.GetBoolConfig("updateIndex", true), configs.GetBoolConfig("splitUpdates", false),
+			configs.GetBoolConfig("splitUpdatesNoWait", true), configs.GetBoolConfig("updateBase", true), configs.GetOrDefault("notifyAddress", "")
+		READS_PER_TXN, UPDATE_SPECIFIC_INDEX_ONLY = configs.GetIntConfig("nReadsTxn", 1), configs.GetBoolConfig("updateSpecificIndex", false)
 
-		queryNumbers := strings.Split(configs.GetOrDefault("queries", "3, 5, 11, 14, 18"), " ")
-		queryFuncs = getQueryList(queryNumbers)
+		queryNumbers := strings.Split(configs.GetOrDefault("queries", "3, 5, 11, 14, 15, 18"), " ")
+		setQueryList(queryNumbers)
+
+		if CRDT_BENCH {
+			startCRDTBench(configs)
+		}
 
 		//Query wait is in nanoseconds!!!
-		fmt.Println(isMulti)
-		fmt.Println(isIndexGlobal)
-		fmt.Println(splitIndexLoad)
-		fmt.Println(useTopKAll)
-		fmt.Println(memDebug)
-		fmt.Println(profiling)
-		fmt.Println(scaleFactor)
-		fmt.Println(maxUpdSize)
-		fmt.Println(commonFolder)
-		fmt.Println(servers)
-		fmt.Println(MAX_BUFF_PROTOS)
-		fmt.Println(QUERY_WAIT)
-		fmt.Println(FORCE_PROTO_CLEAN)
-		fmt.Println(TEST_ROUTINES)
-		fmt.Println(TEST_DURATION)
-		fmt.Println(PRINT_QUERY)
-		fmt.Println(QUERY_BENCH)
-		fmt.Println(INDEX_WITH_FULL_DATA)
-		fmt.Println(CRDT_PER_OBJ)
-		fmt.Println(withUpdates)
-		fmt.Println(N_UPDATE_FILES)
+		/*
+			fmt.Println(isMulti)
+			fmt.Println(isIndexGlobal)
+			fmt.Println(splitIndexLoad)
+			fmt.Println(useTopKAll)
+			fmt.Println(memDebug)
+			fmt.Println(profiling)
+			fmt.Println(scaleFactor)
+			fmt.Println(maxUpdSize)
+			fmt.Println(commonFolder)
+			fmt.Println(servers)
+			fmt.Println(MAX_BUFF_PROTOS)
+			fmt.Println(QUERY_WAIT)
+			fmt.Println(FORCE_PROTO_CLEAN)
+			fmt.Println(TEST_ROUTINES)
+			fmt.Println(TEST_DURATION)
+			fmt.Println(PRINT_QUERY)
+			fmt.Println(QUERY_BENCH)
+			fmt.Println(INDEX_WITH_FULL_DATA)
+			fmt.Println(CRDT_PER_OBJ)
+			fmt.Println(withUpdates)
+			fmt.Println(N_UPDATE_FILES)
+		*/
 	}
 }
 
@@ -250,18 +395,23 @@ func prepareConfigs() {
 		//Note: Part isn't partitioned and lineItem uses multiRegionFunc
 		regionFuncs = [8]func([]string) int8{custToRegion, nil, nationToRegion, ordersToRegion, nil, partSuppToRegion, regionToRegion, supplierToRegion}
 		multiRegionFunc = [8]func([]string) []int8{nil, lineitemToRegion, nil, nil, nil, nil, nil, nil}
+		specialLineItemFunc = specialLineitemToRegion
 		channels.dataChans = []chan QueuedMsg{make(chan QueuedMsg, MAX_BUFF_PROTOS), make(chan QueuedMsg, MAX_BUFF_PROTOS),
 			make(chan QueuedMsg, MAX_BUFF_PROTOS), make(chan QueuedMsg, MAX_BUFF_PROTOS), make(chan QueuedMsg, MAX_BUFF_PROTOS)}
+		channels.updateChans = []chan QueuedMsgWithStat{make(chan QueuedMsgWithStat, MAX_BUFF_PROTOS), make(chan QueuedMsgWithStat, MAX_BUFF_PROTOS),
+			make(chan QueuedMsgWithStat, MAX_BUFF_PROTOS), make(chan QueuedMsgWithStat, MAX_BUFF_PROTOS), make(chan QueuedMsgWithStat, MAX_BUFF_PROTOS)}
 	} else {
 		//servers = []string{"127.0.0.1:8087"}
 		servers = []string{servers[0]}
 		buckets = []string{"R", "", "", "", "", "PART", "INDEX"}
 		times.sendDataProtos = make([]int64, 1)
 		regionFuncs = [8]func([]string) int8{singleRegion, singleRegion, singleRegion, singleRegion, singleRegion, singleRegion, singleRegion, singleRegion}
+		specialLineItemFunc = singleLineitemToRegion
 		channels.dataChans = []chan QueuedMsg{make(chan QueuedMsg, MAX_BUFF_PROTOS)}
+		channels.updateChans = []chan QueuedMsgWithStat{make(chan QueuedMsgWithStat, MAX_BUFF_PROTOS)}
 	}
 
-	if !isIndexGlobal || splitIndexLoad {
+	if !isIndexGlobal || (splitIndexLoad && !SINGLE_INDEX_SERVER) {
 		channels.indexChans = []chan QueuedMsg{make(chan QueuedMsg, MAX_BUFF_PROTOS), make(chan QueuedMsg, MAX_BUFF_PROTOS),
 			make(chan QueuedMsg, MAX_BUFF_PROTOS), make(chan QueuedMsg, MAX_BUFF_PROTOS), make(chan QueuedMsg, MAX_BUFF_PROTOS)}
 	} else {
@@ -288,7 +438,8 @@ func prepareConfigs() {
 		updEntries = []int{450, 1747, 450} //NOTE: FAKE VALUES!
 	case 1:
 		tableEntries[LINEITEM] = 6001215
-		updEntries = []int{1500, 5822, 1500}
+		//updEntries = []int{1500, 5822, 1500}
+		updEntries = []int{1500, 6001, 1500}
 	}
 
 }
@@ -309,7 +460,8 @@ func StartClient() {
 		}
 	}()
 
-	if DOES_QUERIES {
+	if DOES_QUERIES && !DOES_UPDATES {
+		//If it's a mixed client, it'll be started on clientDataLoad.go
 		if QUERY_BENCH {
 			go startQueriesBench()
 		} else {
@@ -323,8 +475,9 @@ func StartClient() {
 	handleHeaders()
 
 	go handleTableProcessing()
-	if DOES_DATA_LOAD || DOES_UPDATES {
-		//Start tcp connection to each server for data loading. Query clients create and manage their own connections
+	if DOES_DATA_LOAD {
+		//Start tcp connection to each server for data loading. Query clients create and manage their own connections.
+		//Update clients start their connections after all data is loaded.
 		go connectToServers()
 	}
 	if DOES_DATA_LOAD {
@@ -525,6 +678,20 @@ func lineitemToRegion(obj []string) []int8 {
 	return []int8{r1, r2}
 }
 
+func specialLineitemToRegion(order []string, item []string) []int8 {
+	suppKey, _ := strconv.ParseInt(item[L_SUPPKEY], 10, 32)
+	custKey, _ := strconv.ParseInt(order[O_CUSTKEY], 10, 32)
+	r1, r2 := procTables.SuppkeyToRegionkey(suppKey), procTables.CustkeyToRegionkey(custKey)
+	if r1 == r2 {
+		return []int8{r1}
+	}
+	return []int8{r1, r2}
+}
+
+func singleLineitemToRegion(order []string, item []string) []int8 {
+	return []int8{0}
+}
+
 func nationToRegion(obj []string) int8 {
 	nationKey, _ := strconv.ParseInt(obj[C_NATIONKEY], 10, 8)
 	return procTables.NationkeyToRegionkey(nationKey)
@@ -554,27 +721,132 @@ func singleRegion(obj []string) int8 {
 	return 0
 }
 
-func getQueryList(queryStrings []string) (funcs []func(QueryClient) int) {
-	funcs = make([]func(QueryClient) int, len(queryStrings))
+func setQueryList(queryStrings []string) {
+	queryFuncs, getReadsFuncs = make([]func(QueryClient) int, len(queryStrings)),
+		make([]func(QueryClient, []antidote.ReadObjectParams, []antidote.ReadObjectParams, []int, int) int, len(queryStrings))
+	processReadReplies = make([]func(QueryClient, []*proto.ApbReadObjectResp, []int, int) int, len(queryStrings))
+	indexesToUpd = make([]int, len(queryStrings))
 	i := 0
 	for _, queryN := range queryStrings {
 		switch queryN {
 		case "3":
-			funcs[i] = sendQ3
+			queryFuncs[i], getReadsFuncs[i], processReadReplies[i], indexesToUpd[i] = sendQ3, getQ3Reads, processQ3Reply, 3
 		case "5":
-			funcs[i] = sendQ5
+			queryFuncs[i], getReadsFuncs[i], processReadReplies[i], indexesToUpd[i] = sendQ5, getQ5Reads, processQ5Reply, 5
 		case "11":
-			funcs[i] = sendQ11
+			//Q11 doens't have updates
+			queryFuncs[i], getReadsFuncs[i], processReadReplies[i] = sendQ11, getQ11Reads, processQ11Reply
 		case "14":
-			funcs[i] = sendQ14
+			queryFuncs[i], getReadsFuncs[i], processReadReplies[i], indexesToUpd[i] = sendQ14, getQ14Reads, processQ14Reply, 14
 		case "15":
-			funcs[i] = sendQ15
+			queryFuncs[i], getReadsFuncs[i], processReadReplies[i], indexesToUpd[i] = sendQ15, getQ15Reads, processQ15Reply, 15
 		case "18":
-			funcs[i] = sendQ18
+			queryFuncs[i], getReadsFuncs[i], processReadReplies[i], indexesToUpd[i] = sendQ18, getQ18Reads, processQ18Reply, 18
 		}
 		i++
 	}
+	sort.Ints(indexesToUpd)
 	return
+}
+
+func resetServers(configs *tools.ConfigLoader) {
+	start := time.Now().UnixNano()
+	servers = strings.Split(configs.GetConfig("servers"), " ")
+	conns := make([]net.Conn, len(servers))
+	for i, server := range servers {
+		conn, err := net.Dial("tcp", server)
+		tools.CheckErr("Network connection establishment err", err)
+		conns[i] = conn
+	}
+	for i, conn := range conns {
+		fmt.Printf("Requested server %s to reset.\n", servers[i])
+		antidote.SendProto(antidote.ResetServer, &proto.ApbResetServer{}, conn)
+	}
+	for i, conn := range conns {
+		antidote.ReceiveProto(conn)
+		fmt.Printf("Server %s has finished resetting itself.\n", servers[i])
+	}
+	end := time.Now().UnixNano()
+	fmt.Println("Time taken for the reset process: ", (end-start)/1000000, "ms")
+}
+
+//Bench
+func registerBenchFlags() {
+	nKeysString = flag.String("b_nkeys", "none", "number of keys for bench clients.")
+	keysTypeString = flag.String("b_keys_type", "none", "type of key splitting for bench clients.")
+	addRateString = flag.String("b_add_rate", "none", "add rate for bench clients.")
+	partReadRateString = flag.String("b_part_read_rate", "none", "partial read rate for bench clients.")
+	queryRatesString = flag.String("b_query_rates", "none", "query distribution for bench clients. Use form e.g. [0,0.5,1]")
+	opsPerTxnString = flag.String("b_ops_per_txn", "none", "number of operations to do in a single transaction.")
+	nTxnsBeforeWaitString = flag.String("b_txns_before_wait", "none", "number of txns to be sent before waiting for replies")
+	nElemsString = flag.String("b_nelems", "none", "number of elements for bench clients' set")
+	maxScoreString = flag.String("b_max_score", "none", "max score value for bench clients' topk")
+	maxIDString = flag.String("b_max_id", "none", "max id value for bench clients' topk")
+	topAboveString = flag.String("b_top_above", "none", "max value for bench clients' topGetAbove (topk)")
+	topNString = flag.String("b_top_n", "none", "max value for bench clients' topGetN (topk)")
+	rndDataSizeString = flag.String("b_rnd_size", "none", "size for bench clients' topk extra data")
+	minChangeString = flag.String("b_min_change", "none", "min value for bench clients' increments (counter)")
+	maxChangeString = flag.String("b_max_change", "none", "max value for bench clients' increments (counter)")
+	maxSumString = flag.String("b_max_sum", "none", "max sum value for bench clients' average")
+	maxNAddsString = flag.String("b_max_nAdds", "none", "max nAdds value for bench clients' average")
+}
+
+func loadBenchFlags(configs *tools.ConfigLoader) {
+	if isFlagValid(nKeysString) {
+		configs.ReplaceConfig("keys", *nKeysString)
+	}
+	if isFlagValid(keysTypeString) {
+		configs.ReplaceConfig("keyType", *keysTypeString)
+	}
+	if isFlagValid(addRateString) {
+		configs.ReplaceConfig("addRate", *addRateString)
+	}
+	if isFlagValid(partReadRateString) {
+		configs.ReplaceConfig("partReadRate", *partReadRateString)
+	}
+	if isFlagValid(queryRatesString) {
+		configs.ReplaceConfig("queryRates", *queryRatesString)
+	}
+	if isFlagValid(opsPerTxnString) {
+		configs.ReplaceConfig("opsPerTxn", *opsPerTxnString)
+	}
+	if isFlagValid(nTxnsBeforeWaitString) {
+		configs.ReplaceConfig("nTxnsBeforeWait", *nTxnsBeforeWaitString)
+	}
+	if isFlagValid(nElemsString) {
+		configs.ReplaceConfig("nSetElems", *nElemsString)
+	}
+	if isFlagValid(maxScoreString) {
+		configs.ReplaceConfig("maxScore", *maxScoreString)
+	}
+	if isFlagValid(maxIDString) {
+		configs.ReplaceConfig("maxID", *maxIDString)
+	}
+	if isFlagValid(topAboveString) {
+		configs.ReplaceConfig("topAbove", *topAboveString)
+	}
+	if isFlagValid(topNString) {
+		configs.ReplaceConfig("topN", *topNString)
+	}
+	if isFlagValid(rndDataSizeString) {
+		configs.ReplaceConfig("randomDataSize", *rndDataSizeString)
+	}
+	if isFlagValid(minChangeString) {
+		configs.ReplaceConfig("minChange", *minChangeString)
+	}
+	if isFlagValid(maxChangeString) {
+		configs.ReplaceConfig("maxChange", *maxChangeString)
+	}
+	if isFlagValid(maxSumString) {
+		configs.ReplaceConfig("maxSum", *maxSumString)
+	}
+	if isFlagValid(maxNAddsString) {
+		configs.ReplaceConfig("maxNAdds", *maxNAddsString)
+	}
+}
+
+func isFlagValid(value *string) bool {
+	return *value != "none" && *value != "" && *value != " "
 }
 
 /*

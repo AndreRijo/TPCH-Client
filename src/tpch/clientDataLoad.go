@@ -4,6 +4,7 @@ import (
 	"antidote"
 	"crdt"
 	"fmt"
+	"math"
 	"proto"
 	"runtime"
 	"strings"
@@ -12,6 +13,15 @@ import (
 
 //Deals with loading the initial data (along with headers) from the files, creating the initial client tables
 //and generating the protobufs for the data
+
+var (
+	//Filled by prepareConfigs()
+	MAX_LINEITEM_GOROUTINES int //max number of goroutines to be used to send lineItems. LineItems protos take around 90% of the dataload time.
+
+	//minimum amount of lineitems to be processed by each goroutine. The number of created goroutines is always <= MAX_LINEITEM_GOROUTINES
+	LINEITEM_FACTOR        = 300000
+	prepareProtoFinishChan chan bool
+)
 
 func handleHeaders() {
 	startTime := time.Now().UnixNano() / 1000000
@@ -27,8 +37,8 @@ func handleTables() {
 	readProcessSendTable(NATION)
 	readProcessSendTable(SUPPLIER)
 	readProcessSendTable(CUSTOMER)
-	//Order is irrelevant now
 	readProcessSendTable(ORDERS)
+	//Order is irrelevant now
 	readProcessSendTable(LINEITEM)
 	readProcessSendTable(PARTSUPP)
 	readProcessSendTable(PART)
@@ -81,7 +91,7 @@ func handleTableProcessing() {
 		}
 	}
 	times.clientTables = (time.Now().UnixNano() - times.startTime) / 1000000
-	fmt.Println("Finished creating all tables")
+	fmt.Println("Finished creating all tables.")
 	//If we're only doing queries, we can clean the unprocessed tables right now, as no further processing will be done
 	if !DOES_DATA_LOAD && !DOES_UPDATES {
 		tables = nil
@@ -96,11 +106,15 @@ func handleTableProcessing() {
 		//For the case of DOES_DATA_LOAD && DOES_UPDATES, updates will start after indexes are prepared.
 		//Also, preparing Q15 index is necessary for the updates to work.
 		if isIndexGlobal {
-			prepareQ15Index()
+			TableInfo{Tables: procTables}.prepareQ15Index()
 		} else {
-			prepareQ15IndexLocal()
+			TableInfo{Tables: procTables}.prepareQ15IndexLocal()
 		}
-		go startUpdates()
+		if DOES_QUERIES {
+			go startMixBench()
+		} else {
+			go startUpdates()
+		}
 	}
 	if DOES_QUERIES && withUpdates && !DOES_UPDATES {
 		//Read only order updates in order to know the new orderIDs added by the update client.
@@ -109,30 +123,45 @@ func handleTableProcessing() {
 }
 
 func handlePrepareSend() {
+	nFinished := 0
+	prepareProtoFinishChan = make(chan bool, len(tableNames))
 	left := len(tableNames)
 	for ; left > 0; left-- {
 		i := <-channels.prepSendChan
 		fmt.Println("Preparing protos", tableNames[i], i)
 		if i == PART {
-			prepareSendAny(i, PART_BKT)
+			go prepareSendAny(i, PART_BKT)
 		} else if !isMulti {
-			prepareSendAny(i, 0)
+			go prepareSendAny(i, 0)
 		} else if i == LINEITEM {
-			prepareSendMultiplePartitioned(i)
+			go prepareSendMultiplePartitioned(i)
 		} else {
-			prepareSendPartitioned(i)
+			go prepareSendPartitioned(i)
 		}
-		runtime.GC()
+		//runtime.GC()
 	}
+	fmt.Println("Waiting for:", nFinished)
+	for ; nFinished < len(tableNames); nFinished++ {
+		<-prepareProtoFinishChan
+		fmt.Println("Received prepareFinish, nFinished will now be:", nFinished+1)
+	}
+	runtime.GC()
 	times.prepareDataProtos = (time.Now().UnixNano() - times.startTime) / 1000000
-	fmt.Println("Finished preparing protos for all tables")
+	updsDone := len(procTables.Customers) + len(procTables.Nations) + len(procTables.Orders) + len(procTables.Parts) +
+		len(procTables.PartSupps) + len(procTables.Regions) + len(procTables.Suppliers) + times.nLineItemsSent
+	if isMulti {
+		updsDone += times.nLineItemsSent
+	} else {
+		updsDone += len(procTables.LineItems)
+	}
+	fmt.Println("Finished preparing protos for all tables. Number of upds generated:", updsDone)
+	dataloadStats.nDataUpds = updsDone
 	for _, channel := range channels.dataChans {
 		channel <- QueuedMsg{code: QUEUE_COMPLETE}
 	}
 }
 
-func queueDataProto(currMap map[string]crdt.UpdateArguments, name string, bucket string, dataChan chan QueuedMsg) {
-	var updParams []antidote.UpdateObjectParams
+func getDataUpdateParams(currMap map[string]crdt.UpdateArguments, name string, bucket string) (updParams []antidote.UpdateObjectParams) {
 	if CRDT_PER_OBJ {
 		updParams = make([]antidote.UpdateObjectParams, len(currMap))
 		i := 0
@@ -149,6 +178,11 @@ func queueDataProto(currMap map[string]crdt.UpdateArguments, name string, bucket
 			KeyParams:  antidote.KeyParams{Key: name, CrdtType: proto.CRDTType_RRMAP, Bucket: bucket},
 			UpdateArgs: &currUpd}}
 	}
+	return
+}
+
+func queueDataProto(currMap map[string]crdt.UpdateArguments, name string, bucket string, dataChan chan QueuedMsg) {
+	updParams := getDataUpdateParams(currMap, name, bucket)
 	dataChan <- QueuedMsg{code: antidote.StaticUpdateObjs, Message: antidote.CreateStaticUpdateObjs(nil, updParams)}
 }
 
@@ -227,48 +261,116 @@ func prepareSendPartitioned(tableIndex int) {
 	}
 	//Clean table
 	tables[tableIndex] = nil
+	prepareProtoFinishChan <- true
 }
 
 func prepareSendMultiplePartitioned(tableIndex int) {
 	regionFunc := multiRegionFunc[tableIndex]
 
-	updsPerServer := make([]map[string]crdt.UpdateArguments, len(procTables.Regions))
-	for i := range updsPerServer {
-		updsPerServer[i] = make(map[string]crdt.UpdateArguments)
-	}
+	/*
+		updsPerServer := make([]map[string]crdt.UpdateArguments, len(procTables.Regions))
+		for i := range updsPerServer {
+			updsPerServer[i] = make(map[string]crdt.UpdateArguments)
+		}
+	*/
 	table, header, primKeys, read, name := tables[tableIndex], headers[tableIndex], keys[tableIndex], read[tableIndex], tableNames[tableIndex]
 
-	var key string
-	var upd *crdt.EmbMapUpdateAll
-	var regions []int8
-	var currMap map[string]crdt.UpdateArguments
-	count := 0
-	printTarget := (len(table) / 10) / maxUpdSize
-	for _, obj := range table {
-		key, upd = getEntryUpd(header, primKeys, obj, read)
-		key = getEntryKey(name, key)
-		regions = regionFunc(obj)
-		for _, reg := range regions {
-			currMap = updsPerServer[reg]
-			currMap[key] = *upd
-			if len(currMap) == maxUpdSize {
-				count++
-				if count%printTarget == 0 {
-					fmt.Println("Queuing lineitem proto", count, count*maxUpdSize)
-				}
-				queueDataProto(currMap, name, buckets[reg], channels.dataChans[reg])
-				updsPerServer[reg] = make(map[string]crdt.UpdateArguments)
+	//Splitting workload between goroutines
+	targetNRoutines := int(math.Min(float64(MAX_LINEITEM_GOROUTINES), float64(len(table)/LINEITEM_FACTOR)+1))
+	if targetNRoutines == MAX_LINEITEM_GOROUTINES {
+		LINEITEM_FACTOR = len(table) / MAX_LINEITEM_GOROUTINES
+	}
+	startPos, endPos := 0, LINEITEM_FACTOR
+	subTables := make([][][]string, targetNRoutines)
+	for i := 0; i < targetNRoutines-1; i++ {
+		subTables[i] = table[startPos:endPos]
+		startPos = endPos
+		endPos += LINEITEM_FACTOR
+	}
+	fmt.Println(len(table))
+	fmt.Println("NGoroutines:", targetNRoutines)
+	fmt.Println(MAX_LINEITEM_GOROUTINES, len(table)/LINEITEM_FACTOR+1)
+	subTables[targetNRoutines-1] = table[startPos:]
+	doneChan := make(chan bool, targetNRoutines)
+	for _, subTable := range subTables {
+		go func(itemTable [][]string) {
+			fmt.Println(len(itemTable))
+			updsPerServer := make([]map[string]crdt.UpdateArguments, len(procTables.Regions))
+			for i := range updsPerServer {
+				updsPerServer[i] = make(map[string]crdt.UpdateArguments)
 			}
-		}
+			var key string
+			var upd *crdt.EmbMapUpdateAll
+			var regions []int8
+			var currMap map[string]crdt.UpdateArguments
+			count := 0
+			printTarget := (len(itemTable) / 2) / maxUpdSize
+			for _, obj := range itemTable {
+				key, upd = getEntryUpd(header, primKeys, obj, read)
+				key = getEntryKey(name, key)
+				regions = regionFunc(obj)
+				for _, reg := range regions {
+					currMap = updsPerServer[reg]
+					currMap[key] = *upd
+					if len(currMap) == maxUpdSize {
+						count++
+						if count%printTarget == 0 {
+							fmt.Println("Queuing lineitem proto", count, count*maxUpdSize)
+						}
+						queueDataProto(currMap, name, buckets[reg], channels.dataChans[reg])
+						updsPerServer[reg] = make(map[string]crdt.UpdateArguments)
+					}
+				}
+				times.nLineItemsSent += len(regions)
+			}
+
+			for i, leftUpds := range updsPerServer {
+				if len(leftUpds) > 0 {
+					queueDataProto(leftUpds, name, buckets[i], channels.dataChans[i])
+				}
+			}
+			doneChan <- true
+		}(subTable)
 	}
 
-	for i, leftUpds := range updsPerServer {
-		if len(leftUpds) > 0 {
-			queueDataProto(leftUpds, name, buckets[i], channels.dataChans[i])
-		}
+	for i := 0; i < targetNRoutines; i++ {
+		<-doneChan
 	}
+	/*
+		var key string
+		var upd *crdt.EmbMapUpdateAll
+		var regions []int8
+		var currMap map[string]crdt.UpdateArguments
+		count := 0
+		printTarget := (len(table) / 10) / maxUpdSize
+		for _, obj := range table {
+			key, upd = getEntryUpd(header, primKeys, obj, read)
+			key = getEntryKey(name, key)
+			regions = regionFunc(obj)
+			for _, reg := range regions {
+				currMap = updsPerServer[reg]
+				currMap[key] = *upd
+				if len(currMap) == maxUpdSize {
+					count++
+					if count%printTarget == 0 {
+						fmt.Println("Queuing lineitem proto", count, count*maxUpdSize)
+					}
+					queueDataProto(currMap, name, buckets[reg], channels.dataChans[reg])
+					updsPerServer[reg] = make(map[string]crdt.UpdateArguments)
+				}
+			}
+			times.nLineItemsSent += len(regions)
+		}
+
+		for i, leftUpds := range updsPerServer {
+			if len(leftUpds) > 0 {
+				queueDataProto(leftUpds, name, buckets[i], channels.dataChans[i])
+			}
+		}
+	*/
 	//Clean table
 	tables[tableIndex] = nil
+	prepareProtoFinishChan <- true
 }
 
 func prepareSendAny(tableIndex int, bucketIndex int) {
@@ -292,4 +394,5 @@ func prepareSendAny(tableIndex int, bucketIndex int) {
 	}
 	//Clean table
 	tables[tableIndex] = nil
+	prepareProtoFinishChan <- true
 }

@@ -3,7 +3,9 @@ package tpch
 import (
 	"antidote"
 	"crdt"
+	"encoding/csv"
 	"fmt"
+	"math"
 	"math/rand"
 	"proto"
 	"strconv"
@@ -13,17 +15,77 @@ import (
 
 var (
 	//Filled by configLoader
-	N_UPDATE_FILES int
+	N_UPDATE_FILES                 int //Used by this update client only. clientQueryUpd.go use START_UPD_FILE and FINISH_UPD_FILE.
+	UPDATES_GOROUTINES             int
+	UPDATE_INDEX, UPDATE_BASE_DATA bool //If indexes/base data (order/items) should be updated or not. The latter is only supported by mix clients for now.
+	UPDATE_SPECIFIC_INDEX_ONLY     bool //Uses list of queries to know which indexes to update
 
 	updsNames = [...]string{"orders", "lineitem", "delete"}
 	//Orders and delete follow SF, except for SF = 0.01. It's filled automatically in tpchClient.go
-	updEntries []int
-	updParts   = [...]int{9, 16}
+	updEntries          []int
+	updParts            = [...]int{9, 16}
+	collectUpdStats     = false //Becomes true when enough time has passed to collect statistics again
+	updStats            = make([]UpdatesStats, 0, 100)
+	currUpdStats        = UpdatesStats{}
+	nFinishedUpdComms   = int64(0)
+	collectUpdStatsComm = []bool{false, false, false, false, false}
+	updStatsComm        = make([][]UpdatesStats, 5)
+	indexesToUpd        []int //Each position corresponds to the number of a query
+
+	updsFinishChan = make(chan bool, UPDATES_GOROUTINES)
 )
 
-//TODO: updates for local indexes?
 //TODO: removes/updates for individual objects (i.e., option in which each customer has its own CRDT)?
-//TODO: extra data for indexes (high priority!)
+
+//Pre-condition: routines >= N_UPDATE_FILES. Also, distribution isn't much fair if routines is close to N_UPDATE_FILES (ideally, should be at most 1/4)
+func splitUpdatesPerRoutine(routines int, ordersUpds [][]string, lineItemUpds [][]string, deleteKeys []string, lineItemSizes []int) (filesPerRoutine int,
+	tableInfos []TableInfo, routineOrders, routineItems [][][]string, routineDelete [][]string, routineLineSizes [][]int) {
+	orderStart, lineStart, orderFinish, lineFinish := 0, 0, -1, 0
+	//Calculating split per routine. Last goroutine will take the leftovers
+	filesPerRoutine = N_UPDATE_FILES / routines
+	routineOrders, routineItems, routineDelete, routineLineSizes = make([][][]string, routines), make([][][]string, routines),
+		make([][]string, routines), make([][]int, routines)
+	tableInfos, currTableInfo := make([]TableInfo, routines), TableInfo{}
+	j, previousJ := 0, 0
+	for i := 0; i < routines-1; i++ {
+		for ; j < (i+1)*filesPerRoutine; j++ {
+			lineFinish += lineItemSizes[j]
+		}
+		orderFinish += (j - previousJ) * (updEntries[0] + 1)
+		//orderFinish += ordersPerRoutine
+		routineOrders[i], routineItems[i], routineDelete[i], routineLineSizes[i] = ordersUpds[orderStart:orderFinish], lineItemUpds[lineStart:lineFinish],
+			deleteKeys[orderStart:orderFinish], lineItemSizes[previousJ:j]
+
+		currTableInfo = TableInfo{Tables: procTables.GetShallowCopy()}
+		//Need to update last deleted index...
+		currTableInfo.LastDeletedPos, currTableInfo.orderIndexFun = orderStart, currTableInfo.getUpdateOrderIndex
+		tableInfos[i] = currTableInfo
+
+		orderStart, lineStart, previousJ = orderFinish, lineFinish, j
+	}
+	//Leftovers go to the last goroutine. C'est la vie.
+	currTableInfo = TableInfo{Tables: procTables.GetShallowCopy()}
+	currTableInfo.LastDeletedPos, currTableInfo.orderIndexFun = orderStart, currTableInfo.getUpdateOrderIndex
+	routineOrders[routines-1], routineItems[routines-1] = ordersUpds[orderStart:], lineItemUpds[lineStart:]
+	routineDelete[routines-1], routineLineSizes[routines-1] = deleteKeys[orderStart:], lineItemSizes[previousJ:]
+	tableInfos[routines-1] = currTableInfo
+
+	//Fix lastDeletePos of first routine (orders start at index 1)
+	tableInfos[0].LastDeletedPos = 1
+
+	//Now that there's multiple routines doing updates, the q15Map/q15LocalMap must be filled for ALL possible combinations.
+	if UPDATE_INDEX {
+		if isIndexGlobal {
+			completeFillQ15Map(q15Map)
+		} else {
+			for _, q15SubMap := range q15LocalMap {
+				completeFillQ15Map(q15SubMap)
+			}
+		}
+	}
+
+	return
+}
 
 func startUpdates() {
 	fmt.Println("Reading updates...")
@@ -32,43 +94,83 @@ func startUpdates() {
 	readFinish := time.Now().UnixNano()
 	fmt.Println("Finished reading updates. Time taken for read:", (readFinish-readStart)/1000000, "ms")
 
+	connectToServers()
+
 	//Start server communication for update sending
 	for i := range channels.dataChans {
 		go handleUpdatesComm(i)
 	}
+
+	if N_UPDATE_FILES < UPDATES_GOROUTINES {
+		UPDATES_GOROUTINES = N_UPDATE_FILES
+	}
+
+	filesPerRoutine, tableInfos, routineOrders, routineItems, routineDelete, routineLineSizes :=
+		splitUpdatesPerRoutine(UPDATES_GOROUTINES, ordersUpds, lineItemUpds, deleteKeys, lineItemSizes)
+
 	//Sleep until query clients start. We need to offset the time spent on sending base data/indexes, plus reading time
 	//QUERY_WAIT is in ms.
 	fmt.Println("Waiting to start updates...")
 	time.Sleep(QUERY_WAIT*1000000 - time.Duration(time.Now().UnixNano()-times.startTime))
 	fmt.Println("Starting updates...")
+	if statisticsInterval > 0 {
+		go doUpdStatsInterval()
+	}
 	updateStart := time.Now().UnixNano()
+	fmt.Println("Number of update files:", N_UPDATE_FILES)
 
-	orderStart, lineStart, orderFinish, lineFinish := 0, 0, -1, 0
-	procTables.orderIndexFun = procTables.getUpdateOrderIndex
-	fmt.Println("Number of updates:", N_UPDATE_FILES-1)
-	for i := 0; i < N_UPDATE_FILES-1; i++ {
-		fmt.Println("Update", i)
-		orderFinish, lineFinish = orderFinish+updEntries[0]+1, lineFinish+lineItemSizes[i]
-		//fmt.Println("First & Last lineitem:", lineItemUpds[lineStart], lineItemUpds[lineFinish-1])
-		//fmt.Println("First & Last order:", ordersUpds[orderStart], ordersUpds[orderFinish-1])
-		//fmt.Println("First & Last delete:", deleteKeys[orderStart], deleteKeys[orderFinish-1])
-		fmt.Println("Lens:", orderFinish-orderStart, lineFinish-lineStart, orderFinish-orderStart)
-		sendDataChangesV2(ordersUpds[orderStart:orderFinish], lineItemUpds[lineStart:lineFinish], deleteKeys[orderStart:orderFinish], lineItemSizes)
-		//orderStart, lineStart = orderStart+updEntries[0], lineStart+lineItemSizes[i]
-		orderStart, lineStart = orderFinish, lineFinish
+	for i := 0; i < UPDATES_GOROUTINES; i++ {
+		nFiles := filesPerRoutine
+		if i == UPDATES_GOROUTINES-1 {
+			nFiles = N_UPDATE_FILES - (filesPerRoutine * (UPDATES_GOROUTINES))
+		}
+		go func(nFiles int, ti TableInfo, orders [][]string, items [][]string, deletes []string, itemSizes []int) {
+			orderS, lineS, orderF, lineF := 0, 0, -1, 0
+			if orders[0][0] > "1" {
+				orderF = 0
+			}
+			for j := 0; j < nFiles; j++ {
+				if j%(N_UPDATE_FILES/40) == 0 {
+					fmt.Println("Update", j)
+				}
+				orderF, lineF = orderF+updEntries[0]+1, lineF+itemSizes[j]
+				ti.sendDataChangesV2(orders[orderS:orderF], items[lineS:lineF], deletes[orderS:orderF])
+				orderS, lineS = orderF, lineF
+				//break
+			}
+			updsFinishChan <- true
+			fmt.Println("Finished goroutine")
+		}(nFiles, tableInfos[i], routineOrders[i], routineItems[i], routineDelete[i], routineLineSizes[i])
 	}
-	//Last update may have less ops
-	fmt.Println("Last Update", N_UPDATE_FILES-1)
-	//fmt.Println("First & Last lineitem:", lineItemUpds[lineStart], lineItemUpds[len(lineItemUpds)-1])
-	//fmt.Println("First & Last order:", ordersUpds[orderStart], ordersUpds[len(ordersUpds)-1])
-	//fmt.Println("First & Last delete:", deleteKeys[orderStart], deleteKeys[len(deleteKeys)-1])
-	sendDataChangesV2(ordersUpds[orderStart:], lineItemUpds[lineStart:], deleteKeys[orderStart:], lineItemSizes)
+
+	for nFinished := 0; nFinished < UPDATES_GOROUTINES; nFinished++ {
+		<-updsFinishChan
+	}
+
 	for i := 0; i < len(channels.dataChans); i++ {
-		channels.dataChans[i] <- QueuedMsg{code: QUEUE_COMPLETE}
+		//channels.dataChans[i] <- QueuedMsg{code: QUEUE_COMPLETE}
+		channels.updateChans[i] <- QueuedMsgWithStat{QueuedMsg: QueuedMsg{code: QUEUE_COMPLETE}}
 	}
-
 	updateFinish := time.Now().UnixNano()
 	fmt.Println("Finished updates. Time taken for updating:", (updateFinish-updateStart)/1000000)
+}
+
+func completeFillQ15Map(q15MapToUse map[int16]map[int8]map[int32]*float64) {
+	var mMap map[int8]map[int32]*float64
+	var suppMap map[int32]*float64
+	has := false
+	for year := int16(1993); year <= 1997; year++ {
+		mMap = q15MapToUse[year]
+		for month := int8(1); month < 12; month += 3 {
+			suppMap = mMap[month]
+			for suppID := int32(1); suppID < int32(len(procTables.Suppliers)); suppID++ {
+				_, has = suppMap[suppID]
+				if !has {
+					suppMap[suppID] = new(float64)
+				}
+			}
+		}
+	}
 }
 
 func readUpds() (ordersUpds [][]string, lineItemUpds [][]string, deleteKeys []string, lineItemSizes []int) {
@@ -76,7 +178,7 @@ func readUpds() (ordersUpds [][]string, lineItemUpds [][]string, deleteKeys []st
 	return ReadUpdates(updCompleteFilename[:], updEntries[:], updParts[:], updPartsRead, N_UPDATE_FILES)
 }
 
-func sendDataChangesV2(ordersUpds [][]string, lineItemUpds [][]string, deleteKeys []string, lineItemSizes []int) {
+func (ti TableInfo) sendDataChangesV2(ordersUpds [][]string, lineItemUpds [][]string, deleteKeys []string) {
 	//Maybe I can do like this:
 	//1st - deletes
 	//2nd - updates
@@ -84,14 +186,23 @@ func sendDataChangesV2(ordersUpds [][]string, lineItemUpds [][]string, deleteKey
 	//Works as long as it is in the same txn or in the same staticUpdateObjs
 	//I actually can't do everything in the same transaction as it involves different servers...
 	//But I should still guarantee that, for the same server, it's atomic, albeit index results will still be screwed.
-	deletedOrders, deletedItems := sendDeletes(deleteKeys)
-	sendUpdates(ordersUpds, lineItemUpds)
-	sendIndexUpdates(deleteKeys, ordersUpds, lineItemUpds, deletedOrders, deletedItems)
-	fmt.Println("Updates sent")
+	var deletedOrders []*Orders
+	var deletedItems [][]*LineItem
+	deletedOrders, deletedItems = ti.sendDeletes(deleteKeys)
+	//deletedOrders, deletedItems := getDeleteClientTables(deleteKeys)
+	ti.sendUpdates(ordersUpds, lineItemUpds)
+	if UPDATE_INDEX {
+		ti.sendIndexUpdates(deleteKeys, ordersUpds, lineItemUpds, deletedOrders, deletedItems)
+	}
+	//ignore(deletedOrders, deletedItems)
+
+	return
 }
 
-func sendDeletes(deleteKeys []string) (orders []*Orders, items [][]*LineItem) {
-	orders, items = getDeleteClientTables(deleteKeys)
+func (ti TableInfo) sendDeletes(deleteKeys []string) (orders []*Orders, items [][]*LineItem) {
+	//updsDone := 0
+	//start := time.Now().UnixNano()
+	orders, items = ti.getDeleteClientTables(deleteKeys)
 	//orders, items = orders[1:], items[1:] //Hide initial entry which is always empty
 	nDeleteItems := getNumberDeleteItems(items)
 	ordersPerServer, itemsPerServer, orderIndex, itemsIndex := makePartionedDeleteStructs(deleteKeys, nDeleteItems)
@@ -105,16 +216,17 @@ func sendDeletes(deleteKeys []string) (orders []*Orders, items [][]*LineItem) {
 
 	for i, orderS := range deleteKeys {
 		order, orderItems = orders[i], items[i]
-		custRegion = procTables.CustkeyToRegionkey(int64(order.O_CUSTKEY))
+		custRegion = ti.Tables.Custkey32ToRegionkey(order.O_CUSTKEY)
 		ordersPerServer[custRegion][orderIndex[custRegion]] = orderS
 		orderIndex[custRegion]++
 
 		for _, item := range orderItems {
+			//TODO: is itemS correct? Considering on getEntryUpd/getEntryKey they add "_" (and, possibly, tableName)
 			itemS = orderS + strconv.FormatInt(int64(item.L_PARTKEY), 10) +
 				strconv.FormatInt(int64(item.L_SUPPKEY), 10) + strconv.FormatInt(int64(item.L_LINENUMBER), 10)
 			itemsPerServer[custRegion][itemsIndex[custRegion]] = itemS
 			itemsIndex[custRegion]++
-			suppRegion = procTables.SuppkeyToRegionkey(int64(item.L_SUPPKEY))
+			suppRegion = ti.Tables.SuppkeyToRegionkey(int64(item.L_SUPPKEY))
 			if custRegion != suppRegion {
 				itemsPerServer[suppRegion][itemsIndex[suppRegion]] = itemS
 				itemsIndex[suppRegion]++
@@ -127,47 +239,52 @@ func sendDeletes(deleteKeys []string) (orders []*Orders, items [][]*LineItem) {
 		for i, orderKeys := range ordersPerServer {
 			orderParams = getDeleteParams(tableNames[ORDERS], buckets[i], orderKeys, orderIndex[i])
 			itemParams = getDeleteParams(tableNames[LINEITEM], buckets[i], itemsPerServer[i], itemsIndex[i])
-			channels.dataChans[i] <- QueuedMsg{
-				code:    antidote.StaticUpdateObjs,
-				Message: antidote.CreateStaticUpdateObjs(nil, []antidote.UpdateObjectParams{orderParams, itemParams}),
-			}
+			/*
+				channels.dataChans[i] <- QueuedMsg{
+					code:    antidote.StaticUpdateObjs,
+					Message: antidote.CreateStaticUpdateObjs(nil, []antidote.UpdateObjectParams{orderParams, itemParams}),
+				}
+				updsDone += orderIndex[i] + itemsIndex[i]
+			*/
+			queueStatMsg(i, []antidote.UpdateObjectParams{orderParams, itemParams}, orderIndex[i]+itemsIndex[i], REMOVE_TYPE)
 		}
 	} else {
 		for i, orderKeys := range ordersPerServer {
-			upds := make([]antidote.UpdateObjectParams, len(orderKeys)+len(itemsPerServer[i]))
+			//upds := make([]antidote.UpdateObjectParams, len(orderKeys)+len(itemsPerServer[i]))
+			upds := make([]antidote.UpdateObjectParams, orderIndex[i]+itemsIndex[i])
 			written := getPerObjDeleteParams(tableNames[ORDERS], buckets[i], orderKeys, orderIndex[i], upds, 0)
 			getPerObjDeleteParams(tableNames[LINEITEM], buckets[i], itemsPerServer[i], itemsIndex[i], upds, written)
-			channels.dataChans[i] <- QueuedMsg{
-				code:    antidote.StaticUpdateObjs,
-				Message: antidote.CreateStaticUpdateObjs(nil, upds),
-			}
+			/*
+				channels.dataChans[i] <- QueuedMsg{
+					code:    antidote.StaticUpdateObjs,
+					Message: antidote.CreateStaticUpdateObjs(nil, upds),
+				}
+				updsDone += orderIndex[i] + itemsIndex[i]
+			*/
+			queueStatMsg(i, upds, orderIndex[i]+itemsIndex[i], REMOVE_TYPE)
 		}
 	}
+	/*
+		finish := time.Now().UnixNano()
+		currUpdStats.removeDataTimeSpent += finish - start
+		currUpdStats.removeDataUpds += updsDone
+	*/
 	return
 }
 
-func getDeleteClientTables(deleteKeys []string) (orders []*Orders, items [][]*LineItem) {
+func (ti TableInfo) getDeleteClientTables(deleteKeys []string) (orders []*Orders, items [][]*LineItem) {
+	startPos, endPos := ti.Tables.LastDeletedPos, ti.Tables.LastDeletedPos+len(deleteKeys)
+	//Not needed as now LastDeletedPos starts at 1.
 	/*
-		orders, items = procTables.LastAddedOrders, procTables.LastAddedLineItems
-		if orders == nil {
-			//First delete run
-			orders, items = procTables.Orders[:len(deleteKeys)+1], procTables.LineItems[:len(deleteKeys)+1]
+		if startPos == 0 {
+			startPos, endPos = 1, endPos+1 //first entry is empty
+			//startPos = 1
 		}
-		return
 	*/
-	//fmt.Println("[DELETE_CT]Last deleted pos:", procTables.LastDeletedPos)
-	startPos, endPos := procTables.LastDeletedPos, procTables.LastDeletedPos+len(deleteKeys)
-	if startPos == 0 {
-		startPos, endPos = 1, endPos+1 //first entry is empty
-		//startPos = 1
-	}
-	procTables.LastDeletedPos = endPos
+	ti.Tables.LastDeletedPos = endPos
 	//lineitems and orders are offset by 1 unit
-	//fmt.Println("[DELETE_CT]Restricting positions from", startPos, "to", endPos)
-	orders, items = procTables.Orders[startPos:endPos], procTables.LineItems[startPos-1:endPos-1]
-	//fmt.Println("[DELETE_CT]Last order, last order's first item:", orders[len(orders)-1].O_ORDERKEY, items[len(orders)-1][0].L_ORDERKEY)
+	orders, items = ti.Tables.Orders[startPos:endPos], ti.Tables.LineItems[startPos-1:endPos-1]
 	return
-	//return procTables.Orders[startPos:endPos], procTables.LineItems[startPos:endPos]
 }
 
 func getDeleteParams(tableName string, bkt string, keys []string, nKeys int) antidote.UpdateObjectParams {
@@ -214,12 +331,13 @@ func getNumberDeleteItems(items [][]*LineItem) (nItems int) {
 	return
 }
 
-func sendUpdates(ordersUpds [][]string, lineItemUpds [][]string) {
+func (ti TableInfo) sendUpdates(ordersUpds [][]string, lineItemUpds [][]string) {
+	//start := time.Now().UnixNano()
 	//Different strategy from the one in sendUpdateData. We'll prepare all updates while the initial data is still being sent as updates are around 0.1% of lineitems.
 	//Also, at first we'll only do updates, indexes will be done afterwards and considering simultaneously added and removed keys.
 	//Worst case if we need to save memory, we can do the index calculus first.
-	ordersPerServer, itemsPerServer := make([]map[string]crdt.UpdateArguments, len(procTables.Regions)), make([]map[string]crdt.UpdateArguments, len(procTables.Regions))
-	for i := 0; i < len(procTables.Regions); i++ {
+	ordersPerServer, itemsPerServer := make([]map[string]crdt.UpdateArguments, len(ti.Tables.Regions)), make([]map[string]crdt.UpdateArguments, len(ti.Tables.Regions))
+	for i := 0; i < len(ti.Tables.Regions); i++ {
 		ordersPerServer[i] = make(map[string]crdt.UpdateArguments)
 		itemsPerServer[i] = make(map[string]crdt.UpdateArguments)
 	}
@@ -238,99 +356,287 @@ func sendUpdates(ordersUpds [][]string, lineItemUpds [][]string) {
 		key = getEntryKey(tableNames[LINEITEM], key)
 		itemRegions = itemFunc(item)
 		for _, region := range itemRegions {
-			itemsPerServer[region][key] = upd
+			itemsPerServer[region][key] = *upd
 		}
 	}
-	for i := 0; i < len(procTables.Regions); i++ {
-		queueDataProto(ordersPerServer[i], tableNames[ORDERS], buckets[i], channels.dataChans[i])
-		queueDataProto(itemsPerServer[i], tableNames[LINEITEM], buckets[i], channels.dataChans[i])
+
+	var currUpdParams []antidote.UpdateObjectParams
+	for i := 0; i < len(ti.Tables.Regions); i++ {
+		//This could be in a single msg
+		currUpdParams = make([]antidote.UpdateObjectParams,
+			getUpdParamsSize([]map[string]crdt.UpdateArguments{ordersPerServer[i], itemsPerServer[i]}))
+		written := getDataUpdateParamsWithBuf(ordersPerServer[i], tableNames[ORDERS], buckets[i], currUpdParams, 0)
+		getDataUpdateParamsWithBuf(itemsPerServer[i], tableNames[LINEITEM], buckets[i], currUpdParams, written)
+		queueStatMsg(i, currUpdParams, len(ordersPerServer[i])+len(itemsPerServer[i]), NEW_TYPE)
+		/*
+			//orders
+			currUpdParams = getDataUpdateParams(ordersPerServer[i], tableNames[ORDERS], buckets[i])
+			channels.updateChans[i] <- QueuedMsgWithStat{QueuedMsg: QueuedMsg{
+				code:    antidote.StaticUpdateObjs,
+				Message: antidote.CreateStaticUpdateObjs(nil, currUpdParams)},
+				nData:    len(ordersPerServer[i]),
+				dataType: NEW_TYPE,
+			}
+			//lineitems
+			currUpdParams = getDataUpdateParams(itemsPerServer[i], tableNames[LINEITEM], buckets[i])
+			channels.updateChans[i] <- QueuedMsgWithStat{QueuedMsg: QueuedMsg{
+				code:    antidote.StaticUpdateObjs,
+				Message: antidote.CreateStaticUpdateObjs(nil, currUpdParams)},
+				nData:    len(itemsPerServer[i]),
+				dataType: NEW_TYPE,
+			}
+		*/
+
+		/*
+			queueDataProto(ordersPerServer[i], tableNames[ORDERS], buckets[i], channels.dataChans[i])
+			queueDataProto(itemsPerServer[i], tableNames[LINEITEM], buckets[i], channels.dataChans[i])
+		*/
+
 	}
 
+	/*
+		finish := time.Now().UnixNano()
+		currUpdStats.newDataTimeSpent += finish - start
+		//TODO: This isn't correct for lineItemUpds, as some lineItems go to 2 regions!!!
+		currUpdStats.newDataUpds += len(ordersUpds) + len(lineItemUpds)
+	*/
 }
 
-func sendIndexUpdates(deleteKeys []string, ordersUpds [][]string, lineItemUpds [][]string,
-	remOrders []*Orders, remItems [][]*LineItem) {
-	if isIndexGlobal {
-		sendGlobalIndexUpdates(deleteKeys, ordersUpds, lineItemUpds, remOrders, remItems)
+func getUpdParamsSize(upds []map[string]crdt.UpdateArguments) (size int) {
+	if CRDT_PER_OBJ {
+		for _, updMap := range upds {
+			size += len(updMap)
+		}
+		return size
 	} else {
-		sendLocalIndexUpdates(deleteKeys, ordersUpds, lineItemUpds, remOrders, remItems)
+		return len(upds)
 	}
 }
 
-func sendGlobalIndexUpdates(deleteKeys []string, ordersUpds [][]string, lineItemUpds [][]string,
+func getDataUpdateParamsWithBuf(currMap map[string]crdt.UpdateArguments, name string, bucket string,
+	buf []antidote.UpdateObjectParams, bufI int) (written int) {
+	if CRDT_PER_OBJ {
+		for key, upd := range currMap {
+			buf[bufI] = antidote.UpdateObjectParams{
+				KeyParams:  antidote.KeyParams{Key: key, CrdtType: proto.CRDTType_RRMAP, Bucket: bucket},
+				UpdateArgs: &upd,
+			}
+			bufI++
+		}
+	} else {
+		var currUpd crdt.UpdateArguments = crdt.EmbMapUpdateAll{Upds: currMap}
+		buf[bufI] = antidote.UpdateObjectParams{
+			KeyParams:  antidote.KeyParams{Key: name, CrdtType: proto.CRDTType_RRMAP, Bucket: bucket},
+			UpdateArgs: &currUpd}
+		bufI++
+	}
+	return bufI
+}
+
+func (ti TableInfo) sendIndexUpdates(deleteKeys []string, ordersUpds [][]string, lineItemUpds [][]string,
 	remOrders []*Orders, remItems [][]*LineItem) {
-
-	indexUpds := make([][]antidote.UpdateObjectParams, 7)
-	//indexUpds := make([][]antidote.UpdateObjectParams, 6)
-	//remOrders, remItems := getDeleteClientTables(deleteKeys)
-	procTables.UpdateOrderLineitems(ordersUpds, lineItemUpds)
-
-	newOrders, newItems := procTables.LastAddedOrders, procTables.LastAddedLineItems
-	//indexUpds[0], indexUpds[1] = getQ3UpdsV2(remOrders, remItems, newOrders, newItems)
-	//indexUpds[2] = getQ5UpdsV2(remOrders, remItems, newOrders, newItems)
-	//Query 11 doesn't need updates (Nation/Supply only, which are never updated.)
-	//indexUpds[3] = getQ14UpdsV2(remOrders, remItems, newOrders, newItems)
-	//indexUpds[4] = getQ15UpdsV2(remOrders, remItems, newOrders, newItems)
-	//indexUpds[5], indexUpds[6] = getQ18UpdsV2(remOrders, remItems, newOrders, newItems)
-
-	indexUpds[6] = getQ14UpdsV2(remOrders, remItems, newOrders, newItems)
-	//indexUpds[0] = getQ14UpdsV2(remOrders, remItems, newOrders, newItems)
-
-	indexUpds[0] = getQ15UpdsV2(remOrders, remItems, newOrders, newItems)
-	indexUpds[1], _ = getQ5UpdsV2(remOrders, remItems, newOrders, newItems)
-	indexUpds[2], indexUpds[3] = getQ18UpdsV2(remOrders, remItems, newOrders, newItems)
-	//Works but it's very slow! (added ~50s overhead instead of like 2-4s as each other did)
-	indexUpds[4], indexUpds[5] = getQ3UpdsV2(remOrders, remItems, newOrders, newItems)
-
-	for _, upds := range indexUpds {
-		//TODO: Smarter sending?
-		channels.dataChans[rand.Intn(len(channels.dataChans))] <- QueuedMsg{code: antidote.StaticUpdateObjs,
-			//channels.dataChans[0] <- QueuedMsg{code: antidote.StaticUpdateObjs,
-			Message: antidote.CreateStaticUpdateObjs(nil, upds),
+	if UPDATE_SPECIFIC_INDEX_ONLY {
+		if isIndexGlobal {
+			ti.sendPartGlobalIndexUpdates(deleteKeys, ordersUpds, lineItemUpds, remOrders, remItems)
+		} else {
+			ti.sendPartLocalIndexUpdates(deleteKeys, ordersUpds, lineItemUpds, remOrders, remItems)
+		}
+	} else {
+		if isIndexGlobal {
+			ti.sendGlobalIndexUpdates(deleteKeys, ordersUpds, lineItemUpds, remOrders, remItems)
+		} else {
+			ti.sendLocalIndexUpdates(deleteKeys, ordersUpds, lineItemUpds, remOrders, remItems)
 		}
 	}
 }
 
-func sendLocalIndexUpdates(deleteKeys []string, ordersUpds [][]string, lineItemUpds [][]string,
+func (ti TableInfo) sendPartGlobalIndexUpdates(deleteKeys []string, ordersUpds [][]string, lineItemUpds [][]string,
 	remOrders []*Orders, remItems [][]*LineItem) {
 
-	indexUpds := make([][][]antidote.UpdateObjectParams, 7)
-	//indexUpds := make([][]antidote.UpdateObjectParams, 6)
-	//remOrders, remItems := getDeleteClientTables(deleteKeys)
-	procTables.UpdateOrderLineitems(ordersUpds, lineItemUpds)
-
-	newOrders, newItems := procTables.LastAddedOrders, procTables.LastAddedLineItems
-	//indexUpds[0], indexUpds[1] = getQ3UpdsV2(remOrders, remItems, newOrders, newItems)
-	//indexUpds[2] = getQ5UpdsV2(remOrders, remItems, newOrders, newItems)
+	indexUpds, indexNUpds := make([][]antidote.UpdateObjectParams, 7), make([]int, 7)
+	ti.Tables.UpdateOrderLineitems(ordersUpds, lineItemUpds)
+	newOrders, newItems := ti.Tables.LastAddedOrders, ti.Tables.LastAddedLineItems
+	i, j := 0, 0
 	//Query 11 doesn't need updates (Nation/Supply only, which are never updated.)
-	//indexUpds[3] = getQ14UpdsV2(remOrders, remItems, newOrders, newItems)
-	//indexUpds[4] = getQ15UpdsV2(remOrders, remItems, newOrders, newItems)
-	//indexUpds[5], indexUpds[6] = getQ18UpdsV2(remOrders, remItems, newOrders, newItems)
 
-	indexUpds[6] = getQ14UpdsLocalV2(remOrders, remItems, newOrders, newItems)
-	//indexUpds[0] = getQ14UpdsV2(remOrders, remItems, newOrders, newItems)
+	if indexesToUpd[i] == 3 {
+		indexUpds[0], indexUpds[1], indexNUpds[0], indexNUpds[1] = ti.getQ3UpdsV2(remOrders, remItems, newOrders, newItems)
+		i++
+		j = 2
+	}
+	if indexesToUpd[i] == 5 {
+		indexUpds[j], _, indexNUpds[j] = ti.getQ5UpdsV2(remOrders, remItems, newOrders, newItems)
+		i++
+		j++
+	}
+	if indexesToUpd[i] == 11 {
+		i++
+	}
+	if indexesToUpd[i] == 14 {
+		indexUpds[j], indexNUpds[j] = ti.getQ14UpdsV2(remOrders, remItems, newOrders, newItems)
+		i++
+		j++
+	}
+	if indexesToUpd[i] == 15 {
+		indexUpds[j], indexNUpds[j] = ti.getQ15UpdsV2(remOrders, remItems, newOrders, newItems)
+		i++
+		j++
+	}
+	if indexesToUpd[i] == 18 {
+		indexUpds[j], indexUpds[j+1], indexNUpds[j], indexNUpds[j+1] = ti.getQ18UpdsV2(remOrders, remItems, newOrders, newItems)
+		i++
+		j += 2
+	}
 
-	indexUpds[0] = getQ15UpdsLocalV2(remOrders, remItems, newOrders, newItems)
-	_, indexUpds[1] = getQ5UpdsV2(remOrders, remItems, newOrders, newItems)
-	indexUpds[2], indexUpds[3] = getQ18UpdsLocalV2(remOrders, remItems, newOrders, newItems)
-	//Works but it's very slow! (added ~50s overhead instead of like 2-4s as each other did)
-	indexUpds[4], indexUpds[5] = getQ3UpdsLocalV2(remOrders, remItems, newOrders, newItems)
+	for k := 0; k < j; j++ {
+		queueStatMsg(rand.Intn(len(channels.indexChans)), indexUpds[k], indexNUpds[k], INDEX_TYPE)
+	}
+}
 
-	for _, upds := range indexUpds {
-		for i, chanUpds := range upds {
+func (ti TableInfo) sendPartLocalIndexUpdates(deleteKeys []string, ordersUpds [][]string, lineItemUpds [][]string,
+	remOrders []*Orders, remItems [][]*LineItem) {
+
+	indexUpds, indexNUpds := make([][][]antidote.UpdateObjectParams, 7), make([]int, 7)
+	ti.Tables.UpdateOrderLineitems(ordersUpds, lineItemUpds)
+	newOrders, newItems := ti.Tables.LastAddedOrders, ti.Tables.LastAddedLineItems
+	i, j := 0, 0
+	//Query 11 doesn't need updates (Nation/Supply only, which are never updated.)
+
+	if indexesToUpd[i] == 3 {
+		indexUpds[0], indexUpds[1], indexNUpds[0], indexNUpds[1] = ti.getQ3UpdsLocalV2(remOrders, remItems, newOrders, newItems)
+		i++
+		j = 2
+	}
+	if indexesToUpd[i] == 5 {
+		_, indexUpds[j], indexNUpds[j] = ti.getQ5UpdsV2(remOrders, remItems, newOrders, newItems)
+		i++
+		j++
+	}
+	if indexesToUpd[i] == 11 {
+		i++
+	}
+	if indexesToUpd[i] == 14 {
+		indexUpds[j], indexNUpds[j] = ti.getQ14UpdsLocalV2(remOrders, remItems, newOrders, newItems)
+		i++
+		j++
+	}
+	if indexesToUpd[i] == 15 {
+		indexUpds[j], indexNUpds[j] = ti.getQ15UpdsLocalV2(remOrders, remItems, newOrders, newItems)
+		i++
+		j++
+	}
+	if indexesToUpd[i] == 18 {
+		indexUpds[j], indexUpds[j+1], indexNUpds[j], indexNUpds[j+1] = ti.getQ18UpdsLocalV2(remOrders, remItems, newOrders, newItems)
+		i++
+		j += 2
+	}
+
+	for k := 0; k < j; j++ {
+		for i, chanUpds := range indexUpds[k] {
 			if len(chanUpds) > 0 {
-				channels.dataChans[i] <- QueuedMsg{code: antidote.StaticUpdateObjs,
-					Message: antidote.CreateStaticUpdateObjs(nil, chanUpds),
-				}
+				queueStatMsg(i, chanUpds, indexNUpds[k], INDEX_TYPE)
 			}
 		}
 	}
 }
 
-func getQ3UpdsLocalV2(remOrders []*Orders, remItems [][]*LineItem, newOrders []*Orders, newItems [][]*LineItem) (rems [][]antidote.UpdateObjectParams,
-	upds [][]antidote.UpdateObjectParams) {
+func (ti TableInfo) sendGlobalIndexUpdates(deleteKeys []string, ordersUpds [][]string, lineItemUpds [][]string,
+	remOrders []*Orders, remItems [][]*LineItem) {
+
+	//start := time.Now().UnixNano()
+	indexUpds := make([][]antidote.UpdateObjectParams, 7)
+	indexNUpds := make([]int, 7)
+	ti.Tables.UpdateOrderLineitems(ordersUpds, lineItemUpds)
+
+	newOrders, newItems := ti.Tables.LastAddedOrders, ti.Tables.LastAddedLineItems
+	//Query 11 doesn't need updates (Nation/Supply only, which are never updated.)
+
+	indexUpds[6], indexNUpds[6] = ti.getQ14UpdsV2(remOrders, remItems, newOrders, newItems)
+	indexUpds[0], indexNUpds[0] = ti.getQ15UpdsV2(remOrders, remItems, newOrders, newItems)
+	indexUpds[1], _, indexNUpds[1] = ti.getQ5UpdsV2(remOrders, remItems, newOrders, newItems)
+	indexUpds[2], indexUpds[3], indexNUpds[2], indexNUpds[3] = ti.getQ18UpdsV2(remOrders, remItems, newOrders, newItems)
+	//Works but it's very slow! (added ~50s overhead instead of like 2-4s as each other did)
+	indexUpds[4], indexUpds[5], indexNUpds[4], indexNUpds[5] = ti.getQ3UpdsV2(remOrders, remItems, newOrders, newItems)
+
+	//for _, upds := range indexUpds {
+	for i, upds := range indexUpds {
+		//TODO: Smarter sending?
+		/*
+			channels.dataChans[rand.Intn(len(channels.indexChans))] <- QueuedMsg{code: antidote.StaticUpdateObjs,
+				//channels.dataChans[0] <- QueuedMsg{code: antidote.StaticUpdateObjs,
+				Message: antidote.CreateStaticUpdateObjs(nil, upds),
+			}
+		*/
+		/*
+			channels.updateChans[rand.Intn(len(channels.indexChans))] <- QueuedMsgWithStat{
+				QueuedMsg: QueuedMsg{code: antidote.StaticUpdateObjs, Message: antidote.CreateStaticUpdateObjs(nil, upds)},
+				nData:     indexNUpds[i],
+				dataType:  INDEX_TYPE,
+			}
+		*/
+		//TODO: This rand should be specific per goroutine
+		//IndexChans is on purpose, to take in consideration the index split and SINGLE_INDEX_SERVER configs.
+		queueStatMsg(rand.Intn(len(channels.indexChans)), upds, indexNUpds[i], INDEX_TYPE)
+	}
+
+	/*
+		totalUpds := indexNUpds[0] + indexNUpds[1] + indexNUpds[2] + indexNUpds[3] + indexNUpds[4] + indexNUpds[5] + indexNUpds[6]
+		finish := time.Now().UnixNano()
+		currUpdStats.indexTimeSpent += finish - start
+		currUpdStats.indexUpds += totalUpds
+	*/
+}
+
+func (ti TableInfo) sendLocalIndexUpdates(deleteKeys []string, ordersUpds [][]string, lineItemUpds [][]string,
+	remOrders []*Orders, remItems [][]*LineItem) {
+
+	//start := time.Now().UnixNano()
+	indexUpds := make([][][]antidote.UpdateObjectParams, 7)
+	indexNUpds := make([]int, 7) //Less 2 as Q18 and Q3 have their deletes & upds grouped together
+	ti.Tables.UpdateOrderLineitems(ordersUpds, lineItemUpds)
+
+	newOrders, newItems := ti.Tables.LastAddedOrders, ti.Tables.LastAddedLineItems
+	//Query 11 doesn't need updates (Nation/Supply only, which are never updated.)
+
+	indexUpds[6], indexNUpds[6] = ti.getQ14UpdsLocalV2(remOrders, remItems, newOrders, newItems)
+	indexUpds[0], indexNUpds[0] = ti.getQ15UpdsLocalV2(remOrders, remItems, newOrders, newItems)
+	_, indexUpds[1], indexNUpds[1] = ti.getQ5UpdsV2(remOrders, remItems, newOrders, newItems)
+	indexUpds[2], indexUpds[3], indexNUpds[2], indexNUpds[3] = ti.getQ18UpdsLocalV2(remOrders, remItems, newOrders, newItems)
+	indexUpds[4], indexUpds[5], indexNUpds[4], indexNUpds[5] = ti.getQ3UpdsLocalV2(remOrders, remItems, newOrders, newItems)
+
+	for j, upds := range indexUpds {
+		for i, chanUpds := range upds {
+			if len(chanUpds) > 0 {
+				/*
+					channels.dataChans[i] <- QueuedMsg{code: antidote.StaticUpdateObjs,
+						Message: antidote.CreateStaticUpdateObjs(nil, chanUpds),
+					}
+				*/
+				/*
+					channels.updateChans[i] <- QueuedMsgWithStat{
+						QueuedMsg: QueuedMsg{code: antidote.StaticUpdateObjs, Message: antidote.CreateStaticUpdateObjs(nil, chanUpds)},
+						nData:     indexNUpds[j],
+						dataType:  INDEX_TYPE,
+					}
+				*/
+				queueStatMsg(i, chanUpds, indexNUpds[j], INDEX_TYPE)
+			}
+		}
+	}
+
+	/*
+		totalUpds := indexNUpds[0] + indexNUpds[1] + indexNUpds[2] + indexNUpds[3] + indexNUpds[4] + indexNUpds[5] + indexNUpds[6]
+		finish := time.Now().UnixNano()
+		currUpdStats.indexTimeSpent += finish - start
+		currUpdStats.indexUpds += totalUpds
+	*/
+	//return indexNUpds[0] + indexNUpds[1] + indexNUpds[2] + indexNUpds[3] + indexNUpds[4] + indexNUpds[5] + indexNUpds[6]
+}
+
+func (ti TableInfo) getQ3UpdsLocalV2(remOrders []*Orders, remItems [][]*LineItem, newOrders []*Orders, newItems [][]*LineItem) (rems [][]antidote.UpdateObjectParams,
+	upds [][]antidote.UpdateObjectParams, nRems int, nAdds int) {
 	//Segment -> orderDate (day) -> orderKey
-	remMap := make([]map[string]map[int8]map[int32]struct{}, len(procTables.Regions))
+	remMap := make([]map[string]map[int8]map[int32]struct{}, len(ti.Tables.Regions))
 	nUpds := make([]int, len(remMap))
 	for i := range remMap {
 		remMap[i] = createQ3DeleteMap()
@@ -338,26 +644,28 @@ func getQ3UpdsLocalV2(remOrders []*Orders, remItems [][]*LineItem, newOrders []*
 
 	for orderI, order := range remOrders {
 		if order.O_ORDERDATE.isSmallerOrEqual(MAX_DATE_Q3) {
-			q3UpdsCalcHelper(remMap[procTables.OrderkeyToRegionkey(order.O_ORDERKEY)], order, orderI)
+			ti.q3UpdsCalcHelper(remMap[ti.Tables.OrderkeyToRegionkey(order.O_ORDERKEY)], order, orderI)
 		}
 	}
 
+	updsDonePart := 0
 	for i := range nUpds {
-		nUpds[i] = getQ3NumberUpds(remMap[i])
+		updsDonePart, nUpds[i] = getQ3NumberUpds(remMap[i])
+		nRems += updsDonePart
 	}
 	rems = make([][]antidote.UpdateObjectParams, len(nUpds))
 	for i := range rems {
-		rems[i] = makeQ3IndexRemoves(remMap[i], nUpds[i])
+		rems[i] = makeQ3IndexRemoves(remMap[i], nUpds[i], INDEX_BKT+i)
 	}
-	existingOrders, existingItems := procTables.Orders, procTables.LineItems
-	procTables.Orders, procTables.LineItems = newOrders, newItems
-	upds = prepareQ3IndexLocal()
-	procTables.Orders, procTables.LineItems = existingOrders, existingItems
-	return
+	existingOrders, existingItems := ti.Tables.Orders, ti.Tables.LineItems
+	ti.Tables.Orders, ti.Tables.LineItems = newOrders, newItems
+	upds, nAdds = ti.prepareQ3IndexLocal()
+	ti.Tables.Orders, ti.Tables.LineItems = existingOrders, existingItems
+	return rems, upds, nRems, nAdds
 }
 
-func getQ3UpdsV2(remOrders []*Orders, remItems [][]*LineItem, newOrders []*Orders, newItems [][]*LineItem) (rems []antidote.UpdateObjectParams,
-	upds []antidote.UpdateObjectParams) {
+func (ti TableInfo) getQ3UpdsV2(remOrders []*Orders, remItems [][]*LineItem, newOrders []*Orders, newItems [][]*LineItem) (rems []antidote.UpdateObjectParams,
+	upds []antidote.UpdateObjectParams, nAdds int, nRems int) {
 	//remItems can be ignored. As for remOrders, we'll need to find their segment and orderdate to know where to remove.
 	//newOrders and newItems should be equal to clientIndex.
 	//segment -> orderDate -> orderkey
@@ -365,26 +673,27 @@ func getQ3UpdsV2(remOrders []*Orders, remItems [][]*LineItem, newOrders []*Order
 
 	for orderI, order := range remOrders {
 		if order.O_ORDERDATE.isSmallerOrEqual(MAX_DATE_Q3) {
-			q3UpdsCalcHelper(remMap, order, orderI)
+			ti.q3UpdsCalcHelper(remMap, order, orderI)
 		}
 	}
 
-	nUpds := getQ3NumberUpds(remMap)
-	rems = makeQ3IndexRemoves(remMap, nUpds)
-	existingOrders, existingItems := procTables.Orders, procTables.LineItems
-	procTables.Orders, procTables.LineItems = newOrders, newItems
-	upds = prepareQ3Index()
-	procTables.Orders, procTables.LineItems = existingOrders, existingItems
-	return
+	nRems, nProtoUpds := getQ3NumberUpds(remMap)
+	rems = makeQ3IndexRemoves(remMap, nProtoUpds, INDEX_BKT)
+	existingOrders, existingItems := ti.Tables.Orders, ti.Tables.LineItems
+	ti.Tables.Orders, ti.Tables.LineItems = newOrders, newItems
+	upds, nAdds = ti.prepareQ3Index()
+	ti.Tables.Orders, ti.Tables.LineItems = existingOrders, existingItems
+	return rems, upds, nAdds, nRems
 }
 
-func q3UpdsCalcHelper(remMap map[string]map[int8]map[int32]struct{}, order *Orders, orderI int) {
+func (ti TableInfo) q3UpdsCalcHelper(remMap map[string]map[int8]map[int32]struct{}, order *Orders, orderI int) {
 	minDay, j := MIN_MONTH_DAY, int8(0)
-	segMap := remMap[procTables.Customers[order.O_CUSTKEY].C_MKTSEGMENT]
-	orderLineItems := procTables.LineItems[orderI]
+	segMap := remMap[ti.Tables.Customers[order.O_CUSTKEY].C_MKTSEGMENT]
+	orderLineItems := ti.Tables.LineItems[orderI]
 
 	for _, item := range orderLineItems {
 		//Check if L_SHIPDATE is higher than minDate and, if it is, check month/year. If month/year > march 1995, then add to all entries. Otherwise, use day to know which entries.
+		//Note: items in the same order may be shipped at different dates (day, month or even year)
 		if item.L_SHIPDATE.isHigherOrEqual(MIN_DATE_Q3) {
 			if item.L_SHIPDATE.MONTH > 3 || item.L_SHIPDATE.YEAR > 1995 {
 				//All days
@@ -400,17 +709,21 @@ func q3UpdsCalcHelper(remMap map[string]map[int8]map[int32]struct{}, order *Orde
 	}
 }
 
-func getQ3NumberUpds(remMap map[string]map[int8]map[int32]struct{}) (nUpds int) {
-	nUpds = 0
+func getQ3NumberUpds(remMap map[string]map[int8]map[int32]struct{}) (nUpds, nProtoUpds int) {
+	nUpds, nProtoUpds = 0, 0
 	if !useTopKAll {
 		for _, segMap := range remMap {
 			for _, dayMap := range segMap {
 				nUpds += len(dayMap)
 			}
 		}
+		nProtoUpds = nUpds
 	} else {
 		for _, segMap := range remMap {
-			nUpds += len(segMap)
+			for _, dayMap := range segMap {
+				nUpds += len(dayMap)
+			}
+			nProtoUpds += len(segMap)
 		}
 	}
 	return
@@ -431,8 +744,8 @@ func createQ3DeleteMap() (sumMap map[string]map[int8]map[int32]struct{}) {
 	return
 }
 
-func getQ5UpdsV2(remOrders []*Orders, remItems [][]*LineItem, newOrders []*Orders, newItems [][]*LineItem) (upds []antidote.UpdateObjectParams,
-	multiUpds [][]antidote.UpdateObjectParams) {
+func (ti TableInfo) getQ5UpdsV2(remOrders []*Orders, remItems [][]*LineItem, newOrders []*Orders, newItems [][]*LineItem) (upds []antidote.UpdateObjectParams,
+	multiUpds [][]antidote.UpdateObjectParams, updsDone int) {
 	//Removes can be translated into Decrements, while additions can be translated into Increments.
 	//Instead, we'll just do both together and use increments for all.
 	//Remember that a negative increment is the same as a decrement
@@ -441,7 +754,7 @@ func getQ5UpdsV2(remOrders []*Orders, remItems [][]*LineItem, newOrders []*Order
 	//Region -> Year -> Country -> Sum
 	sumMap := make(map[int8]map[int16]map[int8]*float64)
 	//Registering regions and dates
-	for _, region := range procTables.Regions {
+	for _, region := range ti.Tables.Regions {
 		regMap := make(map[int16]map[int8]*float64)
 		for i = 1993; i <= 1997; i++ {
 			regMap[i] = make(map[int8]*float64)
@@ -449,7 +762,7 @@ func getQ5UpdsV2(remOrders []*Orders, remItems [][]*LineItem, newOrders []*Order
 		sumMap[region.R_REGIONKEY] = regMap
 	}
 	//Registering countries
-	for _, nation := range procTables.Nations {
+	for _, nation := range ti.Tables.Nations {
 		regMap := sumMap[nation.N_REGIONKEY]
 		for i = 1993; i <= 1997; i++ {
 			value := 0.0
@@ -470,16 +783,16 @@ func getQ5UpdsV2(remOrders []*Orders, remItems [][]*LineItem, newOrders []*Order
 			order = procOrders[i]
 			year = order.O_ORDERDATE.YEAR
 			if year >= 1993 && year <= 1997 {
-				customer = procTables.Customers[order.O_CUSTKEY]
+				customer = ti.Tables.Customers[order.O_CUSTKEY]
 				nationKey = customer.C_NATIONKEY
-				regionKey = procTables.Nations[nationKey].N_REGIONKEY
+				regionKey = ti.Tables.Nations[nationKey].N_REGIONKEY
 				value = sumMap[regionKey][year][nationKey]
 				for _, lineItem := range orderItems {
 					//Conditions:
 					//Ordered year between 1993 and 1997 (inclusive)
 					//Supplier and customer of same nation
 					//Calculate: l_extendedprice * (1 - l_discount)
-					supplier = procTables.Suppliers[lineItem.L_SUPPKEY]
+					supplier = ti.Tables.Suppliers[lineItem.L_SUPPKEY]
 					if nationKey == supplier.S_NATIONKEY {
 						*value += multiplier * lineItem.L_EXTENDEDPRICE * (1 - lineItem.L_DISCOUNT)
 					}
@@ -490,20 +803,26 @@ func getQ5UpdsV2(remOrders []*Orders, remItems [][]*LineItem, newOrders []*Order
 		procOrders, procItems, multiplier = remOrders, remItems, -1.0
 	}
 
+	for _, yearMap := range sumMap {
+		for _, natMap := range yearMap {
+			updsDone += len(natMap)
+		}
+	}
+
 	if isIndexGlobal {
-		return makeQ5IndexUpds(sumMap, INDEX_BKT), nil
+		return ti.makeQ5IndexUpds(sumMap, INDEX_BKT), nil, updsDone
 	}
 	//Create temporary maps with just one region, in order to receive the upds separatelly
-	multiUpds = make([][]antidote.UpdateObjectParams, len(procTables.Regions))
+	multiUpds = make([][]antidote.UpdateObjectParams, len(ti.Tables.Regions))
 	for i, regMap := range sumMap {
-		multiUpds[i] = makeQ5IndexUpds(map[int8]map[int16]map[int8]*float64{i: regMap}, INDEX_BKT+int(i))
+		multiUpds[i] = ti.makeQ5IndexUpds(map[int8]map[int16]map[int8]*float64{i: regMap}, INDEX_BKT+int(i))
 	}
-	return nil, multiUpds
+	return nil, multiUpds, updsDone
 }
 
-func getQ14UpdsLocalV2(remOrders []*Orders, remItems [][]*LineItem, newOrders []*Orders, newItems [][]*LineItem) (upds [][]antidote.UpdateObjectParams) {
-	mapPromo, mapTotal := make([]map[string]*float64, len(procTables.Regions)), make([]map[string]*float64, len(procTables.Regions))
-	inPromo := procTables.PromoParts
+func (ti TableInfo) getQ14UpdsLocalV2(remOrders []*Orders, remItems [][]*LineItem, newOrders []*Orders, newItems [][]*LineItem) (upds [][]antidote.UpdateObjectParams, updsDone int) {
+	mapPromo, mapTotal := make([]map[string]*float64, len(ti.Tables.Regions)), make([]map[string]*float64, len(ti.Tables.Regions))
+	inPromo := ti.Tables.PromoParts
 
 	for i := range mapPromo {
 		mapPromo[i], mapTotal[i] = createQ14Maps()
@@ -512,24 +831,26 @@ func getQ14UpdsLocalV2(remOrders []*Orders, remItems [][]*LineItem, newOrders []
 	procItems, procOrders, multiplier, regionKey := newItems, newOrders, 1.0, int8(0)
 	for i := 0; i < 2; i++ {
 		for j, orderItems := range procItems {
-			regionKey = procTables.OrderkeyToRegionkey(procOrders[j].O_ORDERKEY)
+			regionKey = ti.Tables.OrderkeyToRegionkey(procOrders[j].O_ORDERKEY)
 			q14UpdsCalcHelper(multiplier, orderItems, mapPromo[regionKey], mapTotal[regionKey], inPromo)
 		}
 		procItems, procOrders, multiplier = remItems, remOrders, -1.0
 	}
 
-	upds = make([][]antidote.UpdateObjectParams, len(procTables.Regions))
+	upds = make([][]antidote.UpdateObjectParams, len(ti.Tables.Regions))
 	for i := range upds {
-		upds[i] = makeQ14IndexUpds(mapPromo[i], mapTotal[i], INDEX_BKT+i)
+		upds[i] = ti.makeQ14IndexUpds(mapPromo[i], mapTotal[i], INDEX_BKT+i)
 	}
+	//nRegions * years (1993-1997) * months (1-12)
+	updsDone = len(ti.Tables.Regions) * 5 * 12
 	return
 }
 
-func getQ14UpdsV2(remOrders []*Orders, remItems [][]*LineItem, newOrders []*Orders, newItems [][]*LineItem) (upds []antidote.UpdateObjectParams) {
+func (ti TableInfo) getQ14UpdsV2(remOrders []*Orders, remItems [][]*LineItem, newOrders []*Orders, newItems [][]*LineItem) (upds []antidote.UpdateObjectParams, updsDone int) {
 	//We can do the same trick as in Q5. Removes are AddMultipleValue with negatives, while news are with positives.
 	//Should be ok to mix both.
 
-	inPromo := procTables.PromoParts
+	inPromo := ti.Tables.PromoParts
 	mapPromo, mapTotal := createQ14Maps()
 
 	//Going through lineitem and updating the totals
@@ -542,7 +863,8 @@ func getQ14UpdsV2(remOrders []*Orders, remItems [][]*LineItem, newOrders []*Orde
 		procItems, multiplier = remItems, -1.0
 	}
 
-	return makeQ14IndexUpds(mapPromo, mapTotal, INDEX_BKT)
+	//years*months
+	return ti.makeQ14IndexUpds(mapPromo, mapTotal, INDEX_BKT), 5 * 12
 }
 
 func q14UpdsCalcHelper(multiplier float64, orderItems []*LineItem, mapPromo map[string]*float64, mapTotal map[string]*float64, inPromo map[int32]struct{}) {
@@ -562,9 +884,9 @@ func q14UpdsCalcHelper(multiplier float64, orderItems []*LineItem, mapPromo map[
 	}
 }
 
-func getQ15UpdsLocalV2(remOrders []*Orders, remItems [][]*LineItem, newOrders []*Orders, newItems [][]*LineItem) (upds [][]antidote.UpdateObjectParams) {
-	updEntries := make([]map[int16]map[int8]map[int32]struct{}, len(procTables.Regions))
-	nUpds := make([]int, len(procTables.Regions))
+func (ti TableInfo) getQ15UpdsLocalV2(remOrders []*Orders, remItems [][]*LineItem, newOrders []*Orders, newItems [][]*LineItem) (upds [][]antidote.UpdateObjectParams, updsDone int) {
+	updEntries := make([]map[int16]map[int8]map[int32]struct{}, len(ti.Tables.Regions))
+	nUpds := make([]int, len(ti.Tables.Regions))
 	rKey := int8(0)
 
 	for i := range updEntries {
@@ -572,26 +894,28 @@ func getQ15UpdsLocalV2(remOrders []*Orders, remItems [][]*LineItem, newOrders []
 	}
 
 	for i, orderItems := range remItems {
-		rKey = procTables.OrderkeyToRegionkey(remOrders[i].O_ORDERKEY)
+		rKey = ti.Tables.OrderkeyToRegionkey(remOrders[i].O_ORDERKEY)
 		q15UpdsRemCalcHelper(orderItems, q15LocalMap[rKey], updEntries[rKey])
 	}
 	for i, orderItems := range newItems {
-		rKey = procTables.OrderkeyToRegionkey(newOrders[i].O_ORDERKEY)
+		rKey = ti.Tables.OrderkeyToRegionkey(newOrders[i].O_ORDERKEY)
 		q15UpdsNewCalcHelper(orderItems, q15LocalMap[rKey], updEntries[rKey])
 	}
 
 	for i := range nUpds {
 		nUpds[i] = getQ15NumberUpds(updEntries[i])
 	}
-	upds = make([][]antidote.UpdateObjectParams, len(procTables.Regions))
+	upds = make([][]antidote.UpdateObjectParams, len(ti.Tables.Regions))
+	updsDoneRegion := 0
 	for i := range upds {
-		upds[i] = makeQ15IndexUpdsDeletes(q15LocalMap[i], updEntries[i], nUpds[i], INDEX_BKT+i)
+		upds[i], updsDoneRegion = makeQ15IndexUpdsDeletes(q15LocalMap[i], updEntries[i], nUpds[i], INDEX_BKT+i)
+		updsDone += updsDoneRegion
 	}
 
 	return
 }
 
-func getQ15UpdsV2(remOrders []*Orders, remItems [][]*LineItem, newOrders []*Orders, newItems [][]*LineItem) (upds []antidote.UpdateObjectParams) {
+func (ti TableInfo) getQ15UpdsV2(remOrders []*Orders, remItems [][]*LineItem, newOrders []*Orders, newItems [][]*LineItem) (upds []antidote.UpdateObjectParams, updsDone int) {
 	//Need to update totals in q15Map and mark which entries were updated
 	//Also uses the same idea as in other queries than removes are the same as news but with inverted signals
 	updEntries := createQ15EntriesMap()
@@ -622,21 +946,11 @@ func q15UpdsRemCalcHelper(orderItems []*LineItem, yearMap map[int16]map[int8]map
 func q15UpdsNewCalcHelper(orderItems []*LineItem, yearMap map[int16]map[int8]map[int32]*float64,
 	updEntries map[int16]map[int8]map[int32]struct{}) {
 	year, month := int16(0), int8(0)
-	var suppMap map[int32]*float64
-	var currValue *float64
-	var has bool
-
 	for _, item := range orderItems {
 		year = item.L_SHIPDATE.YEAR
 		if year >= 1993 && year <= 1997 {
 			month = ((item.L_SHIPDATE.MONTH-1)/3)*3 + 1
-			suppMap = yearMap[year][month]
-			currValue, has = suppMap[item.L_SUPPKEY]
-			if !has {
-				currValue = new(float64)
-				suppMap[item.L_SUPPKEY] = currValue
-			}
-			*currValue += (item.L_EXTENDEDPRICE * (1.0 - item.L_DISCOUNT))
+			*yearMap[year][month][item.L_SUPPKEY] += (item.L_EXTENDEDPRICE * (1.0 - item.L_DISCOUNT))
 			updEntries[year][month][item.L_SUPPKEY] = struct{}{}
 		}
 	}
@@ -678,20 +992,23 @@ func createQ18DeleteMap() (toRemove []map[int32]struct{}) {
 	return
 }
 
-func getQ18UpdsLocalV2(remOrders []*Orders, remItems [][]*LineItem, newOrders []*Orders,
-	newItems [][]*LineItem) (rems [][]antidote.UpdateObjectParams, upds [][]antidote.UpdateObjectParams) {
+func (ti TableInfo) getQ18UpdsLocalV2(remOrders []*Orders, remItems [][]*LineItem, newOrders []*Orders,
+	newItems [][]*LineItem) (rems [][]antidote.UpdateObjectParams, upds [][]antidote.UpdateObjectParams, nAddsI int, nRemsI int) {
 
-	toRemove := make([][]map[int32]struct{}, len(procTables.Regions))
-	nRems := make([]int, len(procTables.Regions))
+	toRemove := make([][]map[int32]struct{}, len(ti.Tables.Regions))
+	nRems := make([]int, len(ti.Tables.Regions))
 	rKey, orderKey := int8(0), int32(0)
 	for i := range toRemove {
 		toRemove[i] = createQ18DeleteMap()
 	}
 
+	nRemsOrder := 0
 	for i, order := range remOrders {
 		orderKey = order.O_ORDERKEY
-		rKey = procTables.OrderkeyToRegionkey(orderKey)
-		nRems[rKey] += q18UpdsCalcHelper(toRemove[rKey], remItems[i], orderKey)
+		rKey = ti.Tables.OrderkeyToRegionkey(orderKey)
+		nRemsOrder = q18UpdsCalcHelper(toRemove[rKey], remItems[i], orderKey)
+		nRems[rKey] += nRemsOrder
+		nRemsI += nRemsOrder
 	}
 
 	if useTopKAll {
@@ -705,22 +1022,21 @@ func getQ18UpdsLocalV2(remOrders []*Orders, remItems [][]*LineItem, newOrders []
 
 	rems = make([][]antidote.UpdateObjectParams, len(nRems))
 	for i := range rems {
-		rems[i] = makeQ18IndexRemoves(toRemove[i], nRems[i])
+		rems[i] = makeQ18IndexRemoves(toRemove[i], nRems[i], INDEX_BKT+i)
 	}
-	existingOrders, existingItems := procTables.Orders, procTables.LineItems
-	procTables.Orders, procTables.LineItems = newOrders, newItems
-	upds = prepareQ18IndexLocal()
-	procTables.Orders, procTables.LineItems = existingOrders, existingItems
-	return
+	existingOrders, existingItems := ti.Tables.Orders, ti.Tables.LineItems
+	ti.Tables.Orders, ti.Tables.LineItems = newOrders, newItems
+	upds, nAddsI = ti.prepareQ18IndexLocal()
+	ti.Tables.Orders, ti.Tables.LineItems = existingOrders, existingItems
+	return rems, upds, nAddsI, nRemsI
 }
 
-func getQ18UpdsV2(remOrders []*Orders, remItems [][]*LineItem, newOrders []*Orders,
-	newItems [][]*LineItem) (rems []antidote.UpdateObjectParams, upds []antidote.UpdateObjectParams) {
+func (ti TableInfo) getQ18UpdsV2(remOrders []*Orders, remItems [][]*LineItem, newOrders []*Orders,
+	newItems [][]*LineItem) (rems []antidote.UpdateObjectParams, upds []antidote.UpdateObjectParams, nAdds int, nRems int) {
 	//Remove orders, and then call prepareQ18Index with the new orders/items
 	//Quantity -> orderID
 	toRemove := createQ18DeleteMap()
 
-	nRems := 0
 	for i, order := range remOrders {
 		nRems += q18UpdsCalcHelper(toRemove, remItems[i], order.O_ORDERKEY)
 	}
@@ -732,12 +1048,12 @@ func getQ18UpdsV2(remOrders []*Orders, remItems [][]*LineItem, newOrders []*Orde
 		}
 	}
 
-	rems = makeQ18IndexRemoves(toRemove, nRems)
-	existingOrders, existingItems := procTables.Orders, procTables.LineItems
-	procTables.Orders, procTables.LineItems = newOrders, newItems
-	upds = prepareQ18Index()
-	procTables.Orders, procTables.LineItems = existingOrders, existingItems
-	return
+	rems = makeQ18IndexRemoves(toRemove, nRems, INDEX_BKT)
+	existingOrders, existingItems := ti.Tables.Orders, ti.Tables.LineItems
+	ti.Tables.Orders, ti.Tables.LineItems = newOrders, newItems
+	upds, nAdds = ti.prepareQ18Index()
+	ti.Tables.Orders, ti.Tables.LineItems = existingOrders, existingItems
+	return rems, upds, nAdds, nRems
 }
 
 func q18UpdsCalcHelper(toRemove []map[int32]struct{}, orderItems []*LineItem, orderKey int32) (nRems int) {
@@ -755,7 +1071,7 @@ func q18UpdsCalcHelper(toRemove []map[int32]struct{}, orderItems []*LineItem, or
 	return
 }
 
-func makeQ3IndexRemoves(remMap map[string]map[int8]map[int32]struct{}, nUpds int) (rems []antidote.UpdateObjectParams) {
+func makeQ3IndexRemoves(remMap map[string]map[int8]map[int32]struct{}, nUpds int, bucketI int) (rems []antidote.UpdateObjectParams) {
 	rems = make([]antidote.UpdateObjectParams, nUpds)
 	var keyArgs antidote.KeyParams
 	i := 0
@@ -765,7 +1081,7 @@ func makeQ3IndexRemoves(remMap map[string]map[int8]map[int32]struct{}, nUpds int
 			keyArgs = antidote.KeyParams{
 				Key:      SEGM_DELAY + mktSeg + strconv.FormatInt(int64(day), 10),
 				CrdtType: proto.CRDTType_TOPK_RMV,
-				Bucket:   buckets[INDEX_BKT],
+				Bucket:   buckets[bucketI],
 			}
 			if !useTopKAll {
 				for orderKey := range dayMap {
@@ -791,19 +1107,25 @@ func makeQ3IndexRemoves(remMap map[string]map[int8]map[int32]struct{}, nUpds int
 }
 
 func makeQ15IndexUpdsDeletes(yearMap map[int16]map[int8]map[int32]*float64, updEntries map[int16]map[int8]map[int32]struct{},
-	nUpds int, bucketI int) (upds []antidote.UpdateObjectParams) {
-
+	nUpds int, bucketI int) (upds []antidote.UpdateObjectParams, updsDone int) {
 	upds = make([]antidote.UpdateObjectParams, nUpds)
+	index, done := makeQ15IndexUpdsDeletesHelper(yearMap, updEntries, bucketI, upds, 0)
+	return upds[:index], done
+}
+
+func makeQ15IndexUpdsDeletesHelper(yearMap map[int16]map[int8]map[int32]*float64, updEntries map[int16]map[int8]map[int32]struct{},
+	bucketI int, upds []antidote.UpdateObjectParams, bufI int) (newBufI int, updsDone int) {
+
+	oldBufI := bufI
 	var monthMap map[int8]map[int32]*float64
 	var suppMap map[int32]*float64
 	var keyArgs antidote.KeyParams
-	i := 0
 	var value *float64
 	for year, mUpd := range updEntries {
 		monthMap = yearMap[year]
 		for month, sUpd := range mUpd {
-			suppMap = monthMap[month]
 			if len(sUpd) > 0 {
+				suppMap = monthMap[month]
 				keyArgs = antidote.KeyParams{
 					Key:      TOP_SUPPLIERS + strconv.FormatInt(int64(year), 10) + strconv.FormatInt(int64(month), 10),
 					CrdtType: proto.CRDTType_TOPK_RMV,
@@ -818,9 +1140,10 @@ func makeQ15IndexUpdsDeletes(yearMap map[int16]map[int8]map[int32]*float64, updE
 						} else {
 							currUpd = crdt.TopKAdd{TopKScore: crdt.TopKScore{Id: suppKey, Score: int32(*value)}}
 						}
-						upds[i] = antidote.UpdateObjectParams{KeyParams: keyArgs, UpdateArgs: &currUpd}
-						i++
+						upds[bufI] = antidote.UpdateObjectParams{KeyParams: keyArgs, UpdateArgs: &currUpd}
+						bufI++
 					}
+					updsDone = bufI - oldBufI
 				} else {
 					adds, rems := make([]crdt.TopKScore, len(suppMap)), make([]int32, len(suppMap))
 					j, k := 0, 0
@@ -837,24 +1160,24 @@ func makeQ15IndexUpdsDeletes(yearMap map[int16]map[int8]map[int32]*float64, updE
 					if j > 0 {
 						adds = adds[:j]
 						var currUpd crdt.UpdateArguments = crdt.TopKAddAll{Scores: adds}
-						upds[i] = antidote.UpdateObjectParams{KeyParams: keyArgs, UpdateArgs: &currUpd}
-						i++
+						upds[bufI] = antidote.UpdateObjectParams{KeyParams: keyArgs, UpdateArgs: &currUpd}
+						bufI++
 					}
 					if k > 0 {
 						rems = rems[:k]
 						var currUpd crdt.UpdateArguments = crdt.TopKRemoveAll{Ids: rems}
-						upds[i] = antidote.UpdateObjectParams{KeyParams: keyArgs, UpdateArgs: &currUpd}
-						i++
+						upds[bufI] = antidote.UpdateObjectParams{KeyParams: keyArgs, UpdateArgs: &currUpd}
+						bufI++
 					}
+					updsDone += j + k
 				}
 			}
 		}
 	}
-	upds = upds[:i]
-	return
+	return bufI, updsDone
 }
 
-func makeQ18IndexRemoves(toRemove []map[int32]struct{}, nRems int) (rems []antidote.UpdateObjectParams) {
+func makeQ18IndexRemoves(toRemove []map[int32]struct{}, nRems int, bucketI int) (rems []antidote.UpdateObjectParams) {
 	rems = make([]antidote.UpdateObjectParams, nRems)
 	var keyArgs antidote.KeyParams
 
@@ -863,7 +1186,7 @@ func makeQ18IndexRemoves(toRemove []map[int32]struct{}, nRems int) (rems []antid
 		keyArgs = antidote.KeyParams{
 			Key:      LARGE_ORDERS + strconv.FormatInt(int64(312+baseQ), 10),
 			CrdtType: proto.CRDTType_TOPK_RMV,
-			Bucket:   buckets[INDEX_BKT],
+			Bucket:   buckets[bucketI],
 		}
 		if !useTopKAll {
 			for orderKey := range orderMap {
@@ -884,6 +1207,14 @@ func makeQ18IndexRemoves(toRemove []map[int32]struct{}, nRems int) (rems []antid
 		}
 	}
 	return
+}
+
+func queueStatMsg(chanIndex int, upds []antidote.UpdateObjectParams, nUpds int, dataType int) {
+	channels.updateChans[chanIndex] <- QueuedMsgWithStat{
+		QueuedMsg: QueuedMsg{code: antidote.StaticUpdateObjs, Message: antidote.CreateStaticUpdateObjs(nil, upds)},
+		nData:     nUpds,
+		dataType:  dataType,
+	}
 }
 
 /*****OBSOLETE*****/
@@ -921,7 +1252,7 @@ func getUpdWithIndex(order []string, lineItems [][]string) {
 		_, lineUpds[i] = getEntryUpd(headers[LINEITEM], keys[LINEITEM], order, read[LINEITEM])
 		ignore(item)
 	}
-	//orderObj, lineItemsObjs := procTables.UpdateOrderLineitems(order, lineItems)
+	//orderObj, lineItemsObjs := ti.Tables.UpdateOrderLineitems(order, lineItems)
 	//indexUpds := getIndexUpds(orderObj, lineItemsObjs)
 	ignore(orderUpd)
 }
@@ -1166,6 +1497,130 @@ func getQ18Upds(order *Orders, lineItems []*LineItem) (upds []antidote.UpdateObj
 	//if quantity is < 312 then there's no updates
 	return []antidote.UpdateObjectParams{}
 }
+
+func doUpdStatsInterval() {
+	for {
+		time.Sleep(statisticsInterval * time.Millisecond)
+		collectUpdStats = true
+		collectUpdStatsComm = []bool{true, true, true, true, true}
+	}
+}
+
+func mergeCommUpdateStats() {
+	sizeToUse := int(math.MaxInt32)
+	for _, updStat := range updStatsComm {
+		if len(updStat) < sizeToUse {
+			sizeToUse = len(updStat)
+		}
+	}
+	updStats = make([]UpdatesStats, sizeToUse)
+	var currMerge UpdatesStats
+	var currStat UpdatesStats
+	nClients := int64(len(updStatsComm))
+
+	for i := range updStats {
+		currMerge = UpdatesStats{}
+		for _, commStats := range updStatsComm {
+			currStat = commStats[i]
+			currMerge.newDataTimeSpent += currStat.newDataTimeSpent
+			currMerge.newDataUpds += currStat.newDataUpds
+			currMerge.removeDataTimeSpent += currStat.removeDataTimeSpent
+			currMerge.removeDataUpds += currStat.removeDataUpds
+			currMerge.indexTimeSpent += currStat.indexTimeSpent
+			currMerge.indexUpds += currStat.indexUpds
+		}
+		currMerge.newDataTimeSpent /= nClients
+		currMerge.removeDataTimeSpent /= nClients
+		currMerge.indexTimeSpent /= nClients
+		updStats[i] = currMerge
+	}
+
+}
+
+func writeUpdsStatsFile() {
+	data := make([][]string, len(updStats)+2)
+	data[0] = []string{"Total time", "Section time", "nAllUpds data", "nAllUpds/s", "nUpds data", "nUpds time (ms)", "nUpds/s", "nUpds/totalS",
+		"nRems data", "nRems time (ms)", "nRems/s", "nRems/totalS", "nIndex data", "nIndex time (ms)", "nIndex/s", "nIndex/totalS"}
+	newUpdsPerSecond, removesPerSecond, indexPerSecond, updsPerSecond := 0.0, 0.0, 0.0, 0.0
+	newUpdsPerTotalSecond, removesPerTotalSecond, indexPerTotalSecond := 0.0, 0.0, 0.0
+	totalNewUpds, totalRemoveUpds, totalIndexUpds := 0, 0, 0
+	totalNewTime, totalRemoveTime, totalIndexTime := int64(0), int64(0), int64(0)
+	timeSpent, totalTimeSpent, totalUpds := int64(0), int64(0), 0
+
+	for i, updStat := range updStats {
+		timeSpent = updStat.indexTimeSpent + updStat.newDataTimeSpent + updStat.removeDataTimeSpent
+		newUpdsPerSecond = (float64(updStat.newDataUpds) / float64(updStat.newDataTimeSpent)) * 1000
+		removesPerSecond = (float64(updStat.removeDataUpds) / float64(updStat.removeDataTimeSpent)) * 1000
+		indexPerSecond = (float64(updStat.indexUpds) / float64(updStat.indexTimeSpent)) * 1000
+		newUpdsPerTotalSecond = (float64(updStat.newDataUpds) / float64(timeSpent)) * 1000
+		removesPerTotalSecond = (float64(updStat.removeDataUpds) / float64(timeSpent)) * 1000
+		indexPerTotalSecond = (float64(updStat.indexUpds) / float64(timeSpent)) * 1000
+		updsPerSecond = newUpdsPerTotalSecond + removesPerTotalSecond + indexPerTotalSecond
+
+		totalTimeSpent += timeSpent
+		totalNewUpds += updStat.newDataUpds
+		totalRemoveUpds += updStat.removeDataUpds
+		totalIndexUpds += updStat.indexUpds
+		totalNewTime += updStat.newDataTimeSpent
+		totalRemoveTime += updStat.removeDataTimeSpent
+		totalIndexTime += updStat.indexTimeSpent
+		totalUpds += updStat.newDataUpds + updStat.removeDataUpds + updStat.indexUpds
+
+		data[i+1] = []string{strconv.FormatInt(totalTimeSpent, 10), strconv.FormatInt(timeSpent, 10),
+			strconv.FormatInt(int64(updStat.newDataUpds+updStat.removeDataUpds+updStat.indexUpds), 10), strconv.FormatFloat(updsPerSecond, 'f', 10, 64),
+			strconv.FormatInt(int64(updStat.newDataUpds), 10), strconv.FormatInt(updStat.newDataTimeSpent, 10),
+			strconv.FormatFloat(newUpdsPerSecond, 'f', 10, 64), strconv.FormatFloat(newUpdsPerTotalSecond, 'f', 10, 64),
+			strconv.FormatInt(int64(updStat.removeDataUpds), 10), strconv.FormatInt(updStat.removeDataTimeSpent, 10),
+			strconv.FormatFloat(removesPerSecond, 'f', 10, 64), strconv.FormatFloat(removesPerTotalSecond, 'f', 10, 64),
+			strconv.FormatInt(int64(updStat.indexUpds), 10), strconv.FormatInt(updStat.indexTimeSpent, 10),
+			strconv.FormatFloat(indexPerSecond, 'f', 10, 64), strconv.FormatFloat(indexPerTotalSecond, 'f', 10, 64)}
+	}
+
+	totalUpdsPerSecond := (float64(totalNewUpds+totalRemoveUpds+totalIndexUpds) / float64(totalTimeSpent)) * 1000
+	totalNewUpdsPerSecond := (float64(totalNewUpds) / float64(totalNewTime)) * 1000
+	totalNewUpdsPerTotalSecond := (float64(totalNewUpds) / float64(totalTimeSpent)) * 1000
+	totalRemovesPerSecond := (float64(totalRemoveUpds) / float64(totalRemoveTime)) * 1000
+	totalRemovesPerTotalSecond := (float64(totalRemoveUpds) / float64(totalTimeSpent)) * 1000
+	totalIndexPerSecond := (float64(totalIndexUpds) / float64(totalIndexTime)) * 1000
+	totalIndexPerTotalSecond := (float64(totalIndexUpds) / float64(totalTimeSpent)) * 1000
+
+	data[len(data)-1] = []string{strconv.FormatInt(totalTimeSpent, 10), strconv.FormatInt(totalTimeSpent, 10),
+		strconv.FormatInt(int64(totalUpds), 10), strconv.FormatFloat(totalUpdsPerSecond, 'f', 10, 64),
+		strconv.FormatInt(int64(totalNewUpds), 10), strconv.FormatInt(totalNewTime, 10),
+		strconv.FormatFloat(totalNewUpdsPerSecond, 'f', 10, 64), strconv.FormatFloat(totalNewUpdsPerTotalSecond, 'f', 10, 64),
+		strconv.FormatInt(int64(totalRemoveUpds), 10), strconv.FormatInt(totalRemoveTime, 10),
+		strconv.FormatFloat(totalRemovesPerSecond, 'f', 10, 64), strconv.FormatFloat(totalRemovesPerTotalSecond, 'f', 10, 64),
+		strconv.FormatInt(int64(totalIndexUpds), 10), strconv.FormatInt(totalIndexTime, 10),
+		strconv.FormatFloat(totalIndexPerSecond, 'f', 10, 64), strconv.FormatFloat(totalIndexPerTotalSecond, 'f', 10, 64)}
+
+	file := getStatsFileToWrite("updateStats")
+	if file == nil {
+		return
+	}
+	defer file.Close()
+
+	writer := csv.NewWriter(file)
+	writer.Comma = ';'
+	defer writer.Flush()
+
+	for _, line := range data {
+		writer.Write(line)
+	}
+
+	fmt.Println("Update statistics saved successfully.")
+}
+
+/*
+//One every x seconds.
+type UpdatesStats struct {
+	newDataUpds         int
+	removeDataUpds      int
+	indexUpds           int
+	newDataTimeSpent    int64
+	removeDataTimeSpent int64
+	indexTimeSpent      int64
+}
+*/
 
 /*
 func prepareDeletes(deleteKeys []string) {

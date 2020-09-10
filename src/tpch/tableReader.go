@@ -105,6 +105,67 @@ func processHeaderLine(line string, headers [][]string, toRead [][]int8, keys []
 	return
 }
 
+//Used for mix clients which need lineItemSizes to be per order instead of per file.
+func ReadUpdatesPerOrder(fileLocs []string, nEntries []int, nParts []int, toRead [][]int8, startFile, finishFile int) (ordersUpds [][]string,
+	lineItemUpds [][]string, deleteKeys []string, lineItemSizes []int, itemSizesPerOrder []int) {
+
+	nFiles, startFile64 := finishFile-startFile+1, int64(startFile)
+	ordersUpds, lineItemUpds, deleteKeys, lineItemSizes, itemSizesPerOrder = make([][]string, nEntries[0]*nFiles), make([][]string, nEntries[1]*nFiles),
+		make([]string, nEntries[2]*nFiles), make([]int, nFiles), make([]int, nEntries[0]*nFiles)
+	orderI, lineI, deleteI := 0, 0, 0
+	currOrderKey, currOrderItems, previousSize, currSize, currOrderI := "", 0, 0, 0, 0
+	i, j, nFiles64 := int64(0), int(0), int64(nFiles)
+
+	for ; i < nFiles64; i, deleteI = i+1, deleteI+nEntries[2] {
+		orderI += processUpdFile(fileLocs[0]+strconv.FormatInt(i+startFile64, 10), nEntries[0], nParts[0], toRead[0], ordersUpds[orderI:])
+		lineItemSizes[i] = processUpdFile(fileLocs[1]+strconv.FormatInt(i+startFile64, 10), nEntries[1], nParts[1], toRead[1], lineItemUpds[lineI:])
+		currSize += lineItemSizes[i]
+		if i == 0 {
+			currOrderKey = lineItemUpds[0][0]
+		}
+		for j = previousSize; j < currSize; j++ {
+			if lineItemUpds[j][0] != currOrderKey {
+				itemSizesPerOrder[currOrderI] = currOrderItems
+				currOrderItems, currOrderKey = 0, lineItemUpds[j][0]
+				currOrderI++
+			}
+			currOrderItems++
+		}
+		previousSize, itemSizesPerOrder[currOrderI] = currSize, currOrderItems
+		currOrderItems = 0
+
+		lineI = currSize
+		processDeleteFile(fileLocs[2]+strconv.FormatInt(i+startFile64, 10), nEntries[2], deleteKeys[deleteI:])
+	}
+
+	lineItemPos, previous, orderIndex := 0, 0, 0
+	orderID := ""
+	//Fixing lineItemSizes
+	for k := 1; k <= nFiles; k++ {
+		orderIndex = k*nEntries[0] - k + (k-1)*2
+		if orderIndex >= orderI {
+			k--
+			orderI = k*nEntries[0] - k + (k-1)*2 + 1
+			lineI = lineItemPos
+			finishFile = k + startFile
+			break
+		}
+		orderID = ordersUpds[k*nEntries[0]-k+(k-1)*2][0]
+		//lineItemPos += int(float64(nEntries[0]) * 2)
+		//Use below for 0.1SF
+		lineItemPos += int(float64(nEntries[0]) * 3) //Always safe to skip this amount at least
+		for ; len(lineItemUpds[lineItemPos][0]) < len(orderID) || lineItemUpds[lineItemPos][0] <= orderID; lineItemPos++ {
+			//Note: We're comparing strings and not ints here, thus we must compare the len to deal with cases like 999 < 1000
+		}
+		lineItemSizes[k-1] = lineItemPos - previous
+		previous = lineItemPos
+		//fmt.Println(orderID, lineItemUpds[lineItemPos-1][0], k, lineItemSizes[k-1])
+	}
+	fmt.Println("OrderI, LineI:", orderI, lineI)
+	ordersUpds, lineItemUpds, deleteKeys = ordersUpds[:orderI], lineItemUpds[:lineI], deleteKeys[:orderI]
+	return
+}
+
 //File order: orders, lineitem, delete
 //fileLocs and nEntries are required for the 3 files. nParts is only required for the first two.
 func ReadUpdates(fileLocs []string, nEntries []int, nParts []int, toRead [][]int8, nFiles int) (ordersUpds [][]string,
@@ -133,9 +194,9 @@ func ReadUpdates(fileLocs []string, nEntries []int, nParts []int, toRead [][]int
 			break
 		}
 		orderID = ordersUpds[k*nEntries[0]-k+(k-1)*2][0]
-		lineItemPos += int(float64(nEntries[0]) * 2)
+		//lineItemPos += int(float64(nEntries[0]) * 2)
 		//Use below for 0.1SF
-		//lineItemPos += int(float64(nEntries[0]) * 3) //Always safe to skip this amount at least
+		lineItemPos += int(float64(nEntries[0]) * 3) //Always safe to skip this amount at least
 		for ; len(lineItemUpds[lineItemPos][0]) < len(orderID) || lineItemUpds[lineItemPos][0] <= orderID; lineItemPos++ {
 			//Note: We're comparing strings and not ints here, thus we must compare the len to deal with cases like 999 < 1000
 		}
@@ -143,6 +204,7 @@ func ReadUpdates(fileLocs []string, nEntries []int, nParts []int, toRead [][]int
 		previous = lineItemPos
 		//fmt.Println(orderID, lineItemUpds[lineItemPos-1][0], k, lineItemSizes[k-1])
 	}
+	fmt.Println("OrderI, LineI:", orderI, lineI)
 	ordersUpds, lineItemUpds, deleteKeys = ordersUpds[:orderI], lineItemUpds[:lineI], deleteKeys[:orderI]
 	return
 }

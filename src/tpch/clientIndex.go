@@ -13,9 +13,26 @@ import (
 
 //TODO: Maybe remake clientIndex, clientUpdates and clientQueries to have a file per query?
 
+/*
+	Updates count:
+	Q3: Max is nOrders * nSegments. nSegments is 5, nOrders is 150000 and 1500000 respectively for 0.1SF and 1SF, thus max is 750000  and 7500000.
+	    On 0.1SF, seems to be 159306, and on 1SF 1587920.
+	Q5: nNations * 5 years (1993-1997) = 25*5 = 125, always, for all SFs.
+	Q11: Max is nNations + nNations * nParts, which, for 0.1SF and 1SF: 25 + 25*20000 = 500025; 25 + 25*200000 = 5000025.
+		On 0.1SF, seems to be 75379, and on 1SF 753341.
+	Q14: 5 years (1993-1997) * 12 months = 60, always, for all SFs.
+	Q15: theorically not predefined. 5 years * 4 months, with each entry containing up to len(suppliers). Max is 20000 for 0.1SF, 200000 for 1SF.
+		 On 0.1SF, seems to be 20000, and on 1SF 200000.
+	Q18: On 0.1SF it is reporting 1, while on 1SF it is reporting 4.
+*/
 type PairInt struct {
 	first  int32
 	second int32
+}
+
+//Idea: allow concurrent goroutines to use different versions of Orders and Lineitems table
+type TableInfo struct {
+	*Tables
 }
 
 const (
@@ -32,27 +49,33 @@ var (
 )
 
 func prepareIndexesToSend() {
+	ti := TableInfo{Tables: procTables}
 	startTime := time.Now().UnixNano() / 1000000
 	//TODO: Later consider 6, 10, 2, by this order.
 	fmt.Println("Preparing indexes...")
 	//queueIndex(prepareQ2Index())
-	queueIndex(prepareQ3Index())
+	q3Upds, q3N := ti.prepareQ3Index()
+	queueIndex(q3Upds)
 	times.prepareIndexProtos[0] = time.Now().UnixNano() / 1000000
 	fmt.Println("Index Q3 OK")
-	q5Upds, _ := prepareQ5Index()
+	q5Upds, _, q5N := ti.prepareQ5Index()
 	queueIndex(q5Upds)
 	times.prepareIndexProtos[1] = time.Now().UnixNano() / 1000000
 	fmt.Println("Index Q5 OK")
-	queueIndex(prepareQ11Index())
+	q11Upds, q11N := ti.prepareQ11Index()
+	queueIndex(q11Upds)
 	times.prepareIndexProtos[2] = time.Now().UnixNano() / 1000000
 	fmt.Println("Index Q11 OK")
-	queueIndex(prepareQ14Index())
+	q14Upds, q14N := ti.prepareQ14Index()
+	queueIndex(q14Upds)
 	times.prepareIndexProtos[3] = time.Now().UnixNano() / 1000000
 	fmt.Println("Index Q14 OK")
-	queueIndex(prepareQ15Index())
+	q15Upds, q15N := ti.prepareQ15Index()
+	queueIndex(q15Upds)
 	times.prepareIndexProtos[4] = time.Now().UnixNano() / 1000000
 	fmt.Println("Index Q15 OK")
-	queueIndex(prepareQ18Index())
+	q18Upds, q18N := ti.prepareQ18Index()
+	queueIndex(q18Upds)
 	endTime := time.Now().UnixNano() / 1000000
 	times.prepareIndexProtos[5] = endTime
 	fmt.Println("Index Q18 OK")
@@ -72,6 +95,10 @@ func prepareIndexesToSend() {
 		channels.indexChans[0] <- QueuedMsg{code: QUEUE_COMPLETE}
 	}
 
+	dataloadStats.nIndexUpds = q3N + q5N + q11N + q14N + q15N + q18N
+	fmt.Println("Number of index upds:", dataloadStats.nIndexUpds)
+	fmt.Println("Q3, Q5, Q11, Q14, Q15, Q18:", q3N, q5N, q11N, q14N, q15N, q18N)
+
 	//Start reading updates data
 	if DOES_UPDATES {
 		go startUpdates()
@@ -85,27 +112,33 @@ func queueIndex(upds []antidote.UpdateObjectParams) {
 }
 
 func prepareIndexesLocalToSend() {
+	ti := TableInfo{Tables: procTables}
 	startTime := time.Now().UnixNano() / 1000000
 	//TODO: Later consider 6, 10, 2, by this order.
 	fmt.Println("Preparing indexes...")
 	//queueIndex(prepareQ2Index())
-	queueIndexLocal(prepareQ3IndexLocal())
+	q3Upds, q3N := ti.prepareQ3IndexLocal()
+	queueIndexLocal(q3Upds)
 	times.prepareIndexProtos[0] = time.Now().UnixNano() / 1000000
 	fmt.Println("Index Q3 OK")
-	_, q5Upds := prepareQ5Index()
+	_, q5Upds, q5N := ti.prepareQ5Index()
 	queueIndexLocal(q5Upds)
 	times.prepareIndexProtos[1] = time.Now().UnixNano() / 1000000
 	fmt.Println("Index Q5 OK")
-	queueIndexLocal(prepareQ11IndexLocal())
+	q11Upds, q11N := ti.prepareQ11IndexLocal()
+	queueIndexLocal(q11Upds)
 	times.prepareIndexProtos[2] = time.Now().UnixNano() / 1000000
 	fmt.Println("Index Q11 OK")
-	queueIndexLocal(prepareQ14IndexLocal())
+	q14Upds, q14N := ti.prepareQ14IndexLocal()
+	queueIndexLocal(q14Upds)
 	times.prepareIndexProtos[3] = time.Now().UnixNano() / 1000000
 	fmt.Println("Index Q14 OK")
-	queueIndexLocal(prepareQ15IndexLocal())
+	q15Upds, q15N := ti.prepareQ15IndexLocal()
+	queueIndexLocal(q15Upds)
 	times.prepareIndexProtos[4] = time.Now().UnixNano() / 1000000
 	fmt.Println("Index Q15 OK")
-	queueIndexLocal(prepareQ18IndexLocal())
+	q18Upds, q18N := ti.prepareQ18IndexLocal()
+	queueIndexLocal(q18Upds)
 	endTime := time.Now().UnixNano() / 1000000
 	times.prepareIndexProtos[5] = endTime
 	fmt.Println("Index Q18 OK")
@@ -120,6 +153,10 @@ func prepareIndexesLocalToSend() {
 	for _, channel := range channels.indexChans {
 		channel <- QueuedMsg{code: QUEUE_COMPLETE}
 	}
+
+	dataloadStats.nIndexUpds = q3N + q5N + q11N + q14N + q15N + q18N
+	fmt.Println("Number of index upds:", dataloadStats.nIndexUpds)
+	fmt.Println("Q3, Q5, Q11, Q14, Q15, Q18:", q3N, q5N, q11N, q14N, q15N, q18N)
 
 	//Start reading updates data
 	if DOES_UPDATES {
@@ -148,36 +185,51 @@ func prepareQ2Index() (upds []antidote.UpdateObjectParams) {
 }
 */
 
-func prepareQ3IndexLocal() (upds [][]antidote.UpdateObjectParams) {
+func (ti TableInfo) prepareQ3IndexLocal() (upds [][]antidote.UpdateObjectParams, updsDone int) {
 	//Segment -> orderDate (day) -> orderKey
-	sumMap := make([]map[string]map[int8]map[int32]*float64, len(procTables.Regions))
+	sumMap := make([]map[string]map[int8]map[int32]*float64, len(ti.Tables.Regions))
 	nUpds := make([]int, len(sumMap))
 	for i := range sumMap {
 		sumMap[i] = createQ3Map()
 	}
 
 	regionI := int8(0)
-	orders := procTables.Orders
+	orders := ti.Tables.Orders
 	if orders[0] == nil {
 		//Happens only for the initial data
 		orders = orders[1:]
 	}
 	for orderI, order := range orders {
 		if order.O_ORDERDATE.isSmallerOrEqual(MAX_DATE_Q3) {
-			regionI = procTables.OrderkeyToRegionkey(order.O_ORDERKEY)
-			nUpds[regionI] += q3CalcHelper(sumMap[regionI], order, orderI)
+			regionI = ti.Tables.OrderkeyToRegionkey(order.O_ORDERKEY)
+			nUpds[regionI] += ti.q3CalcHelper(sumMap[regionI], order, orderI)
+		}
+	}
+
+	for _, rUpds := range nUpds {
+		updsDone += rUpds
+	}
+
+	//TODO: Don't I need to override nProtoUpds also here?
+	//Override nUpds if useTopKAll
+	if useTopKAll {
+		for i, regionSumMap := range sumMap {
+			nUpds[i] = 0
+			for _, segMap := range regionSumMap {
+				nUpds[i] += len(segMap)
+			}
 		}
 	}
 
 	upds = make([][]antidote.UpdateObjectParams, len(nUpds))
 	for i := range upds {
-		upds[i] = makeQ3IndexUpds(sumMap[i], nUpds[i], INDEX_BKT+i)
+		upds[i] = ti.makeQ3IndexUpds(sumMap[i], nUpds[i], INDEX_BKT+i)
 	}
 
 	return
 }
 
-func prepareQ3Index() (upds []antidote.UpdateObjectParams) {
+func (ti TableInfo) prepareQ3Index() (upds []antidote.UpdateObjectParams, updsDone int) {
 	//sum: l_extendedprice*(1-l_discount)
 	//This is for each pair of (l_orderkey, o_orderdate, o_shippriority).
 	//The query will still need to collect all whose date < o_orderdate and then filter for only those whose
@@ -192,8 +244,8 @@ func prepareQ3Index() (upds []antidote.UpdateObjectParams) {
 	//segment -> orderDate -> orderkey -> sum
 	sumMap := createQ3Map()
 
-	nUpds := 0
-	orders := procTables.Orders
+	updsDone = 0
+	orders := ti.Tables.Orders
 	if orders[0] == nil {
 		//Happens only for the initial data
 		orders = orders[1:]
@@ -202,22 +254,23 @@ func prepareQ3Index() (upds []antidote.UpdateObjectParams) {
 		//To be in range for the maps, o_orderDate must be <= than the highest date 1995-03-31
 		//And l_shipdate must be >= than the smallest date 1995-03-01
 		if order.O_ORDERDATE.isSmallerOrEqual(MAX_DATE_Q3) {
-			nUpds += q3CalcHelper(sumMap, order, orderI)
+			updsDone += ti.q3CalcHelper(sumMap, order, orderI)
 		}
 	}
-	//Override nUpds if useTopKAll
+	nProtoUpds := updsDone
+	//Override nProtoUpds if useTopKAll
 	if useTopKAll {
-		nUpds = 0
+		nProtoUpds = 0
 		for _, segMap := range sumMap {
-			nUpds += len(segMap)
+			nProtoUpds += len(segMap)
 		}
 	}
 
-	return makeQ3IndexUpds(sumMap, nUpds, INDEX_BKT)
+	return ti.makeQ3IndexUpds(sumMap, nProtoUpds, INDEX_BKT), updsDone
 }
 
 //Note: not much efficient, but we don't really know how old can an orderdate be without being shipped. And we also don't have any index for dates
-func q3CalcHelper(sumMap map[string]map[int8]map[int32]*float64, order *Orders, orderI int) (nUpds int) {
+func (ti TableInfo) q3CalcHelper(sumMap map[string]map[int8]map[int32]*float64, order *Orders, orderI int) (nUpds int) {
 	var minDay = MIN_MONTH_DAY
 	var currSum *float64
 	var has bool
@@ -225,8 +278,8 @@ func q3CalcHelper(sumMap map[string]map[int8]map[int32]*float64, order *Orders, 
 
 	//fmt.Println("OrderDate:", *order.O_ORDERDATE, ". Compare result:", order.O_ORDERDATE.isSmallerOrEqual(maxDate))
 	//Get the customer's market segment
-	segMap := sumMap[procTables.Customers[order.O_CUSTKEY].C_MKTSEGMENT]
-	orderLineItems := procTables.LineItems[orderI]
+	segMap := sumMap[ti.Tables.Customers[order.O_CUSTKEY].C_MKTSEGMENT]
+	orderLineItems := ti.Tables.LineItems[orderI]
 	for _, item := range orderLineItems {
 		//Check if L_SHIPDATE is higher than minDate and, if it is, check month/year. If month/year > march 1995, then add to all entries. Otherwise, use day to know which entries.
 		if item.L_SHIPDATE.isHigherOrEqual(MIN_DATE_Q3) {
@@ -267,7 +320,7 @@ func createQ3Map() (sumMap map[string]map[int8]map[int32]*float64) {
 	return
 }
 
-func prepareQ5Index() (upds []antidote.UpdateObjectParams, multiUpds [][]antidote.UpdateObjectParams) {
+func (ti TableInfo) prepareQ5Index() (upds []antidote.UpdateObjectParams, multiUpds [][]antidote.UpdateObjectParams, updsDone int) {
 	//2.4.5:
 	//sum: l_extendedprice * (1 - l_discount)
 	//Group this by the pair (country, year) (i.e., group all the days of a year in the same CRDT).
@@ -279,7 +332,7 @@ func prepareQ5Index() (upds []antidote.UpdateObjectParams, multiUpds [][]antidot
 	//Region -> Year -> Country -> Sum
 	sumMap := make(map[int8]map[int16]map[int8]*float64)
 	//Registering regions and dates
-	for _, region := range procTables.Regions {
+	for _, region := range ti.Tables.Regions {
 		regMap := make(map[int16]map[int8]*float64)
 		for i = 1993; i <= 1997; i++ {
 			regMap[i] = make(map[int8]*float64)
@@ -287,7 +340,7 @@ func prepareQ5Index() (upds []antidote.UpdateObjectParams, multiUpds [][]antidot
 		sumMap[region.R_REGIONKEY] = regMap
 	}
 	//Registering countries
-	for _, nation := range procTables.Nations {
+	for _, nation := range ti.Tables.Nations {
 		regMap := sumMap[nation.N_REGIONKEY]
 		for i = 1993; i <= 1997; i++ {
 			value := 0.0
@@ -296,7 +349,7 @@ func prepareQ5Index() (upds []antidote.UpdateObjectParams, multiUpds [][]antidot
 	}
 
 	//Actually collecting the data
-	orders := procTables.Orders
+	orders := ti.Tables.Orders
 	if orders[0] == nil {
 		//Happens only for the initial data
 		orders = orders[1:]
@@ -308,21 +361,21 @@ func prepareQ5Index() (upds []antidote.UpdateObjectParams, multiUpds [][]antidot
 	var nationKey, regionKey int8
 	var value *float64
 
-	//for i, orderItems := range procTables.LineItems[1:] {
-	for i, orderItems := range procTables.LineItems {
+	//for i, orderItems := range ti.Tables.LineItems[1:] {
+	for i, orderItems := range ti.Tables.LineItems {
 		order = orders[i]
 		year = order.O_ORDERDATE.YEAR
 		if year >= 1993 && year <= 1997 {
-			customer = procTables.Customers[order.O_CUSTKEY]
+			customer = ti.Tables.Customers[order.O_CUSTKEY]
 			nationKey = customer.C_NATIONKEY
-			regionKey = procTables.Nations[nationKey].N_REGIONKEY
+			regionKey = ti.Tables.Nations[nationKey].N_REGIONKEY
 			value = sumMap[regionKey][year][nationKey]
 			for _, lineItem := range orderItems {
 				//Conditions:
 				//Ordered year between 1993 and 1997 (inclusive)
 				//Supplier and customer of same nation
 				//Calculate: l_extendedprice * (1 - l_discount)
-				supplier = procTables.Suppliers[lineItem.L_SUPPKEY]
+				supplier = ti.Tables.Suppliers[lineItem.L_SUPPKEY]
 				if nationKey == supplier.S_NATIONKEY {
 					*value += lineItem.L_EXTENDEDPRICE * (1 - lineItem.L_DISCOUNT)
 				}
@@ -330,27 +383,28 @@ func prepareQ5Index() (upds []antidote.UpdateObjectParams, multiUpds [][]antidot
 		}
 	}
 
+	//Upds done: 5 (years) * nations
 	if isIndexGlobal {
-		return makeQ5IndexUpds(sumMap, INDEX_BKT), nil
+		return ti.makeQ5IndexUpds(sumMap, INDEX_BKT), nil, 5 * len(ti.Tables.Nations)
 	}
 	//Create temporary maps with just one region, in order to receive the upds separatelly
-	multiUpds = make([][]antidote.UpdateObjectParams, len(procTables.Regions))
+	multiUpds = make([][]antidote.UpdateObjectParams, len(ti.Tables.Regions))
 	for i, regMap := range sumMap {
-		multiUpds[i] = makeQ5IndexUpds(map[int8]map[int16]map[int8]*float64{i: regMap}, INDEX_BKT+int(i))
+		multiUpds[i] = ti.makeQ5IndexUpds(map[int8]map[int16]map[int8]*float64{i: regMap}, INDEX_BKT+int(i))
 	}
-	return nil, multiUpds
+	return nil, multiUpds, 5 * len(ti.Tables.Nations)
 }
 
-func prepareQ11IndexLocal() (upds [][]antidote.UpdateObjectParams) {
-	nationMap := make([]map[int8]map[int32]*float64, len(procTables.Regions))
-	totalSumMap := make([]map[int8]*float64, len(procTables.Regions))
-	updsPerRegion := make([]int, len(procTables.Regions))
+func (ti TableInfo) prepareQ11IndexLocal() (upds [][]antidote.UpdateObjectParams, updsDone int) {
+	nationMap := make([]map[int8]map[int32]*float64, len(ti.Tables.Regions))
+	totalSumMap := make([]map[int8]*float64, len(ti.Tables.Regions))
+	updsPerRegion := make([]int, len(ti.Tables.Regions))
 
 	for i := range nationMap {
 		nationMap[i] = make(map[int8]map[int32]*float64)
 		totalSumMap[i] = make(map[int8]*float64)
 	}
-	for _, nation := range procTables.Nations {
+	for _, nation := range ti.Tables.Nations {
 		nationMap[nation.N_REGIONKEY][nation.N_NATIONKEY] = make(map[int32]*float64)
 		totalSumMap[nation.N_REGIONKEY][nation.N_NATIONKEY] = new(float64)
 		updsPerRegion[nation.N_REGIONKEY]++ //Each nation has at least 1 upd (totalSum)
@@ -358,21 +412,25 @@ func prepareQ11IndexLocal() (upds [][]antidote.UpdateObjectParams) {
 
 	var supplier *Supplier
 	var regionK int8
-	for _, partSup := range procTables.PartSupps {
-		supplier = procTables.Suppliers[partSup.PS_SUPPKEY]
-		regionK = procTables.Nations[supplier.S_NATIONKEY].N_REGIONKEY
-		updsPerRegion[regionK] += q11CalcHelper(nationMap[regionK], totalSumMap[regionK], partSup, supplier)
+	for _, partSup := range ti.Tables.PartSupps {
+		supplier = ti.Tables.Suppliers[partSup.PS_SUPPKEY]
+		regionK = ti.Tables.Nations[supplier.S_NATIONKEY].N_REGIONKEY
+		updsPerRegion[regionK] += ti.q11CalcHelper(nationMap[regionK], totalSumMap[regionK], partSup, supplier)
 	}
 
-	upds = make([][]antidote.UpdateObjectParams, len(procTables.Regions))
+	for _, updsR := range updsPerRegion {
+		updsDone += updsR
+	}
+
+	upds = make([][]antidote.UpdateObjectParams, len(ti.Tables.Regions))
 	for i := range upds {
-		upds[i] = makeQ11IndexUpds(nationMap[i], totalSumMap[i], updsPerRegion[i], INDEX_BKT+i)
+		upds[i] = ti.makeQ11IndexUpds(nationMap[i], totalSumMap[i], updsPerRegion[i], INDEX_BKT+i)
 	}
 
 	return
 }
 
-func prepareQ11Index() (upds []antidote.UpdateObjectParams) {
+func (ti TableInfo) prepareQ11Index() (upds []antidote.UpdateObjectParams, updsDone int) {
 	//2.4.11:	sum: ps_supplycost * ps_availqty
 	//Group by (part, nation). Nation is the supplier nation.
 	//The query itself only wants the groups for a given nation in which the sum represents >= 0.01%/SF of
@@ -392,23 +450,23 @@ func prepareQ11Index() (upds []antidote.UpdateObjectParams) {
 	totalSumMap := make(map[int8]*float64)
 
 	//Preparing maps for each nation
-	for _, nation := range procTables.Nations {
+	for _, nation := range ti.Tables.Nations {
 		nationMap[nation.N_NATIONKEY] = make(map[int32]*float64)
 		totalSumMap[nation.N_NATIONKEY] = new(float64)
 	}
 
 	var supplier *Supplier
-	nUpds := len(procTables.Nations) //Assuming all nations have at least one supplier. Initial value corresponds to the number of nations
+	nUpds := len(ti.Tables.Nations) //Assuming all nations have at least one supplier. Initial value corresponds to the number of nations
 	//Calculate totals
-	for _, partSup := range procTables.PartSupps {
-		supplier = procTables.Suppliers[partSup.PS_SUPPKEY]
-		nUpds += q11CalcHelper(nationMap, totalSumMap, partSup, supplier)
+	for _, partSup := range ti.Tables.PartSupps {
+		supplier = ti.Tables.Suppliers[partSup.PS_SUPPKEY]
+		nUpds += ti.q11CalcHelper(nationMap, totalSumMap, partSup, supplier)
 	}
 
-	return makeQ11IndexUpds(nationMap, totalSumMap, nUpds, INDEX_BKT)
+	return ti.makeQ11IndexUpds(nationMap, totalSumMap, nUpds, INDEX_BKT), nUpds
 }
 
-func q11CalcHelper(nationMap map[int8]map[int32]*float64, totalSumMap map[int8]*float64, partSup *PartSupp, supplier *Supplier) (nUpds int) {
+func (ti TableInfo) q11CalcHelper(nationMap map[int8]map[int32]*float64, totalSumMap map[int8]*float64, partSup *PartSupp, supplier *Supplier) (nUpds int) {
 	//Calculate totals
 	partMap := nationMap[supplier.S_NATIONKEY]
 	currSum, has := partMap[partSup.PS_PARTKEY]
@@ -424,35 +482,37 @@ func q11CalcHelper(nationMap map[int8]map[int32]*float64, totalSumMap map[int8]*
 	return
 }
 
-func prepareQ14IndexLocal() (upds [][]antidote.UpdateObjectParams) {
-	mapPromo, mapTotal := make([]map[string]*float64, len(procTables.Regions)), make([]map[string]*float64, len(procTables.Regions))
-	inPromo := procTables.PromoParts
+func (ti TableInfo) prepareQ14IndexLocal() (upds [][]antidote.UpdateObjectParams, updsDone int) {
+	mapPromo, mapTotal := make([]map[string]*float64, len(ti.Tables.Regions)), make([]map[string]*float64, len(ti.Tables.Regions))
+	inPromo := ti.Tables.PromoParts
 
 	for i := range mapPromo {
 		mapPromo[i], mapTotal[i] = createQ14Maps()
 	}
 
 	regionKey := int8(0)
-	orders := procTables.Orders
+	orders := ti.Tables.Orders
 	if orders[0] == nil {
 		//Happens only for the initial data
 		orders = orders[1:]
 	}
-	//for i, orderItems := range procTables.LineItems[1:] {
-	for i, orderItems := range procTables.LineItems {
-		//regionKey = procTables.OrderkeyToRegionkey(procTables.Orders[i+1].O_ORDERKEY)
-		regionKey = procTables.OrderkeyToRegionkey(orders[i].O_ORDERKEY)
-		q14CalcHelper(orderItems, mapPromo[regionKey], mapTotal[regionKey], inPromo)
+	//for i, orderItems := range ti.Tables.LineItems[1:] {
+	for i, orderItems := range ti.Tables.LineItems {
+		//regionKey = ti.Tables.OrderkeyToRegionkey(ti.Tables.Orders[i+1].O_ORDERKEY)
+		regionKey = ti.Tables.OrderkeyToRegionkey(orders[i].O_ORDERKEY)
+		ti.q14CalcHelper(orderItems, mapPromo[regionKey], mapTotal[regionKey], inPromo)
 	}
 
-	upds = make([][]antidote.UpdateObjectParams, len(procTables.Regions))
+	upds = make([][]antidote.UpdateObjectParams, len(ti.Tables.Regions))
 	for i := range upds {
-		upds[i] = makeQ14IndexUpds(mapPromo[i], mapTotal[i], INDEX_BKT+i)
+		upds[i] = ti.makeQ14IndexUpds(mapPromo[i], mapTotal[i], INDEX_BKT+i)
 	}
+	//NRegions * years (1993-1997) * months (1-12)
+	updsDone = len(ti.Tables.Regions) * 5 * 12
 	return
 }
 
-func prepareQ14Index() (upds []antidote.UpdateObjectParams) {
+func (ti TableInfo) prepareQ14Index() (upds []antidote.UpdateObjectParams, updsDone int) {
 	//Avg CRDT
 	//sum + count (or mix together if possible): l_extendedprice * (1 - l_discount), when p_type starts with "PROMO"
 	//Group by month (l_shipdate). Asked date always starts at the 1st day of a given month, between 1993 and 1997.
@@ -463,19 +523,19 @@ func prepareQ14Index() (upds []antidote.UpdateObjectParams) {
 	//Likelly we should even go through all the parts first to achieve that
 	//Then go through lineItem, check with the map, and update the correct sums
 
-	inPromo := procTables.PromoParts
+	inPromo := ti.Tables.PromoParts
 	mapPromo, mapTotal := createQ14Maps()
 
 	//Going through lineitem and updating the totals
-	for _, orderItems := range procTables.LineItems {
-		//for _, orderItems := range procTables.LineItems[1:] {
-		q14CalcHelper(orderItems, mapPromo, mapTotal, inPromo)
+	for _, orderItems := range ti.Tables.LineItems {
+		//for _, orderItems := range ti.Tables.LineItems[1:] {
+		ti.q14CalcHelper(orderItems, mapPromo, mapTotal, inPromo)
 	}
 
-	return makeQ14IndexUpds(mapPromo, mapTotal, INDEX_BKT)
+	return ti.makeQ14IndexUpds(mapPromo, mapTotal, INDEX_BKT), len(mapPromo)
 }
 
-func q14CalcHelper(orderItems []*LineItem, mapPromo map[string]*float64, mapTotal map[string]*float64, inPromo map[int32]struct{}) {
+func (ti TableInfo) q14CalcHelper(orderItems []*LineItem, mapPromo map[string]*float64, mapTotal map[string]*float64, inPromo map[int32]struct{}) {
 	var year int16
 	revenue := 0.0
 	date := ""
@@ -507,9 +567,9 @@ func createQ14Maps() (mapPromo map[string]*float64, mapTotal map[string]*float64
 	return
 }
 
-func prepareQ15IndexLocal() (upds [][]antidote.UpdateObjectParams) {
-	yearMap := make([]map[int16]map[int8]map[int32]*float64, len(procTables.Regions))
-	nUpds := make([]int, len(procTables.Regions))
+func (ti TableInfo) prepareQ15IndexLocal() (upds [][]antidote.UpdateObjectParams, updsDone int) {
+	yearMap := make([]map[int16]map[int8]map[int32]*float64, len(ti.Tables.Regions))
+	nUpds := make([]int, len(ti.Tables.Regions))
 	q15LocalMap = yearMap
 
 	for i := range yearMap {
@@ -517,28 +577,33 @@ func prepareQ15IndexLocal() (upds [][]antidote.UpdateObjectParams) {
 	}
 
 	rKey := int8(0)
-	orders := procTables.Orders
+	orders := ti.Tables.Orders
 	if orders[0] == nil {
 		//Happens only for the initial data
 		orders = orders[1:]
 	}
-	for i, orderItems := range procTables.LineItems {
-		//for i, orderItems := range procTables.LineItems[1:] {
-		//rKey = procTables.OrderkeyToRegionkey(procTables.Orders[i+1].O_ORDERKEY)
-		rKey = procTables.OrderkeyToRegionkey(orders[i].O_ORDERKEY)
-		nUpds[rKey] += q15CalcHelper(orderItems, yearMap[rKey])
+
+	for i, orderItems := range ti.Tables.LineItems {
+		//for i, orderItems := range ti.Tables.LineItems[1:] {
+		//rKey = ti.Tables.OrderkeyToRegionkey(ti.Tables.Orders[i+1].O_ORDERKEY)
+		rKey = ti.Tables.OrderkeyToRegionkey(orders[i].O_ORDERKEY)
+		nUpds[rKey] += ti.q15CalcHelper(orderItems, yearMap[rKey])
 	}
 
-	upds = make([][]antidote.UpdateObjectParams, len(procTables.Regions))
+	for _, nUpdsR := range nUpds {
+		updsDone += nUpdsR
+	}
+
+	upds = make([][]antidote.UpdateObjectParams, len(ti.Tables.Regions))
 	for i := range upds {
-		upds[i] = makeQ15IndexUpds(yearMap[i], nUpds[i], INDEX_BKT+i)
+		upds[i] = ti.makeQ15IndexUpds(yearMap[i], nUpds[i], INDEX_BKT+i)
 	}
 
 	return
 }
 
 //TODO: Can I really assume that quarters are Jan-Mar, Apr-Jun, Jul-Sep, Oct-Dec?
-func prepareQ15Index() (upds []antidote.UpdateObjectParams) {
+func (ti TableInfo) prepareQ15Index() (upds []antidote.UpdateObjectParams, updsDone int) {
 	//2.4.15: topk: sum(l_extendedprice * (1-l_discount))
 	//Group by month. The sum corresponds to the revenue shipped by a supplier during a given quarter of the year.
 	//Date can start between first month of 1993 and 10th month of 1997 (first day always)
@@ -549,14 +614,14 @@ func prepareQ15Index() (upds []antidote.UpdateObjectParams) {
 
 	nUpds := 0 //Assuming each quarter has at least one supplier
 
-	for _, orderItems := range procTables.LineItems {
-		nUpds += q15CalcHelper(orderItems, yearMap)
+	for _, orderItems := range ti.Tables.LineItems {
+		nUpds += ti.q15CalcHelper(orderItems, yearMap)
 	}
 
-	return makeQ15IndexUpds(yearMap, nUpds, INDEX_BKT)
+	return ti.makeQ15IndexUpds(yearMap, nUpds, INDEX_BKT), nUpds
 }
 
-func q15CalcHelper(orderItems []*LineItem, yearMap map[int16]map[int8]map[int32]*float64) (nUpds int) {
+func (ti TableInfo) q15CalcHelper(orderItems []*LineItem, yearMap map[int16]map[int8]map[int32]*float64) (nUpds int) {
 	var year int16
 	var month int8
 	var suppMap map[int32]*float64
@@ -594,35 +659,47 @@ func createQ15Map() (yearMap map[int16]map[int8]map[int32]*float64) {
 	return
 }
 
-func prepareQ18IndexLocal() (upds [][]antidote.UpdateObjectParams) {
-	quantityMap := make([]map[int32]map[int32]*PairInt, len(procTables.Regions))
+func (ti TableInfo) prepareQ18IndexLocal() (upds [][]antidote.UpdateObjectParams, updsDone int) {
+	quantityMap := make([]map[int32]map[int32]*PairInt, len(ti.Tables.Regions))
 	for i := range quantityMap {
 		quantityMap[i] = map[int32]map[int32]*PairInt{312: make(map[int32]*PairInt), 313: make(map[int32]*PairInt),
 			314: make(map[int32]*PairInt), 315: make(map[int32]*PairInt)}
 	}
 
 	regionKey := int8(0)
-	orders := procTables.Orders
+	orders := ti.Tables.Orders
 	if orders[0] == nil {
 		//Happens only for the initial data
 		orders = orders[1:]
 	}
 	for i, order := range orders {
-		//for i, order := range procTables.Orders[1:] {
-		regionKey = procTables.OrderkeyToRegionkey(order.O_ORDERKEY)
-		q18CalcHelper(quantityMap[regionKey], order, i)
+		//for i, order := range ti.Tables.Orders[1:] {
+		regionKey = ti.Tables.OrderkeyToRegionkey(order.O_ORDERKEY)
+		ti.q18CalcHelper(quantityMap[regionKey], order, i)
 	}
 
-	upds = make([][]antidote.UpdateObjectParams, len(procTables.Regions))
+	upds = make([][]antidote.UpdateObjectParams, len(ti.Tables.Regions))
 	for i := range upds {
-		upds[i] = makeQ18IndexUpds(quantityMap[i], INDEX_BKT+i)
+		upds[i] = ti.makeQ18IndexUpds(quantityMap[i], INDEX_BKT+i)
 	}
+
+	if useTopKAll {
+		for _, innerMap := range quantityMap {
+			updsDone += min(len(innerMap[312]), 1) + min(len(innerMap[313]), 1) + min(len(innerMap[314]), 1) + min(len(innerMap[315]), 1)
+		}
+
+	} else {
+		for _, innerMap := range quantityMap {
+			updsDone += len(innerMap[312]) + len(innerMap[313]) + len(innerMap[314]) + len(innerMap[315])
+		}
+	}
+
 	return
 }
 
 //TODO: This likelly could be reimplemented with only 1 topK and using the query of "above value".
 //Albeit that potencially would imply downloading more than 100 customers.
-func prepareQ18Index() (upds []antidote.UpdateObjectParams) {
+func (ti TableInfo) prepareQ18Index() (upds []antidote.UpdateObjectParams, updsDone int) {
 	//2.4.18: topk with 100 elements: o_totalprice, o_orderdate
 	//Group by l_quantity. Theorically only need quantities between 312 and 315.
 	//Ideally we would store c_custKey + "_" + o_orderKey, and then fetch each one. For now, we're only storing o_orderKey.
@@ -635,7 +712,7 @@ func prepareQ18Index() (upds []antidote.UpdateObjectParams) {
 	quantityMap[314] = make(map[int32]*PairInt)
 	quantityMap[315] = make(map[int32]*PairInt)
 
-	orders := procTables.Orders
+	orders := ti.Tables.Orders
 	if orders[0] == nil {
 		//Happens only for the initial data
 		orders = orders[1:]
@@ -643,9 +720,9 @@ func prepareQ18Index() (upds []antidote.UpdateObjectParams) {
 	//Going through orders and, for each order, checking all its lineitems
 	//Doing the other way around is possible but would require a map of order -> quantity.
 	//Let's do both and then choose one
-	//for i, order := range procTables.Orders[1:] {
+	//for i, order := range ti.Tables.Orders[1:] {
 	for i, order := range orders {
-		q18CalcHelper(quantityMap, order, i)
+		ti.q18CalcHelper(quantityMap, order, i)
 	}
 
 	/*
@@ -658,11 +735,11 @@ func prepareQ18Index() (upds []antidote.UpdateObjectParams) {
 		var holderPair PairInt	//Used to host a new pair that is being created
 		var has bool
 		//First, acumulate total quantities per order
-		for i := 1; i < len(procTables.LineItems); i++ {
-			item = procTables[i]
+		for i := 1; i < len(ti.Tables.LineItems); i++ {
+			item = ti.Tables[i]
 			if item == nil {
 				//Skip remaining positions for the order, which will also be nil
-				i += procTables.MaxOrderLineitems - lastLineItemId
+				i += ti.Tables.MaxOrderLineitems - lastLineItemId
 				continue
 			}
 			//lineItem not nil, process
@@ -678,7 +755,7 @@ func prepareQ18Index() (upds []antidote.UpdateObjectParams) {
 		//Now, go through all orders and store in the respective maps
 		for orderKey, pair := range orderMap {
 			if pair.second >= 312 {
-				pair.first = procTables[GetOrderIndex(orderKey)].O_CUSTKEY
+				pair.first = ti.Tables[GetOrderIndex(orderKey)].O_CUSTKEY
 				for minQ, orderQuantityMap := range quantityMap {
 					if pair.second >= minQ {
 						orderQuantityMap[orderKey] = pair
@@ -689,13 +766,18 @@ func prepareQ18Index() (upds []antidote.UpdateObjectParams) {
 			}
 		}
 	*/
+	if useTopKAll {
+		updsDone = min(len(quantityMap[312]), 1) + min(len(quantityMap[313]), 1) + min(len(quantityMap[314]), 1) + min(len(quantityMap[315]), 1)
+	} else {
+		updsDone = len(quantityMap[312]) + len(quantityMap[313]) + len(quantityMap[314]) + len(quantityMap[315])
+	}
 
-	return makeQ18IndexUpds(quantityMap, INDEX_BKT)
+	return ti.makeQ18IndexUpds(quantityMap, INDEX_BKT), updsDone
 }
 
-func q18CalcHelper(quantityMap map[int32]map[int32]*PairInt, order *Orders, index int) {
+func (ti TableInfo) q18CalcHelper(quantityMap map[int32]map[int32]*PairInt, order *Orders, index int) {
 	currQuantity := int32(0)
-	orderItems := procTables.LineItems[index]
+	orderItems := ti.Tables.LineItems[index]
 	for _, item := range orderItems {
 		currQuantity += int32(item.L_QUANTITY)
 	}
@@ -712,7 +794,7 @@ func q18CalcHelper(quantityMap map[int32]map[int32]*PairInt, order *Orders, inde
 	}
 }
 
-func makeQ3IndexUpds(sumMap map[string]map[int8]map[int32]*float64, nUpds int, bucketI int) (upds []antidote.UpdateObjectParams) {
+func (ti TableInfo) makeQ3IndexUpds(sumMap map[string]map[int8]map[int32]*float64, nUpds int, bucketI int) (upds []antidote.UpdateObjectParams) {
 	upds = make([]antidote.UpdateObjectParams, nUpds)
 	var keyArgs antidote.KeyParams
 	i := 0
@@ -729,7 +811,7 @@ func makeQ3IndexUpds(sumMap map[string]map[int8]map[int32]*float64, nUpds int, b
 				if !useTopKAll {
 					for orderKey, sum := range dayMap {
 						var currUpd crdt.UpdateArguments = crdt.TopKAdd{TopKScore: crdt.TopKScore{Id: orderKey, Score: int32(*sum),
-							Data: packQ3IndexExtraData(orderKey)}}
+							Data: ti.packQ3IndexExtraDataFromKey(orderKey)}}
 						upds[i] = antidote.UpdateObjectParams{KeyParams: keyArgs, UpdateArgs: &currUpd}
 						i++
 					}
@@ -737,7 +819,7 @@ func makeQ3IndexUpds(sumMap map[string]map[int8]map[int32]*float64, nUpds int, b
 					adds := make([]crdt.TopKScore, len(dayMap))
 					j := 0
 					for orderKey, sum := range dayMap {
-						adds[j] = crdt.TopKScore{Id: orderKey, Score: int32(*sum), Data: packQ3IndexExtraData(orderKey)}
+						adds[j] = crdt.TopKScore{Id: orderKey, Score: int32(*sum), Data: ti.packQ3IndexExtraDataFromKey(orderKey)}
 						j++
 					}
 					var currUpd crdt.UpdateArguments = crdt.TopKAddAll{Scores: adds}
@@ -776,11 +858,11 @@ func makeQ3IndexUpds(sumMap map[string]map[int8]map[int32]*float64, nUpds int, b
 			}
 		}
 	}
-	fmt.Println(nUpds)
+	//fmt.Println(nUpds)
 	return
 }
 
-func makeQ5IndexUpds(sumMap map[int8]map[int16]map[int8]*float64, bucketI int) (upds []antidote.UpdateObjectParams) {
+func (ti TableInfo) makeQ5IndexUpds(sumMap map[int8]map[int16]map[int8]*float64, bucketI int) (upds []antidote.UpdateObjectParams) {
 	//TODO: Actually have a CRDT to store a float instead of an int
 	//Prepare the updates. *5 as there's 5 years and we'll do a embMapCRDT for each (region, year)
 	upds = make([]antidote.UpdateObjectParams, len(sumMap)*5)
@@ -788,12 +870,12 @@ func makeQ5IndexUpds(sumMap map[int8]map[int16]map[int8]*float64, bucketI int) (
 	years := []string{"1993", "1994", "1995", "1996", "1997"}
 	regS := ""
 	for regK, regionMap := range sumMap {
-		regS = NATION_REVENUE + procTables.Regions[regK].R_NAME
+		regS = NATION_REVENUE + ti.Tables.Regions[regK].R_NAME
 		for year = 1993; year <= 1997; year++ {
 			yearMap := regionMap[year]
 			regDateUpd := crdt.EmbMapUpdateAll{Upds: make(map[string]crdt.UpdateArguments)}
 			for natK, value := range yearMap {
-				regDateUpd.Upds[procTables.Nations[natK].N_NAME] = crdt.Increment{Change: int32(*value)}
+				regDateUpd.Upds[ti.Tables.Nations[natK].N_NAME] = crdt.Increment{Change: int32(*value)}
 			}
 			var args crdt.UpdateArguments = regDateUpd
 			upds[i] = antidote.UpdateObjectParams{
@@ -803,13 +885,15 @@ func makeQ5IndexUpds(sumMap map[int8]map[int16]map[int8]*float64, bucketI int) (
 			i++
 		}
 	}
-	fmt.Println(len(sumMap) * 5)
+	//fmt.Println(len(sumMap) * 5)
 	return
 }
 
-func makeQ11IndexUpds(nationMap map[int8]map[int32]*float64, totalSumMap map[int8]*float64, nUpds, bucketI int) (upds []antidote.UpdateObjectParams) {
+func (ti TableInfo) makeQ11IndexUpds(nationMap map[int8]map[int32]*float64, totalSumMap map[int8]*float64, nUpds, bucketI int) (upds []antidote.UpdateObjectParams) {
 	//Preparing updates for the topK CRDTs
-	//TODO: TopKAddAll for optimization purposes
+	if useTopKAll {
+		nUpds = len(nationMap) + len(totalSumMap)
+	}
 	upds = make([]antidote.UpdateObjectParams, nUpds)
 	//var currUpd crdt.UpdateArguments
 	var keyArgs antidote.KeyParams
@@ -817,7 +901,7 @@ func makeQ11IndexUpds(nationMap map[int8]map[int32]*float64, totalSumMap map[int
 
 	for natKey, partMap := range nationMap {
 		keyArgs = antidote.KeyParams{
-			Key:      IMP_SUPPLY + procTables.Nations[natKey].N_NAME,
+			Key:      IMP_SUPPLY + ti.Tables.Nations[natKey].N_NAME,
 			CrdtType: proto.CRDTType_TOPK_RMV,
 			Bucket:   buckets[bucketI],
 		}
@@ -838,13 +922,14 @@ func makeQ11IndexUpds(nationMap map[int8]map[int32]*float64, totalSumMap map[int
 			var currUpd crdt.UpdateArguments = crdt.TopKAddAll{Scores: adds}
 			upds[i] = antidote.UpdateObjectParams{KeyParams: keyArgs, UpdateArgs: &currUpd}
 			i++
+
 		}
 	}
 
 	//Preparing updates for the counter CRDTs
 	for natKey, value := range totalSumMap {
 		keyArgs = antidote.KeyParams{
-			Key:      SUM_SUPPLY + procTables.Nations[natKey].N_NAME,
+			Key:      SUM_SUPPLY + ti.Tables.Nations[natKey].N_NAME,
 			CrdtType: proto.CRDTType_COUNTER,
 			Bucket:   buckets[bucketI],
 		}
@@ -854,11 +939,11 @@ func makeQ11IndexUpds(nationMap map[int8]map[int32]*float64, totalSumMap map[int
 		i++
 	}
 
-	fmt.Println(nUpds)
+	//fmt.Println(nUpds)
 	return
 }
 
-func makeQ14IndexUpds(mapPromo map[string]*float64, mapTotal map[string]*float64, bucketI int) (upds []antidote.UpdateObjectParams) {
+func (ti TableInfo) makeQ14IndexUpds(mapPromo map[string]*float64, mapTotal map[string]*float64, bucketI int) (upds []antidote.UpdateObjectParams) {
 	//Create the updates
 	upds = make([]antidote.UpdateObjectParams, len(mapPromo), len(mapPromo))
 	i := 0
@@ -874,12 +959,11 @@ func makeQ14IndexUpds(mapPromo map[string]*float64, mapTotal map[string]*float64
 		}
 		i++
 	}
-	fmt.Println(len(mapPromo))
-	//upds = upds[:40]
+	//fmt.Println(len(mapPromo))
 	return
 }
 
-func makeQ15IndexUpds(yearMap map[int16]map[int8]map[int32]*float64, nUpds int, bucketI int) (upds []antidote.UpdateObjectParams) {
+func (ti TableInfo) makeQ15IndexUpds(yearMap map[int16]map[int8]map[int32]*float64, nUpds int, bucketI int) (upds []antidote.UpdateObjectParams) {
 	//Create the updates. Always 20 updates if doing with TopKAddAll (5 years * 4 months)
 	if useTopKAll {
 		nUpds = 20
@@ -920,14 +1004,14 @@ func makeQ15IndexUpds(yearMap map[int16]map[int8]map[int32]*float64, nUpds int, 
 
 		}
 	}
-	fmt.Println(nUpds)
+	//fmt.Println(nUpds)
 	return
 }
 
-func makeQ18IndexUpds(quantityMap map[int32]map[int32]*PairInt, bucketI int) (upds []antidote.UpdateObjectParams) {
+func (ti TableInfo) makeQ18IndexUpds(quantityMap map[int32]map[int32]*PairInt, bucketI int) (upds []antidote.UpdateObjectParams) {
 	nUpds := 0
 	if useTopKAll {
-		nUpds = 4
+		nUpds = min(len(quantityMap[312]), 1) + min(len(quantityMap[313]), 1) + min(len(quantityMap[314]), 1) + min(len(quantityMap[315]), 1)
 	} else {
 		nUpds = len(quantityMap[312]) + len(quantityMap[313]) + len(quantityMap[314]) + len(quantityMap[315])
 	}
@@ -961,9 +1045,11 @@ func makeQ18IndexUpds(quantityMap map[int32]map[int32]*PairInt, bucketI int) (up
 					adds[j] = crdt.TopKScore{Id: orderKey, Score: pair.second}
 					j++
 				}
-				var currUpd crdt.UpdateArguments = crdt.TopKAddAll{Scores: adds}
-				upds[i] = antidote.UpdateObjectParams{KeyParams: keyArgs, UpdateArgs: &currUpd}
-				i++
+				if j > 0 {
+					var currUpd crdt.UpdateArguments = crdt.TopKAddAll{Scores: adds}
+					upds[i] = antidote.UpdateObjectParams{KeyParams: keyArgs, UpdateArgs: &currUpd}
+					i++
+				}
 			}
 		}
 	} else {
@@ -979,7 +1065,7 @@ func makeQ18IndexUpds(quantityMap map[int32]map[int32]*PairInt, bucketI int) (up
 					var currUpd crdt.UpdateArguments = crdt.TopKAdd{TopKScore: crdt.TopKScore{
 						Id:    orderKey,
 						Score: pair.second,
-						Data:  packQ18IndexExtraData(orderKey),
+						Data:  ti.packQ18IndexExtraDataFromKey(orderKey),
 					}}
 					upds[i] = antidote.UpdateObjectParams{KeyParams: keyArgs, UpdateArgs: &currUpd}
 					i++
@@ -988,22 +1074,33 @@ func makeQ18IndexUpds(quantityMap map[int32]map[int32]*PairInt, bucketI int) (up
 				adds := make([]crdt.TopKScore, len(orderMap))
 				j := 0
 				for orderKey, pair := range orderMap {
-					adds[j] = crdt.TopKScore{Id: orderKey, Score: pair.second, Data: packQ18IndexExtraData(orderKey)}
+					adds[j] = crdt.TopKScore{Id: orderKey, Score: pair.second, Data: ti.packQ18IndexExtraDataFromKey(orderKey)}
 					j++
 				}
-				var currUpd crdt.UpdateArguments = crdt.TopKAddAll{Scores: adds}
-				upds[i] = antidote.UpdateObjectParams{KeyParams: keyArgs, UpdateArgs: &currUpd}
-				i++
+				if j > 0 {
+					var currUpd crdt.UpdateArguments = crdt.TopKAddAll{Scores: adds}
+					upds[i] = antidote.UpdateObjectParams{KeyParams: keyArgs, UpdateArgs: &currUpd}
+					i++
+				}
 			}
 		}
 	}
-	fmt.Println(nUpds)
+	//fmt.Println(nUpds)
 
 	return
 }
 
-func packQ3IndexExtraData(orderKey int32) (data *[]byte) {
-	order := procTables.Orders[procTables.GetOrderIndex(orderKey)]
+func (ti TableInfo) packQ3IndexExtraDataFromKey(orderKey int32) (data *[]byte) {
+	return packQ3IndexExtraData(ti.Tables.Orders[ti.Tables.GetOrderIndex(orderKey)])
+}
+
+func (ti TableInfo) packQ18IndexExtraDataFromKey(orderKey int32) (data *[]byte) {
+	order := ti.Tables.Orders[ti.Tables.GetOrderIndex(orderKey)]
+	cust := ti.Tables.Customers[order.O_CUSTKEY]
+	return packQ18IndexExtraData(order, cust)
+}
+
+func packQ3IndexExtraData(order *Orders) (data *[]byte) {
 	date := order.O_ORDERDATE
 	var build strings.Builder
 	build.WriteString(strconv.FormatInt(int64(date.YEAR), 10))
@@ -1017,9 +1114,7 @@ func packQ3IndexExtraData(orderKey int32) (data *[]byte) {
 	return &buf
 }
 
-func packQ18IndexExtraData(orderKey int32) (data *[]byte) {
-	order := procTables.Orders[procTables.GetOrderIndex(orderKey)]
-	customer := procTables.Customers[order.O_CUSTKEY]
+func packQ18IndexExtraData(order *Orders, customer *Customer) (data *[]byte) {
 	date := order.O_ORDERDATE
 	var build strings.Builder
 	build.WriteString(customer.C_NAME)

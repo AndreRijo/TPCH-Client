@@ -144,6 +144,14 @@ type Tables struct {
 	LastAddedLineItems [][]*LineItem
 	//Pos of the last order that was deleted from the original table
 	LastDeletedPos int
+
+	//Variables as well since they're different depending if we're working on single-server or multi-server modes
+	NationkeyToRegionkey func(int64) int8
+	SuppkeyToRegionkey   func(int64) int8
+	CustkeyToRegionkey   func(int64) int8
+	Custkey32ToRegionkey func(int32) int8
+	OrderkeyToRegionkey  func(int32) int8
+	OrderToRegionkey     func(*Orders) int8
 }
 
 //*****Auxiliary data types*****//
@@ -200,6 +208,33 @@ func (date *Date) isSmallerOrEqual(otherDate *Date) bool {
 	return true
 }
 
+func (tab *Tables) GetShallowCopy() (copyTables *Tables) {
+	return &Tables{
+		Customers:            tab.Customers,
+		LineItems:            tab.LineItems,
+		Nations:              tab.Nations,
+		Orders:               tab.Orders,
+		Parts:                tab.Parts,
+		PartSupps:            tab.PartSupps,
+		Regions:              tab.Regions,
+		Suppliers:            tab.Suppliers,
+		MaxOrderLineitems:    tab.MaxOrderLineitems,
+		Segments:             tab.Segments,
+		PromoParts:           tab.PromoParts,
+		orderToRegionFun:     tab.orderToRegionFun,
+		orderIndexFun:        tab.orderIndexFun,
+		LastDeletedPos:       tab.LastDeletedPos,
+		LastAddedOrders:      tab.LastAddedOrders,
+		LastAddedLineItems:   tab.LastAddedLineItems,
+		NationkeyToRegionkey: tab.NationkeyToRegionkey,
+		SuppkeyToRegionkey:   tab.SuppkeyToRegionkey,
+		CustkeyToRegionkey:   tab.CustkeyToRegionkey,
+		Custkey32ToRegionkey: tab.Custkey32ToRegionkey,
+		OrderkeyToRegionkey:  tab.OrderkeyToRegionkey,
+		OrderToRegionkey:     tab.OrderToRegionkey,
+	}
+}
+
 func CreateClientTables(rawData [][][]string) (tables *Tables) {
 	startTime := time.Now().UnixNano() / 1000000
 	lineItems, maxOrderLineitems := createLineitemTable(rawData[1], len(rawData[3]))
@@ -215,13 +250,50 @@ func CreateClientTables(rawData [][][]string) (tables *Tables) {
 		MaxOrderLineitems: maxOrderLineitems,
 		Segments:          createSegmentsList(),
 	}
+	if isMulti {
+		tables.NationkeyToRegionkey = tables.nationkeyToRegionkey
+		tables.SuppkeyToRegionkey = tables.suppkeyToRegionkey
+		tables.CustkeyToRegionkey = tables.custkeyToRegionkey
+		tables.Custkey32ToRegionkey = tables.custkey32ToRegionkey
+		tables.OrderkeyToRegionkey = tables.orderkeyToRegionkey
+		tables.OrderToRegionkey = tables.orderToRegionkey
+	} else {
+		tables.NationkeyToRegionkey = tables.singleServerToRegionkey
+		tables.SuppkeyToRegionkey = tables.singleServerToRegionkey
+		tables.CustkeyToRegionkey = tables.singleServerToRegionkey
+		tables.Custkey32ToRegionkey = tables.singleServer32ToRegionkey
+		tables.OrderkeyToRegionkey = tables.singleServer32ToRegionkey
+		tables.OrderToRegionkey = tables.singleServerOrderToRegionkey
+	}
 	tables.PromoParts = calculatePromoParts(tables.Parts)
 	tables.orderToRegionFun = tables.orderkeyToRegionkeyMultiple
 	tables.orderIndexFun = tables.getFullOrderIndex
-	tables.LastDeletedPos = 0
+	tables.LastDeletedPos = 1
 	endTime := time.Now().UnixNano() / 1000000
 	fmt.Println("Time taken to process tables:", endTime-startTime, "ms")
 	return
+}
+
+func (tab *Tables) InitConstants() {
+	tab.Segments = createSegmentsList()
+	tab.orderToRegionFun = tab.orderkeyToRegionkeyMultiple
+	tab.orderIndexFun = tab.getFullOrderIndex
+	tab.LastDeletedPos = 1
+	if isMulti {
+		tab.NationkeyToRegionkey = tab.nationkeyToRegionkey
+		tab.SuppkeyToRegionkey = tab.suppkeyToRegionkey
+		tab.CustkeyToRegionkey = tab.custkeyToRegionkey
+		tab.Custkey32ToRegionkey = tab.custkey32ToRegionkey
+		tab.OrderkeyToRegionkey = tab.orderkeyToRegionkey
+		tab.OrderToRegionkey = tab.orderToRegionkey
+	} else {
+		tab.NationkeyToRegionkey = tab.singleServerToRegionkey
+		tab.SuppkeyToRegionkey = tab.singleServerToRegionkey
+		tab.CustkeyToRegionkey = tab.singleServerToRegionkey
+		tab.Custkey32ToRegionkey = tab.singleServer32ToRegionkey
+		tab.OrderkeyToRegionkey = tab.singleServer32ToRegionkey
+		tab.OrderToRegionkey = tab.singleServerOrderToRegionkey
+	}
 }
 
 func (tab *Tables) FillOrdersToRegion(updOrders [][]string) {
@@ -242,7 +314,7 @@ func (tab *Tables) FillOrdersToRegion(updOrders [][]string) {
 
 func createCustomerTable(cTable [][]string) (customers []*Customer) {
 	//Customers IDs are 1 -> n, so we reserve an extra empty space at start
-	fmt.Println("Creating customer table")
+	//fmt.Println("Creating customer table")
 	customers = make([]*Customer, len(cTable)+1)
 	var nationKey int64
 	for i, entry := range cTable {
@@ -262,7 +334,7 @@ func createCustomerTable(cTable [][]string) (customers []*Customer) {
 }
 
 func createLineitemTable(liTable [][]string, nOrders int) (lineItems [][]*LineItem, maxLineItem int32) {
-	fmt.Println("Creating lineItem table with size", nOrders)
+	//fmt.Println("Creating lineItem table with size", nOrders)
 	maxLineItem = 8
 
 	lineItems = make([][]*LineItem, nOrders)
@@ -308,9 +380,6 @@ func createLineitemTable(liTable [][]string, nOrders int) (lineItems [][]*LineIt
 
 		//Check if it belongs to a new order
 		if convOrderKey != currOrderID {
-			if nOrders < 1000 {
-				fmt.Println(currOrderID, bufOrder)
-			}
 			//Add everything in the buffer apart from the new one to the table
 			newLine = make([]*LineItem, bufI)
 			for k, item := range bufItems[:bufI] {
@@ -327,10 +396,11 @@ func createLineitemTable(liTable [][]string, nOrders int) (lineItems [][]*LineIt
 		//fmt.Println(orderKey)
 	}
 
-	fmt.Println("Last order for lineitemTable: ", bufItems[bufI-1])
-	fmt.Println("Last order already in table:", lineItems[bufOrder-1][len(lineItems[bufOrder-1])-1])
-	fmt.Println(currOrderID, bufOrder)
+	//fmt.Println("Last order for lineitemTable: ", bufItems[bufI-1])
+	//fmt.Println("Last order already in table:", lineItems[bufOrder-1][len(lineItems[bufOrder-1])-1])
+	//fmt.Println(currOrderID, bufOrder)
 	//Last order
+	//fmt.Printf("Last orderID: %s, last orderID already in lineItems: %d, trying to add: %d\n", liTable[len(liTable)-1][0], lineItems[bufOrder-1][0].L_ORDERKEY, currOrderID)
 	newLine = make([]*LineItem, bufI)
 	for k, item := range bufItems[:bufI] {
 		newLine[k] = item
@@ -339,54 +409,8 @@ func createLineitemTable(liTable [][]string, nOrders int) (lineItems [][]*LineIt
 	return
 }
 
-/*
-func createLineitemTable(liTable [][]string, nOrders int) (lineItems []*LineItem, maxLineItem int32) {
-	fmt.Println("Creating lineItem table")
-	maxLineItem = 8
-
-	nEntries := int32(nOrders)*maxLineItem + maxLineItem + 1 + 100 //Leave one extra empty entry at the end for easier access via order
-	lineItems = make([]*LineItem, nEntries, nEntries)
-	var partKey, orderKey, suppKey, lineNumber, quantity int64
-	var convLineNumber int8
-	var convOrderKey int32
-	var extendedPrice, discount float64
-
-	for _, entry := range liTable {
-		orderKey, _ = strconv.ParseInt(entry[0], 10, 32)
-		partKey, _ = strconv.ParseInt(entry[1], 10, 32)
-		suppKey, _ = strconv.ParseInt(entry[2], 10, 32)
-		lineNumber, _ = strconv.ParseInt(entry[3], 10, 8)
-		quantity, _ = strconv.ParseInt(entry[4], 10, 8)
-		convLineNumber, convOrderKey = int8(lineNumber), int32(orderKey)
-		extendedPrice, _ = strconv.ParseFloat(entry[5], 32)
-		discount, _ = strconv.ParseFloat(entry[6], 32)
-
-		index := GetLineitemIndex(convLineNumber, convOrderKey, maxLineItem)
-		lineItems[index] = &LineItem{
-			L_ORDERKEY:      convOrderKey,
-			L_PARTKEY:       int32(partKey),
-			L_SUPPKEY:       int32(suppKey),
-			L_LINENUMBER:    convLineNumber,
-			L_QUANTITY:      int8(quantity),
-			L_EXTENDEDPRICE: extendedPrice,
-			L_DISCOUNT:      discount,
-			L_TAX:           entry[7],
-			L_RETURNFLAG:    entry[8],
-			L_LINESTATUS:    entry[9],
-			L_SHIPDATE:      createDate(entry[10]),
-			L_COMMITDATE:    entry[11],
-			L_RECEIPTDATE:   entry[12],
-			L_SHIPINSTRUCT:  entry[13],
-			L_SHIPMODE:      entry[14],
-			L_COMMENT:       entry[15],
-		}
-	}
-	return
-}
-*/
-
 func createNationTable(nTable [][]string) (nations []*Nation) {
-	fmt.Println("Creating nation table")
+	//fmt.Println("Creating nation table")
 	nations = make([]*Nation, len(nTable))
 	var nationKey, regionKey int64
 	for i, entry := range nTable {
@@ -403,7 +427,7 @@ func createNationTable(nTable [][]string) (nations []*Nation) {
 }
 
 func createOrdersTable(oTable [][]string) (orders []*Orders) {
-	fmt.Println("Creating orders table with size", len(oTable)+1)
+	//fmt.Println("Creating orders table with size", len(oTable)+1)
 	orders = make([]*Orders, len(oTable)+1)
 	var orderKey, customerKey int64
 	for i, entry := range oTable {
@@ -429,7 +453,7 @@ func createOrdersTable(oTable [][]string) (orders []*Orders) {
 }
 
 func createPartTable(pTable [][]string) (parts []*Part) {
-	fmt.Println("Creating parts table")
+	//fmt.Println("Creating parts table")
 	parts = make([]*Part, len(pTable)+1)
 	var partKey int64
 	for i, entry := range pTable {
@@ -450,7 +474,7 @@ func createPartTable(pTable [][]string) (parts []*Part) {
 }
 
 func createPartsuppTable(psTable [][]string) (partSupps []*PartSupp) {
-	fmt.Println("Creating partsupp table")
+	//fmt.Println("Creating partsupp table")
 	partSupps = make([]*PartSupp, len(psTable))
 	var partKey, suppKey, availQty int64
 	var supplyCost float64
@@ -471,7 +495,7 @@ func createPartsuppTable(psTable [][]string) (partSupps []*PartSupp) {
 }
 
 func createRegionTable(rTable [][]string) (regions []*Region) {
-	fmt.Println("Creating region table")
+	//fmt.Println("Creating region table")
 	regions = make([]*Region, len(rTable))
 	var regionKey int64
 	for i, entry := range rTable {
@@ -486,7 +510,7 @@ func createRegionTable(rTable [][]string) (regions []*Region) {
 }
 
 func createSupplierTable(sTable [][]string) (suppliers []*Supplier) {
-	fmt.Println("Creating supplier table")
+	//fmt.Println("Creating supplier table")
 	suppliers = make([]*Supplier, len(sTable)+1)
 	var suppKey, nationKey int64
 	for i, entry := range sTable {
@@ -579,20 +603,18 @@ func createSegmentsList() []string {
 
 func (tab *Tables) UpdateOrderLineitems(order [][]string, lineItems [][]string) {
 	//Just call createOrder and createLineitem and store them
+	//fmt.Println("First orderID, first lineItem orderID, lasts:", order[0][0], lineItems[0][0], order[len(order)-1][0], lineItems[len(lineItems)-1][0])
+	//fmt.Println("Sizes:", len(order), len(lineItems))
 	tab.LastAddedOrders = createOrdersTable(order)
 	tab.LastAddedLineItems, _ = createLineitemTable(lineItems, len(order))
 }
 
-/*
-func (tab *Tables) UpdateOrderLineitems(order []string, lineItems [][]string) (orderObj *Orders,
-	lineItemsObjs []*LineItem) {
-	//Order
+func (tab *Tables) CreateOrder(order []string) *Orders {
 	orderKey, _ := strconv.ParseInt(order[0], 10, 32)
-	custKey, _ := strconv.ParseInt(order[1], 10, 32)
-	orderKey32 := int32(orderKey)
-	orderObj = &Orders{
-		O_ORDERKEY:      orderKey32,
-		O_CUSTKEY:       int32(custKey),
+	customerKey, _ := strconv.ParseInt(order[1], 10, 32)
+	return &Orders{
+		O_ORDERKEY:      int32(orderKey),
+		O_CUSTKEY:       int32(customerKey),
 		O_ORDERSTATUS:   order[2],
 		O_TOTALPRICE:    order[3],
 		O_ORDERDATE:     createDate(order[4]),
@@ -601,25 +623,28 @@ func (tab *Tables) UpdateOrderLineitems(order []string, lineItems [][]string) (o
 		O_SHIPPRIORITY:  order[7],
 		O_COMMENT:       order[8],
 	}
-	tab.Orders[GetOrderIndex(orderKey32)] = orderObj
+}
 
-	//Lineitems
-	lineItemsObjs = make([]*LineItem, len(lineItems))
-	lineIndex := GetLineitemIndex(1, orderKey32, tab.MaxOrderLineitems)
-	var partKey, suppKey, lineNumber, quantity int64
-	var extendedPrice, discount float64
+func (tab *Tables) CreateLineitemsOfOrder(items [][]string) (lineItems []*LineItem) {
+	lineItems = make([]*LineItem, len(items))
+	var partKey, orderKey, suppKey, lineNumber, quantity int64
 	var convLineNumber int8
-	for i, item := range lineItems {
+	var convOrderKey int32
+	var extendedPrice, discount float64
+
+	for i, item := range items {
+		//Create lineitem
+		orderKey, _ = strconv.ParseInt(item[0], 10, 32)
 		partKey, _ = strconv.ParseInt(item[1], 10, 32)
 		suppKey, _ = strconv.ParseInt(item[2], 10, 32)
 		lineNumber, _ = strconv.ParseInt(item[3], 10, 8)
 		quantity, _ = strconv.ParseInt(item[4], 10, 8)
-		convLineNumber = int8(lineNumber)
+		convLineNumber, convOrderKey = int8(lineNumber), int32(orderKey)
 		extendedPrice, _ = strconv.ParseFloat(item[5], 32)
 		discount, _ = strconv.ParseFloat(item[6], 32)
 
-		lineItemsObjs[i] = &LineItem{
-			L_ORDERKEY:      orderKey32,
+		lineItems[i] = &LineItem{
+			L_ORDERKEY:      convOrderKey,
 			L_PARTKEY:       int32(partKey),
 			L_SUPPKEY:       int32(suppKey),
 			L_LINENUMBER:    convLineNumber,
@@ -636,18 +661,8 @@ func (tab *Tables) UpdateOrderLineitems(order []string, lineItems [][]string) (o
 			L_SHIPMODE:      item[14],
 			L_COMMENT:       item[15],
 		}
-		tab.LineItems[lineIndex] = lineItemsObjs[i]
-		lineIndex++
 	}
 	return
-}
-*/
-
-func (tab *Tables) InitConstants() {
-	tab.Segments = createSegmentsList()
-	tab.orderToRegionFun = tab.orderkeyToRegionkeyMultiple
-	tab.orderIndexFun = tab.getFullOrderIndex
-	tab.LastDeletedPos = 0
 }
 
 func (tab *Tables) CreateCustomers(table [][][]string) {
@@ -682,24 +697,40 @@ func (tab *Tables) CreateSuppliers(table [][][]string) {
 	tab.Suppliers = createSupplierTable(table[SUPPLIER])
 }
 
-func (tab *Tables) NationkeyToRegionkey(nationKey int64) int8 {
+func (tab *Tables) nationkeyToRegionkey(nationKey int64) int8 {
 	return tab.Nations[nationKey].N_REGIONKEY
 }
 
-func (tab *Tables) SuppkeyToRegionkey(suppKey int64) int8 {
+func (tab *Tables) suppkeyToRegionkey(suppKey int64) int8 {
 	return tab.Nations[tab.Suppliers[suppKey].S_NATIONKEY].N_REGIONKEY
 }
 
-func (tab *Tables) CustkeyToRegionkey(custKey int64) int8 {
+func (tab *Tables) custkeyToRegionkey(custKey int64) int8 {
 	return tab.Nations[tab.Customers[custKey].C_NATIONKEY].N_REGIONKEY
 }
 
-func (tab *Tables) Custkey32ToRegionkey(custKey int32) int8 {
+func (tab *Tables) custkey32ToRegionkey(custKey int32) int8 {
 	return tab.Nations[tab.Customers[custKey].C_NATIONKEY].N_REGIONKEY
 }
 
-func (tab *Tables) OrderkeyToRegionkey(orderKey int32) int8 {
+func (tab *Tables) orderkeyToRegionkey(orderKey int32) int8 {
 	return tab.orderToRegionFun(orderKey)
+}
+
+func (tab *Tables) orderToRegionkey(order *Orders) int8 {
+	return tab.Nations[tab.Customers[order.O_CUSTKEY].C_NATIONKEY].N_REGIONKEY
+}
+
+func (tab *Tables) singleServerToRegionkey(key int64) int8 {
+	return 0
+}
+
+func (tab *Tables) singleServer32ToRegionkey(key int32) int8 {
+	return 0
+}
+
+func (tab *Tables) singleServerOrderToRegionkey(order *Orders) int8 {
+	return 0
 }
 
 func (tab *Tables) orderkeyToRegionkeyMultiple(orderKey int32) int8 {
