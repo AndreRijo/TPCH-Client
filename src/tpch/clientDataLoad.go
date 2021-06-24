@@ -1,10 +1,10 @@
 package tpch
 
 import (
-	"potionDB/src/antidote"
-	"potionDB/src/crdt"
 	"fmt"
 	"math"
+	"potionDB/src/antidote"
+	"potionDB/src/crdt"
 	"potionDB/src/proto"
 	"runtime"
 	"strings"
@@ -95,21 +95,7 @@ func handleTableProcessing() {
 	//If we're only doing queries, we can clean the unprocessed tables right now, as no further processing will be done
 	if !DOES_DATA_LOAD && !DOES_UPDATES {
 		tables = nil
-	} else if DOES_DATA_LOAD {
-		//Start preparing the indexes
-		if isIndexGlobal {
-			prepareIndexesToSend()
-		} else {
-			prepareIndexesLocalToSend()
-		}
 	} else if DOES_UPDATES {
-		//For the case of DOES_DATA_LOAD && DOES_UPDATES, updates will start after indexes are prepared.
-		//Also, preparing Q15 index is necessary for the updates to work.
-		if isIndexGlobal {
-			TableInfo{Tables: procTables}.prepareQ15Index()
-		} else {
-			TableInfo{Tables: procTables}.prepareQ15IndexLocal()
-		}
 		if DOES_QUERIES {
 			go startMixBench()
 		} else {

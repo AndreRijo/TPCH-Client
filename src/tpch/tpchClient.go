@@ -12,7 +12,6 @@ import (
 	"potionDB/src/tools"
 	"runtime"
 	"runtime/pprof"
-	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -351,20 +350,15 @@ func loadConfigsFile(configs *tools.ConfigLoader) {
 		PRINT_QUERY, QUERY_BENCH, CRDT_BENCH = true, false, false
 		INDEX_WITH_FULL_DATA, CRDT_PER_OBJ, DOES_DATA_LOAD, DOES_QUERIES, DOES_UPDATES = true, false, true, true, false
 		withUpdates, N_UPDATE_FILES, START_UPD_FILE, FINISH_UPD_FILE = false, 1000, 1, 1000
-		queryFuncs = []func(QueryClient) int{sendQ3, sendQ5, sendQ11, sendQ14, sendQ15, sendQ18}
-		statisticsInterval, q15CrdtType = -1, proto.CRDTType_TOPSUM
+		//queryFuncs = []func(QueryClient) int{sendQ3, sendQ5, sendQ11, sendQ14, sendQ15, sendQ18}
+		statisticsInterval = -1
 		MAX_LINEITEM_GOROUTINES, UPDATES_GOROUTINES, READS_PER_TXN = 16, 16, 1
 		UPDATE_INDEX, UPDATE_SPECIFIC_INDEX_ONLY, BATCH_MODE = true, false, CYCLE
 	} else {
 		fmt.Println("Defined config folder.")
 		isMulti, splitIndexLoad, useTopKAll = configs.GetBoolConfig("multiServer", true),
 			configs.GetBoolConfig("splitIndexLoad", true), configs.GetBoolConfig("useTopKAll", false)
-		useTopSum = configs.GetBoolConfig("useTopSum", false)
-		if useTopSum {
-			q15CrdtType = proto.CRDTType_TOPSUM
-		} else {
-			q15CrdtType = proto.CRDTType_TOPK_RMV
-		}
+		useTopSum = configs.GetBoolConfig("useTopSum", false) //Ignored in this version
 		memDebug, profiling = configs.GetBoolConfig("memDebug", true), configs.GetBoolConfig("profiling", false)
 		scaleFactor, _ = strconv.ParseFloat(configs.GetConfig("scale"), 64)
 		maxUpdSize64, _ := strconv.ParseInt(configs.GetOrDefault("updsPerProto", "100"), 10, 64)
@@ -386,8 +380,8 @@ func loadConfigsFile(configs *tools.ConfigLoader) {
 		READS_PER_TXN, UPDATE_SPECIFIC_INDEX_ONLY = configs.GetIntConfig("nReadsTxn", 1), configs.GetBoolConfig("updateSpecificIndex", false)
 		BATCH_MODE, LATENCY_MODE = batchModeStringToInt(configs.GetOrDefault("batchMode", "CYCLE")), latencyModeStringToInt(configs.GetOrDefault("latencyMode", "AVG_OP"))
 
-		queryNumbers := strings.Split(configs.GetOrDefault("queries", "3, 5, 11, 14, 15, 18"), " ")
-		setQueryList(queryNumbers)
+		//queryNumbers := strings.Split(configs.GetOrDefault("queries", "3, 5, 11, 14, 15, 18"), " ")
+		//setQueryList(queryNumbers)
 
 		if useTopSum {
 			fmt.Println("[TPCH_CLIENT]Using top-sum!")
@@ -749,6 +743,7 @@ func singleRegion(obj []string) int8 {
 	return 0
 }
 
+/*
 func setQueryList(queryStrings []string) {
 	queryFuncs, getReadsFuncs = make([]func(QueryClient) int, len(queryStrings)),
 		make([]func(QueryClient, []antidote.ReadObjectParams, []antidote.ReadObjectParams, []int, int) int, len(queryStrings))
@@ -776,6 +771,7 @@ func setQueryList(queryStrings []string) {
 	sort.Ints(indexesToUpd)
 	return
 }
+*/
 
 func latencyModeStringToInt(typeS string) int {
 	switch strings.ToUpper(typeS) {
