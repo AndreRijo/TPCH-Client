@@ -1,15 +1,15 @@
 package tpch
 
 import (
-	"antidote"
-	"crdt"
 	"encoding/csv"
 	"fmt"
 	"math"
 	"math/rand"
 	"net"
 	"os"
-	"proto"
+	"potionDB/src/antidote"
+	"potionDB/src/crdt"
+	"potionDB/src/proto"
 	"sort"
 	"strconv"
 	"strings"
@@ -32,6 +32,10 @@ type QueryClientResult struct {
 	intermediateResults        []QueryStats
 }
 
+const (
+	CYCLE, SINGLE = 0, 1 //BATCH_MODE
+)
+
 var (
 	//Filled automatically by configLoader
 	PRINT_QUERY, QUERY_BENCH bool
@@ -40,10 +44,12 @@ var (
 	STOP_QUERIES             bool //Becomes true when the execution time for the queries is over
 	READS_PER_TXN            int
 	QUERY_WAIT               time.Duration
+	BATCH_MODE               int                     //CYCLE or SINGLE. Only supported by mix clients atm.
 	queryFuncs               []func(QueryClient) int //queries to execute
 	collectQueryStats        []bool                  //Becomes true when enough time has passed to collect statistics again. One entry per queryClient
 	getReadsFuncs            []func(QueryClient, []antidote.ReadObjectParams, []antidote.ReadObjectParams, []int, int) int
 	processReadReplies       []func(QueryClient, []*proto.ApbReadObjectResp, []int, int) int //int[]: fullReadPos, partialReadPos. int: reads done
+	q15CrdtType              proto.CRDTType                                                  //Q15 can be implemented with either TopK or TopSum.
 )
 
 func startQueriesBench() {
@@ -480,7 +486,7 @@ func getQ15Reads(client QueryClient, fullR, partialR []antidote.ReadObjectParams
 	rndQuarter, rndYear := 1+3*client.rng.Int63n(4), 1993+client.rng.Int63n(5)
 	date := strconv.FormatInt(rndYear, 10) + strconv.FormatInt(rndQuarter, 10)
 	partialR[bufI[1]] = antidote.ReadObjectParams{
-		KeyParams: antidote.KeyParams{Key: TOP_SUPPLIERS + date, CrdtType: proto.CRDTType_TOPK_RMV, Bucket: buckets[INDEX_BKT]},
+		KeyParams: antidote.KeyParams{Key: TOP_SUPPLIERS + date, CrdtType: q15CrdtType, Bucket: buckets[INDEX_BKT]},
 		ReadArgs:  crdt.GetTopNArguments{NumberEntries: 1},
 	}
 	bufI[1]++
@@ -502,7 +508,7 @@ func sendQ15(client QueryClient) (nRequests int) {
 	date := strconv.FormatInt(rndYear, 10) + strconv.FormatInt(rndQuarter, 10)
 
 	readParam := []antidote.ReadObjectParams{antidote.ReadObjectParams{
-		KeyParams: antidote.KeyParams{Key: TOP_SUPPLIERS + date, CrdtType: proto.CRDTType_TOPK_RMV, Bucket: buckets[INDEX_BKT]},
+		KeyParams: antidote.KeyParams{Key: TOP_SUPPLIERS + date, CrdtType: q15CrdtType, Bucket: buckets[INDEX_BKT]},
 		ReadArgs:  crdt.GetTopNArguments{NumberEntries: 1},
 	}}
 	//topkProto := sendReceiveReadProto(client, []antidote.ReadObjectParams{}, readParam).GetObjects().GetObjects()[0].GetTopk()
@@ -1137,6 +1143,19 @@ func convertQueryStats(stats []QueryClientResult) (convStats [][]QueryStats) {
 	}
 
 	return
+}
+
+func batchModeStringToInt(typeS string) int {
+	switch strings.ToUpper(typeS) {
+	case "SINGLE":
+		return SINGLE
+	case "CYCLE":
+		return CYCLE
+	default:
+		fmt.Println("[ERROR]Unknown batch mode type. Exitting")
+		os.Exit(0)
+	}
+	return CYCLE
 }
 
 //OBSOLETE

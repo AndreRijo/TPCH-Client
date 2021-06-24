@@ -1,18 +1,18 @@
 package tpch
 
 import (
-	"antidote"
+	"potionDB/src/antidote"
 	"encoding/csv"
 	"fmt"
 	"net"
 	"os"
-	"proto"
+	"potionDB/src/proto"
 	"runtime"
 	"strconv"
 	"strings"
 	"sync/atomic"
 	"time"
-	"tools"
+	"potionDB/src/tools"
 
 	pb "github.com/golang/protobuf/proto"
 )
@@ -303,7 +303,7 @@ func getStatsFileToWrite(filename string) (file *os.File) {
 			fileCreated = true
 			file, err = os.Create(statsSaveLocation + filename + id + ".csv")
 			if err != nil {
-				fmt.Println("[DATASAVE][ERROR]Failed to create stats file with name"+filename+id+".csv. Error:", err)
+				fmt.Println("[DATASAVE][ERROR]Failed to create stats file with name "+filename+id+".csv. Error:", err)
 				return
 			}
 		} else {
@@ -333,5 +333,5 @@ func writeDataloadStatsFile() {
 	writer.Write([]string{strconv.FormatInt(int64(dataloadStats.nIndexUpds), 10), strconv.FormatInt(dataloadStats.indexTimeSpent, 10),
 		strconv.FormatFloat(indexUpdsPerSecond, 'f', 10, 64)})
 
-	fmt.Println("Dataload statistics saved successfully.")
+	fmt.Println("Dataload statistics saved successfully to " + file.Name())
 }

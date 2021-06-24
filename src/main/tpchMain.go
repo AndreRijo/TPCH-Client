@@ -1,7 +1,8 @@
 package main
 
 import (
-	"tpch"
+	"tpch_client/src/autoindex"
+	"tpch_client/src/tpch"
 )
 
 /**
@@ -68,6 +69,15 @@ With small; VM, disabled, replicaID of 2 bytes intead of 8: 1604MB
 	//This seems to increase exponentially with the number of upds. E.g., 0.1SF is a few (<10) seconds, 1SF is over 3min.
 */
 
+const (
+	USE_AUTO_INDEX_CLIENT = false
+)
+
 func main() {
-	tpch.StartClient()
+	if !USE_AUTO_INDEX_CLIENT {
+		tpch.StartClient()
+	} else {
+		tpch.LoadConfigs()
+		autoindex.StartAutoIndexClient()
+	}
 }

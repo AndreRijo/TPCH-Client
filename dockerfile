@@ -28,7 +28,11 @@ RESET "none" \
 ID "none" \
 SPLIT_UPDATES "none" \
 SPLIT_UPDATES_NO_WAIT "none" \
-N_READS_TXN "none"
+N_READS_TXN "none" \
+BATCH_MODE "none" \
+LATENCY_MODE "none" \
+SERVERS "none" \
+USE_TOP_SUM "none" 
 #Bench args
 ENV B_N_KEYS "none" \
 B_KEY_TYPE "none" \

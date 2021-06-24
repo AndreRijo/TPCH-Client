@@ -1,11 +1,11 @@
 package tpch
 
 import (
-	"antidote"
-	"crdt"
 	"fmt"
 	"math/rand"
-	"proto"
+	"potionDB/src/antidote"
+	"potionDB/src/crdt"
+	"potionDB/src/proto"
 	"strconv"
 	"strings"
 	"time"
@@ -269,6 +269,7 @@ func (ti TableInfo) prepareQ3Index() (upds []antidote.UpdateObjectParams, updsDo
 	return ti.makeQ3IndexUpds(sumMap, nProtoUpds, INDEX_BKT), updsDone
 }
 
+//TODO: I might need to review this... shouldn't I only be writting positions between orderdate and shipdate?
 //Note: not much efficient, but we don't really know how old can an orderdate be without being shipped. And we also don't have any index for dates
 func (ti TableInfo) q3CalcHelper(sumMap map[string]map[int8]map[int32]*float64, order *Orders, orderI int) (nUpds int) {
 	var minDay = MIN_MONTH_DAY
@@ -595,8 +596,14 @@ func (ti TableInfo) prepareQ15IndexLocal() (upds [][]antidote.UpdateObjectParams
 	}
 
 	upds = make([][]antidote.UpdateObjectParams, len(ti.Tables.Regions))
-	for i := range upds {
-		upds[i] = ti.makeQ15IndexUpds(yearMap[i], nUpds[i], INDEX_BKT+i)
+	if !useTopSum {
+		for i := range upds {
+			upds[i] = ti.makeQ15IndexUpds(yearMap[i], nUpds[i], INDEX_BKT+i)
+		}
+	} else {
+		for i := range upds {
+			upds[i] = ti.makeQ15IndexUpdsTopSum(yearMap[i], nUpds[i], INDEX_BKT+i)
+		}
 	}
 
 	return
@@ -618,7 +625,12 @@ func (ti TableInfo) prepareQ15Index() (upds []antidote.UpdateObjectParams, updsD
 		nUpds += ti.q15CalcHelper(orderItems, yearMap)
 	}
 
-	return ti.makeQ15IndexUpds(yearMap, nUpds, INDEX_BKT), nUpds
+	if !useTopSum {
+		fmt.Println("[TPCH_INDEX]Not using topsum to prepare q15 index")
+		return ti.makeQ15IndexUpds(yearMap, nUpds, INDEX_BKT), nUpds
+	}
+	fmt.Println("[TPCH_INDEX]Using topsum to prepare q15 index.")
+	return ti.makeQ15IndexUpdsTopSum(yearMap, nUpds, INDEX_BKT), nUpds
 }
 
 func (ti TableInfo) q15CalcHelper(orderItems []*LineItem, yearMap map[int16]map[int8]map[int32]*float64) (nUpds int) {
@@ -963,6 +975,50 @@ func (ti TableInfo) makeQ14IndexUpds(mapPromo map[string]*float64, mapTotal map[
 	return
 }
 
+func (ti TableInfo) makeQ15IndexUpdsTopSum(yearMap map[int16]map[int8]map[int32]*float64, nUpds int, bucketI int) (upds []antidote.UpdateObjectParams) {
+	//It's always 20 updates if using TopKAddAll (5 years * 4 months)
+	if useTopKAll {
+		nUpds = 20
+	}
+	upds = make([]antidote.UpdateObjectParams, nUpds)
+	var keyArgs antidote.KeyParams
+
+	i, month := 0, int8(0)
+	for year, monthMap := range yearMap {
+		for month = 1; month <= 12; month += 3 {
+			keyArgs = antidote.KeyParams{
+				Key:      TOP_SUPPLIERS + strconv.FormatInt(int64(year), 10) + strconv.FormatInt(int64(month), 10),
+				CrdtType: proto.CRDTType_TOPSUM,
+				Bucket:   buckets[bucketI],
+			}
+			if !useTopKAll {
+				for suppKey, value := range monthMap[month] {
+					//TODO: Not use int32 for value
+					var currUpd crdt.UpdateArguments = crdt.TopSAdd{TopKScore: crdt.TopKScore{
+						Id:    suppKey,
+						Score: int32(*value),
+					}}
+					upds[i] = antidote.UpdateObjectParams{KeyParams: keyArgs, UpdateArgs: &currUpd}
+					i++
+				}
+			} else {
+				adds := make([]crdt.TopKScore, len(monthMap[month]))
+				j := 0
+				for suppKey, value := range monthMap[month] {
+					//TODO: Not use int32 for value
+					adds[j] = crdt.TopKScore{Id: suppKey, Score: int32(*value)}
+					j++
+				}
+				var currUpd crdt.UpdateArguments = crdt.TopSAddAll{Scores: adds}
+				upds[i] = antidote.UpdateObjectParams{KeyParams: keyArgs, UpdateArgs: &currUpd}
+				i++
+			}
+		}
+	}
+
+	return
+}
+
 func (ti TableInfo) makeQ15IndexUpds(yearMap map[int16]map[int8]map[int32]*float64, nUpds int, bucketI int) (upds []antidote.UpdateObjectParams) {
 	//Create the updates. Always 20 updates if doing with TopKAddAll (5 years * 4 months)
 	if useTopKAll {
@@ -1008,6 +1064,7 @@ func (ti TableInfo) makeQ15IndexUpds(yearMap map[int16]map[int8]map[int32]*float
 	return
 }
 
+//TODO: The Score of the CRDT should be totalprice instead of the sum of amounts
 func (ti TableInfo) makeQ18IndexUpds(quantityMap map[int32]map[int32]*PairInt, bucketI int) (upds []antidote.UpdateObjectParams) {
 	nUpds := 0
 	if useTopKAll {
@@ -1019,7 +1076,6 @@ func (ti TableInfo) makeQ18IndexUpds(quantityMap map[int32]map[int32]*PairInt, b
 	upds = make([]antidote.UpdateObjectParams, nUpds)
 	var keyArgs antidote.KeyParams
 
-	//TODO: TopK with multipleAdd
 	i := 0
 	if !INDEX_WITH_FULL_DATA {
 		for quantity, orderMap := range quantityMap {

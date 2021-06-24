@@ -1,13 +1,13 @@
 package tpch
 
 import (
-	"antidote"
-	"crdt"
+	"potionDB/src/antidote"
+	"potionDB/src/crdt"
 	"encoding/csv"
 	"fmt"
 	"math"
 	"math/rand"
-	"proto"
+	"potionDB/src/proto"
 	"strconv"
 	"strings"
 	"time"
@@ -478,7 +478,11 @@ func (ti TableInfo) sendPartGlobalIndexUpdates(deleteKeys []string, ordersUpds [
 		j++
 	}
 	if indexesToUpd[i] == 15 {
-		indexUpds[j], indexNUpds[j] = ti.getQ15UpdsV2(remOrders, remItems, newOrders, newItems)
+		if !useTopSum {
+			indexUpds[j], indexNUpds[j] = ti.getQ15UpdsV2(remOrders, remItems, newOrders, newItems)
+		} else {
+			indexUpds[j], indexNUpds[j] = ti.getQ15TopSumUpdsV2(remOrders, remItems, newOrders, newItems)
+		}
 		i++
 		j++
 	}
@@ -521,7 +525,11 @@ func (ti TableInfo) sendPartLocalIndexUpdates(deleteKeys []string, ordersUpds []
 		j++
 	}
 	if indexesToUpd[i] == 15 {
-		indexUpds[j], indexNUpds[j] = ti.getQ15UpdsLocalV2(remOrders, remItems, newOrders, newItems)
+		if useTopSum {
+			indexUpds[j], indexNUpds[j] = ti.getQ15TopSumUpdsLocalV2(remOrders, remItems, newOrders, newItems)
+		} else {
+			indexUpds[j], indexNUpds[j] = ti.getQ15UpdsLocalV2(remOrders, remItems, newOrders, newItems)
+		}
 		i++
 		j++
 	}
@@ -552,7 +560,11 @@ func (ti TableInfo) sendGlobalIndexUpdates(deleteKeys []string, ordersUpds [][]s
 	//Query 11 doesn't need updates (Nation/Supply only, which are never updated.)
 
 	indexUpds[6], indexNUpds[6] = ti.getQ14UpdsV2(remOrders, remItems, newOrders, newItems)
-	indexUpds[0], indexNUpds[0] = ti.getQ15UpdsV2(remOrders, remItems, newOrders, newItems)
+	if !useTopSum {
+		indexUpds[0], indexNUpds[0] = ti.getQ15UpdsV2(remOrders, remItems, newOrders, newItems)
+	} else {
+		indexUpds[0], indexNUpds[0] = ti.getQ15TopSumUpdsV2(remOrders, remItems, newOrders, newItems)
+	}
 	indexUpds[1], _, indexNUpds[1] = ti.getQ5UpdsV2(remOrders, remItems, newOrders, newItems)
 	indexUpds[2], indexUpds[3], indexNUpds[2], indexNUpds[3] = ti.getQ18UpdsV2(remOrders, remItems, newOrders, newItems)
 	//Works but it's very slow! (added ~50s overhead instead of like 2-4s as each other did)
@@ -599,7 +611,11 @@ func (ti TableInfo) sendLocalIndexUpdates(deleteKeys []string, ordersUpds [][]st
 	//Query 11 doesn't need updates (Nation/Supply only, which are never updated.)
 
 	indexUpds[6], indexNUpds[6] = ti.getQ14UpdsLocalV2(remOrders, remItems, newOrders, newItems)
-	indexUpds[0], indexNUpds[0] = ti.getQ15UpdsLocalV2(remOrders, remItems, newOrders, newItems)
+	if !useTopSum {
+		indexUpds[0], indexNUpds[0] = ti.getQ15UpdsLocalV2(remOrders, remItems, newOrders, newItems)
+	} else {
+		indexUpds[0], indexNUpds[0] = ti.getQ15TopSumUpdsLocalV2(remOrders, remItems, newOrders, newItems)
+	}
 	_, indexUpds[1], indexNUpds[1] = ti.getQ5UpdsV2(remOrders, remItems, newOrders, newItems)
 	indexUpds[2], indexUpds[3], indexNUpds[2], indexNUpds[3] = ti.getQ18UpdsLocalV2(remOrders, remItems, newOrders, newItems)
 	indexUpds[4], indexUpds[5], indexNUpds[4], indexNUpds[5] = ti.getQ3UpdsLocalV2(remOrders, remItems, newOrders, newItems)
@@ -884,6 +900,37 @@ func q14UpdsCalcHelper(multiplier float64, orderItems []*LineItem, mapPromo map[
 	}
 }
 
+func (ti TableInfo) getQ15TopSumUpdsLocalV2(remOrders []*Orders, remItems [][]*LineItem, newOrders []*Orders, newItems [][]*LineItem) (upds [][]antidote.UpdateObjectParams, updsDone int) {
+	diffEntries := make([]map[int16]map[int8]map[int32]float64, len(ti.Tables.Regions))
+	nUpds := make([]int, len(ti.Tables.Regions))
+	rKey := int8(0)
+
+	for i := range diffEntries {
+		diffEntries[i] = createQ15TopSumEntriesMap()
+	}
+
+	for i, orderItems := range remItems {
+		rKey = ti.Tables.OrderkeyToRegionkey(remOrders[i].O_ORDERKEY)
+		q15TopSumUpdsRemCalcHelper(orderItems, q15LocalMap[rKey], diffEntries[rKey])
+	}
+	for i, orderItems := range newItems {
+		rKey = ti.Tables.OrderkeyToRegionkey(newOrders[i].O_ORDERKEY)
+		q15TopSumUpdsNewCalcHelper(orderItems, q15LocalMap[rKey], diffEntries[rKey])
+	}
+
+	for i := range nUpds {
+		nUpds[i] = getQ15TopSumNumberUpds(diffEntries[i])
+	}
+	upds = make([][]antidote.UpdateObjectParams, len(ti.Tables.Regions))
+	updsDoneRegion := 0
+	for i := range upds {
+		upds[i], updsDoneRegion = makeQ15TopSumIndexUpdsDeletes(q15LocalMap[i], diffEntries[i], nUpds[i], INDEX_BKT+i)
+		updsDone += updsDoneRegion
+	}
+
+	return
+}
+
 func (ti TableInfo) getQ15UpdsLocalV2(remOrders []*Orders, remItems [][]*LineItem, newOrders []*Orders, newItems [][]*LineItem) (upds [][]antidote.UpdateObjectParams, updsDone int) {
 	updEntries := make([]map[int16]map[int8]map[int32]struct{}, len(ti.Tables.Regions))
 	nUpds := make([]int, len(ti.Tables.Regions))
@@ -912,6 +959,74 @@ func (ti TableInfo) getQ15UpdsLocalV2(remOrders []*Orders, remItems [][]*LineIte
 		updsDone += updsDoneRegion
 	}
 
+	return
+}
+
+func (ti TableInfo) getQ15TopSumUpdsV2(remOrders []*Orders, remItems [][]*LineItem, newOrders []*Orders, newItems [][]*LineItem) (upds []antidote.UpdateObjectParams, updsDone int) {
+	//Need to update totals in q15Map and mark which entries were updated
+	//Also uses the same idea as in other queries than removes are the same as news but with inverted signals
+	diffEntries := createQ15TopSumEntriesMap()
+
+	for _, orderItems := range remItems {
+		q15TopSumUpdsRemCalcHelper(orderItems, q15Map, diffEntries)
+	}
+	for _, orderItems := range newItems {
+		q15TopSumUpdsNewCalcHelper(orderItems, q15Map, diffEntries)
+	}
+
+	return makeQ15TopSumIndexUpdsDeletes(q15Map, diffEntries, getQ15TopSumNumberUpds(diffEntries), INDEX_BKT)
+}
+
+func q15TopSumUpdsRemCalcHelper(orderItems []*LineItem, yearMap map[int16]map[int8]map[int32]*float64,
+	diffEntries map[int16]map[int8]map[int32]float64) {
+	year, month := int16(0), int8(0)
+	value := 0.0
+	for _, item := range orderItems {
+		year = item.L_SHIPDATE.YEAR
+		if year >= 1993 && year <= 1997 {
+			month, value = ((item.L_SHIPDATE.MONTH-1)/3)*3+1, (item.L_EXTENDEDPRICE * (1.0 - item.L_DISCOUNT))
+			*yearMap[year][month][item.L_SUPPKEY] -= value
+			diffEntries[year][month][item.L_SUPPKEY] -= value
+		}
+	}
+}
+
+func q15TopSumUpdsNewCalcHelper(orderItems []*LineItem, yearMap map[int16]map[int8]map[int32]*float64,
+	diffEntries map[int16]map[int8]map[int32]float64) {
+	year, month := int16(0), int8(0)
+	value := 0.0
+	for _, item := range orderItems {
+		year = item.L_SHIPDATE.YEAR
+		if year >= 1993 && year <= 1997 {
+			month, value = ((item.L_SHIPDATE.MONTH-1)/3)*3+1, (item.L_EXTENDEDPRICE * (1.0 - item.L_DISCOUNT))
+			*yearMap[year][month][item.L_SUPPKEY] += value
+			diffEntries[year][month][item.L_SUPPKEY] += value
+		}
+	}
+}
+
+func getQ15TopSumNumberUpds(diffEntries map[int16]map[int8]map[int32]float64) (nUpds int) {
+	nUpds = 0
+	//TODO: TopSumAll?
+	for _, monthMap := range diffEntries {
+		for _, suppMap := range monthMap {
+			nUpds += len(suppMap)
+		}
+	}
+
+	return
+}
+
+//For top-sum, we need to register the diff, so that we can inc/dec the correct amount. Map is per-client.
+func createQ15TopSumEntriesMap() (diffEntries map[int16]map[int8]map[int32]float64) {
+	diffEntries = make(map[int16]map[int8]map[int32]float64)
+	var mMap map[int8]map[int32]float64
+	var year int16 = 1993
+	for ; year <= 1997; year++ {
+		mMap = make(map[int8]map[int32]float64)
+		mMap[1], mMap[4], mMap[7], mMap[10] = make(map[int32]float64), make(map[int32]float64), make(map[int32]float64), make(map[int32]float64)
+		diffEntries[year] = mMap
+	}
 	return
 }
 
@@ -983,7 +1098,6 @@ func createQ15EntriesMap() (updEntries map[int16]map[int8]map[int32]struct{}) {
 	}
 	return
 }
-
 func createQ18DeleteMap() (toRemove []map[int32]struct{}) {
 	toRemove = make([]map[int32]struct{}, 4)
 	for i, _ := range toRemove {
@@ -1106,6 +1220,75 @@ func makeQ3IndexRemoves(remMap map[string]map[int8]map[int32]struct{}, nUpds int
 	return
 }
 
+func makeQ15TopSumIndexUpdsDeletes(yearMap map[int16]map[int8]map[int32]*float64, diffEntries map[int16]map[int8]map[int32]float64,
+	nUpds int, bucketI int) (upds []antidote.UpdateObjectParams, updsDone int) {
+	upds = make([]antidote.UpdateObjectParams, nUpds)
+	index, done := makeQ15TopSumIndexUpdsDeletesHelper(yearMap, diffEntries, bucketI, upds, 0)
+	return upds[:index], done
+}
+
+func makeQ15TopSumIndexUpdsDeletesHelper(yearMap map[int16]map[int8]map[int32]*float64, diffEntries map[int16]map[int8]map[int32]float64,
+	bucketI int, upds []antidote.UpdateObjectParams, bufI int) (newBufI int, updsDone int) {
+
+	oldBufI := bufI
+	var monthMap map[int8]map[int32]float64
+	var suppMap map[int32]float64
+	var keyArgs antidote.KeyParams
+	var value float64
+	for year, mUpd := range diffEntries {
+		monthMap = diffEntries[year]
+		for month, sUpd := range mUpd {
+			if len(sUpd) > 0 {
+				suppMap = monthMap[month]
+				keyArgs = antidote.KeyParams{
+					Key:      TOP_SUPPLIERS + strconv.FormatInt(int64(year), 10) + strconv.FormatInt(int64(month), 10),
+					CrdtType: proto.CRDTType_TOPSUM,
+					Bucket:   buckets[bucketI],
+				}
+				if !useTopKAll {
+					for suppKey, _ := range sUpd {
+						value = suppMap[suppKey]
+						var currUpd crdt.UpdateArguments
+						if value > 0.0 {
+							currUpd = crdt.TopSAdd{TopKScore: crdt.TopKScore{Id: suppKey, Score: int32(value)}}
+						} else if value < 0.0 {
+							currUpd = crdt.TopSSub{TopKScore: crdt.TopKScore{Id: suppKey, Score: int32(value)}}
+						}
+						upds[bufI] = antidote.UpdateObjectParams{KeyParams: keyArgs, UpdateArgs: &currUpd}
+						bufI++
+					}
+					updsDone = bufI - oldBufI
+				} else {
+					incs, decs := make([]crdt.TopKScore, len(suppMap)), make([]crdt.TopKScore, len(suppMap))
+					j, k := 0, 0
+					for suppKey, _ := range sUpd {
+						value = suppMap[suppKey]
+						if value > 0.0 {
+							incs[j], j = crdt.TopKScore{Id: suppKey, Score: int32(value)}, j+1
+						} else if value < 0.0 {
+							decs[k], k = crdt.TopKScore{Id: suppKey, Score: int32(value)}, k+1
+						}
+					}
+					if j > 0 {
+						incs = incs[:j]
+						var currUpd crdt.UpdateArguments = crdt.TopSAddAll{Scores: incs}
+						upds[bufI] = antidote.UpdateObjectParams{KeyParams: keyArgs, UpdateArgs: &currUpd}
+						bufI++
+					}
+					if k > 0 {
+						decs = decs[:k]
+						var currUpd crdt.UpdateArguments = crdt.TopSSubAll{Scores: decs}
+						upds[bufI] = antidote.UpdateObjectParams{KeyParams: keyArgs, UpdateArgs: &currUpd}
+						bufI++
+					}
+					updsDone += j + k
+				}
+			}
+		}
+	}
+	return bufI, updsDone
+}
+
 func makeQ15IndexUpdsDeletes(yearMap map[int16]map[int8]map[int32]*float64, updEntries map[int16]map[int8]map[int32]struct{},
 	nUpds int, bucketI int) (upds []antidote.UpdateObjectParams, updsDone int) {
 	upds = make([]antidote.UpdateObjectParams, nUpds)
@@ -1115,6 +1298,8 @@ func makeQ15IndexUpdsDeletes(yearMap map[int16]map[int8]map[int32]*float64, updE
 
 func makeQ15IndexUpdsDeletesHelper(yearMap map[int16]map[int8]map[int32]*float64, updEntries map[int16]map[int8]map[int32]struct{},
 	bucketI int, upds []antidote.UpdateObjectParams, bufI int) (newBufI int, updsDone int) {
+
+	//Note: I don't think this actually is correct - if for a given supplier the value decreases, the topKAdd won't have any effect - as a higher value is there.
 
 	oldBufI := bufI
 	var monthMap map[int8]map[int32]*float64

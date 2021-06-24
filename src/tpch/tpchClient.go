@@ -1,14 +1,15 @@
 package tpch
 
 import (
-	"antidote"
 	"flag"
 	"fmt"
 	"math/rand"
 	"net"
 	"os"
 	"os/signal"
-	"proto"
+	"potionDB/src/antidote"
+	"potionDB/src/proto"
+	"potionDB/src/tools"
 	"runtime"
 	"runtime/pprof"
 	"sort"
@@ -17,7 +18,6 @@ import (
 	"sync"
 	"syscall"
 	"time"
-	"tools"
 )
 
 //TODO: Support on the benchmark thing coupling multiple queries in one txn? That may lead to higher (or lower) queries/s.
@@ -118,7 +118,7 @@ type UpdatesStats struct {
 	newDataUpds         int
 	removeDataUpds      int
 	indexUpds           int
-	newDataTimeSpent    int64
+	newDataTimeSpent    int64 //This (and the 2 below) are used for update-only client.
 	removeDataTimeSpent int64
 	indexTimeSpent      int64
 }
@@ -128,6 +128,8 @@ type QueryStats struct {
 	nQueries  int
 	nReads    int
 	timeSpent int64
+	latency   int64 //Used when LATENCY_MODE is PER_BATCH
+	nTxns     int   //Note: only mix clients use nTxns currently
 }
 
 const (
@@ -147,20 +149,24 @@ const (
 	C_NATIONKEY, L_SUPPKEY, L_ORDERKEY, N_REGIONKEY, O_CUSTKEY, PS_SUPPKEY, S_NATIONKEY, R_REGIONKEY = 3, 2, 0, 2, 1, 1, 3, 0
 	PART_BKT, INDEX_BKT                                                                              = 5, 6
 	O_ORDERDATE, C_MKTSEGMENT, L_SHIPDATE, L_EXTENDEDPRICE, L_DISCOUNT, O_SHIPPRIOTITY, O_ORDERKEY   = 4, 6, 10, 5, 6, 5, 0
+
+	AVG_OP, AVG_BATCH, PER_BATCH = 0, 1, 2 //LATENCY_MODE. Note that only the latter supports recording latencies for queries separated from update latencies.
 )
 
 var (
 	//Filled dinamically by prepareConfigs()
-	tableFolder, updFolder, commonFolder, headerLoc                         string
-	scaleFactor                                                             float64
-	isIndexGlobal, isMulti, memDebug, profiling, splitIndexLoad, useTopKAll bool
-	maxUpdSize                                                              int //Max number of entries for a single upd msg. To avoid sending the whole table in one request...
-	INDEX_WITH_FULL_DATA, CRDT_PER_OBJ, SINGLE_INDEX_SERVER                 bool
-	DOES_DATA_LOAD, DOES_QUERIES, DOES_UPDATES, CRDT_BENCH                  bool
-	withUpdates                                                             bool //Also loads the necessary update data in order to still be able to do the queries with updates.
-	updCompleteFilename                                                     [3]string
-	statisticsInterval                                                      time.Duration //Milliseconds. A negative number means that no statistics need to be collected.
-	statsSaveLocation                                                       string
+	tableFolder, updFolder, commonFolder, headerLoc string
+	scaleFactor                                     float64
+	//TODO: Finish useTopSum.
+	isIndexGlobal, isMulti, memDebug, profiling, splitIndexLoad, useTopKAll, useTopSum bool
+	maxUpdSize                                                                         int //Max number of entries for a single upd msg. To avoid sending the whole table in one request...
+	INDEX_WITH_FULL_DATA, CRDT_PER_OBJ, SINGLE_INDEX_SERVER                            bool
+	DOES_DATA_LOAD, DOES_QUERIES, DOES_UPDATES, CRDT_BENCH                             bool
+	withUpdates                                                                        bool //Also loads the necessary update data in order to still be able to do the queries with updates.
+	updCompleteFilename                                                                [3]string
+	statisticsInterval                                                                 time.Duration //Milliseconds. A negative number means that no statistics need to be collected.
+	statsSaveLocation                                                                  string
+	LATENCY_MODE                                                                       int //OP_AVG, BATCH_AVG, PER_BATCH
 
 	//Constants...
 	tableNames = [...]string{"customer", "lineitem", "nation", "orders", "part", "partsupp", "region", "supplier"}
@@ -205,7 +211,7 @@ var (
 	dataloadStats                                                                                                    = DataloadStats{}
 	configFolder, indexGlobalString, testRoutinesString, statsSaveLocationString, singleIndexString, updRateString   *string
 	idString, updateIndexString, splitUpdatesString, splitUpdatesNoWaitString, updateBaseString, notifyAddressString *string
-	nReadsTxn, updateSpecificIndex                                                                                   *string
+	nReadsTxn, updateSpecificIndex, batchModeS, latencyModeS, useTopSumString, serversString                         *string
 	//Bench
 	nKeysString, keysTypeString, addRateString, partReadRateString, queryRatesString, opsPerTxnString, nTxnsBeforeWaitString, nElemsString,
 	maxIDString, maxScoreString, topNString, topAboveString, rndDataSizeString, minChangeString, maxChangeString, maxSumString, maxNAddsString *string
@@ -214,7 +220,7 @@ var (
 	idLock sync.Mutex //Statistics files may be written concurrently, thus this lock protects the ID from being changed concurrently.
 )
 
-func loadConfigs() {
+func LoadConfigs() {
 	configs := loadFlags()
 	loadConfigsFile(configs)
 	prepareConfigs()
@@ -236,15 +242,24 @@ func loadFlags() (configs *tools.ConfigLoader) {
 	notifyAddressString = flag.String("notify_address", "none", "ip:port to notify when test is complete. 'none' (or don't provide this flag) if notification isn't desired.")
 	nReadsTxn = flag.String("n_reads_txn", "none", "number of reads (not queries) per transaction. Works for both mix and query clients.")
 	updateSpecificIndex = flag.String("update_specific_index", "none", "if only the indexes correspondent to the queries in the config file should be updated.")
+	batchModeS = flag.String("batch_mode", "none", "how queries are grouped in a transaction - CYCLE, SINGLE.")
+	latencyModeS = flag.String("latency_mode", "none", "how is latency measured - AVG_OP, AVG_BATCH, PER_BATCH.")
+	useTopSumString = flag.String("use_top_sum", "none", "for supported queries (Q15), if true TopSum will be used instead of TopK.")
+	serversString = flag.String("servers", "none", "list of servers to connect to.")
+	//fmt.Println("On flag: ", *serversString)
 
 	registerBenchFlags()
 
 	flag.Parse()
+	fmt.Println("On flag after parse: ", *serversString)
+	fmt.Println("ConfigFolder after parse:", *configFolder)
 
 	configs = &tools.ConfigLoader{}
 	if isFlagValid(configFolder) {
+		fmt.Println("Loading valid configs")
 		configs.LoadConfigs(*configFolder)
 	} else {
+		fmt.Println("Loading empty configs")
 		configs.InitEmptyConfig()
 	}
 	if isFlagValid(reset) {
@@ -291,8 +306,28 @@ func loadFlags() (configs *tools.ConfigLoader) {
 	if isFlagValid(updateSpecificIndex) {
 		configs.ReplaceConfig("updateSpecificIndex", *updateSpecificIndex)
 	}
+	if isFlagValid(batchModeS) {
+		configs.ReplaceConfig("batchMode", *batchModeS)
+	}
+	if isFlagValid(latencyModeS) {
+		configs.ReplaceConfig("latencyMode", *latencyModeS)
+	}
+	if isFlagValid(useTopSumString) {
+		configs.ReplaceConfig("useTopSum", *useTopSumString)
+	}
+	if isFlagValid(serversString) {
+		fmt.Println("ServersString is valid")
+		processServersCommandLine(configs)
+		fmt.Println("On configs: ", configs.GetConfig("servers"))
+	} else {
+		fmt.Println("ServersString is not valid as its value is:", *serversString)
+	}
 	loadBenchFlags(configs)
 	return
+}
+
+func printFlags(f *flag.Flag) {
+	fmt.Println(*f)
 }
 
 func loadConfigsFile(configs *tools.ConfigLoader) {
@@ -308,7 +343,8 @@ func loadConfigsFile(configs *tools.ConfigLoader) {
 
 	//All remaining are non-flag configs
 	if *configFolder == "none" {
-		isMulti, splitIndexLoad, memDebug, profiling, scaleFactor, maxUpdSize, useTopKAll = true, true, false, false, 0.1, 2000, false
+		fmt.Println("Non-defined configFolder, using defaults")
+		isMulti, splitIndexLoad, memDebug, profiling, scaleFactor, maxUpdSize, useTopKAll, useTopSum = true, true, false, false, 0.1, 2000, false, false
 		commonFolder = "/Users/a.rijo/Documents/University_6th_year/potionDB docs/"
 		MAX_BUFF_PROTOS, QUERY_WAIT, FORCE_PROTO_CLEAN, TEST_DURATION = 200, 5000, 10000, 20000
 
@@ -316,12 +352,19 @@ func loadConfigsFile(configs *tools.ConfigLoader) {
 		INDEX_WITH_FULL_DATA, CRDT_PER_OBJ, DOES_DATA_LOAD, DOES_QUERIES, DOES_UPDATES = true, false, true, true, false
 		withUpdates, N_UPDATE_FILES, START_UPD_FILE, FINISH_UPD_FILE = false, 1000, 1, 1000
 		queryFuncs = []func(QueryClient) int{sendQ3, sendQ5, sendQ11, sendQ14, sendQ15, sendQ18}
-		statisticsInterval = -1
+		statisticsInterval, q15CrdtType = -1, proto.CRDTType_TOPSUM
 		MAX_LINEITEM_GOROUTINES, UPDATES_GOROUTINES, READS_PER_TXN = 16, 16, 1
-		UPDATE_INDEX, UPDATE_SPECIFIC_INDEX_ONLY = true, false
+		UPDATE_INDEX, UPDATE_SPECIFIC_INDEX_ONLY, BATCH_MODE = true, false, CYCLE
 	} else {
+		fmt.Println("Defined config folder.")
 		isMulti, splitIndexLoad, useTopKAll = configs.GetBoolConfig("multiServer", true),
 			configs.GetBoolConfig("splitIndexLoad", true), configs.GetBoolConfig("useTopKAll", false)
+		useTopSum = configs.GetBoolConfig("useTopSum", false)
+		if useTopSum {
+			q15CrdtType = proto.CRDTType_TOPSUM
+		} else {
+			q15CrdtType = proto.CRDTType_TOPK_RMV
+		}
 		memDebug, profiling = configs.GetBoolConfig("memDebug", true), configs.GetBoolConfig("profiling", false)
 		scaleFactor, _ = strconv.ParseFloat(configs.GetConfig("scale"), 64)
 		maxUpdSize64, _ := strconv.ParseInt(configs.GetOrDefault("updsPerProto", "100"), 10, 64)
@@ -341,42 +384,23 @@ func loadConfigsFile(configs *tools.ConfigLoader) {
 		UPDATE_INDEX, SPLIT_UPDATES, SPLIT_UPDATES_NO_WAIT, UPDATE_BASE_DATA, NOTIFY_ADDRESS = configs.GetBoolConfig("updateIndex", true), configs.GetBoolConfig("splitUpdates", false),
 			configs.GetBoolConfig("splitUpdatesNoWait", true), configs.GetBoolConfig("updateBase", true), configs.GetOrDefault("notifyAddress", "")
 		READS_PER_TXN, UPDATE_SPECIFIC_INDEX_ONLY = configs.GetIntConfig("nReadsTxn", 1), configs.GetBoolConfig("updateSpecificIndex", false)
+		BATCH_MODE, LATENCY_MODE = batchModeStringToInt(configs.GetOrDefault("batchMode", "CYCLE")), latencyModeStringToInt(configs.GetOrDefault("latencyMode", "AVG_OP"))
 
 		queryNumbers := strings.Split(configs.GetOrDefault("queries", "3, 5, 11, 14, 15, 18"), " ")
 		setQueryList(queryNumbers)
 
-		if CRDT_BENCH {
-			startCRDTBench(configs)
+		if useTopSum {
+			fmt.Println("[TPCH_CLIENT]Using top-sum!")
 		}
-
-		//Query wait is in nanoseconds!!!
-		/*
-			fmt.Println(isMulti)
-			fmt.Println(isIndexGlobal)
-			fmt.Println(splitIndexLoad)
-			fmt.Println(useTopKAll)
-			fmt.Println(memDebug)
-			fmt.Println(profiling)
-			fmt.Println(scaleFactor)
-			fmt.Println(maxUpdSize)
-			fmt.Println(commonFolder)
-			fmt.Println(servers)
-			fmt.Println(MAX_BUFF_PROTOS)
-			fmt.Println(QUERY_WAIT)
-			fmt.Println(FORCE_PROTO_CLEAN)
-			fmt.Println(TEST_ROUTINES)
-			fmt.Println(TEST_DURATION)
-			fmt.Println(PRINT_QUERY)
-			fmt.Println(QUERY_BENCH)
-			fmt.Println(INDEX_WITH_FULL_DATA)
-			fmt.Println(CRDT_PER_OBJ)
-			fmt.Println(withUpdates)
-			fmt.Println(N_UPDATE_FILES)
-		*/
+		if CRDT_BENCH {
+			loadBenchConfigs(configs)
+		}
+		fmt.Println("Servers loaded from configs: ", servers)
 	}
 }
 
 func prepareConfigs() {
+	fmt.Println("Servers before prepare configs:", servers)
 	scaleFactorS := strconv.FormatFloat(scaleFactor, 'f', -1, 64)
 	tableFolder, updFolder = commonFolder+fmt.Sprintf(tableFormat, scaleFactorS), commonFolder+fmt.Sprintf(updFormat, scaleFactorS)
 	updCompleteFilename = [3]string{updFolder + updsNames[0] + updExtension, updFolder + updsNames[1] + updExtension,
@@ -442,10 +466,14 @@ func prepareConfigs() {
 		updEntries = []int{1500, 6001, 1500}
 	}
 
+	fmt.Println("Servers after prepareConfigs:", servers)
 }
 
 func StartClient() {
-	loadConfigs()
+	LoadConfigs()
+	if CRDT_BENCH {
+		startCRDTBench()
+	}
 	if memDebug {
 		go debugMemory()
 	}
@@ -749,6 +777,21 @@ func setQueryList(queryStrings []string) {
 	return
 }
 
+func latencyModeStringToInt(typeS string) int {
+	switch strings.ToUpper(typeS) {
+	case "AVG_OP":
+		return AVG_OP
+	case "AVG_BATCH":
+		return AVG_BATCH
+	case "PER_BATCH":
+		return PER_BATCH
+	default:
+		fmt.Println("[ERROR]Unknown batch mode type. Exitting")
+		os.Exit(0)
+	}
+	return AVG_OP
+}
+
 func resetServers(configs *tools.ConfigLoader) {
 	start := time.Now().UnixNano()
 	servers = strings.Split(configs.GetConfig("servers"), " ")
@@ -847,6 +890,14 @@ func loadBenchFlags(configs *tools.ConfigLoader) {
 
 func isFlagValid(value *string) bool {
 	return *value != "none" && *value != "" && *value != " "
+}
+
+func processServersCommandLine(configs *tools.ConfigLoader) {
+	srv := *serversString
+	if srv[0] == '[' {
+		srv = strings.Replace(srv[1:len(srv)-1], ",", " ", -1)
+	}
+	configs.ReplaceConfig("servers", srv)
 }
 
 /*

@@ -1,19 +1,19 @@
 package tpch
 
 import (
-	"antidote"
-	"crdt"
+	"potionDB/src/antidote"
+	"potionDB/src/crdt"
 	"encoding/csv"
 	"fmt"
 	"math"
 	"math/rand"
 	"net"
 	"os"
-	"proto"
+	"potionDB/src/proto"
 	"strconv"
 	"strings"
 	"time"
-	"tools"
+	"potionDB/src/tools"
 )
 
 /*
@@ -114,11 +114,8 @@ type AvgInfo struct {
 	maxNAdds int64
 }
 
-func startCRDTBench(configs *tools.ConfigLoader) {
+func startCRDTBench() {
 	start := time.Now().UnixNano()
-	fmt.Println("Reading bench-specific configs...")
-	loadBenchConfigs(configs)
-	fmt.Println("Bench-specific configs sucessfully read.")
 	server := servers[0]
 
 	fmt.Println("Preparing bench clients...")
@@ -988,6 +985,7 @@ total time | section time | reads | upds | reads/s | upds/s | latency
 /////////////////configs///////////////////
 
 func loadBenchConfigs(configs *tools.ConfigLoader) {
+	fmt.Println("Reading bench-specific configs...")
 	BENCH_N_KEYS, BENCH_KEY_TYPE = configs.GetIntConfig("keys", 1), configs.GetOrDefault("keyType", "SINGLE")
 	BENCH_ADD_RATE, BENCH_PART_READ_RATE = configs.GetFloatConfig("addRate", 1), configs.GetFloatConfig("partReadRate", 0)
 	BENCH_CRDT, BENCH_DO_PRELOAD = selectCrdtType(configs.GetOrDefault("crdtType", "ORSET")), configs.GetBoolConfig("doPreload", false)
@@ -998,6 +996,7 @@ func loadBenchConfigs(configs *tools.ConfigLoader) {
 	OPS_PER_TXN, N_TXNS_BEFORE_WAIT = configs.GetIntConfig("opsPerTxn", 1), configs.GetIntConfig("nTxnsBeforeWait", 1)
 
 	readCrdtConfigs(configs)
+	fmt.Println("Bench-specific configs sucessfully read.")
 }
 
 func readCrdtConfigs(configs *tools.ConfigLoader) {

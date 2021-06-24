@@ -1,15 +1,15 @@
 package tpch
 
 import (
-	"antidote"
-	"crdt"
 	"encoding/csv"
 	"fmt"
 	"math"
 	"math/rand"
 	"net"
 	"os"
-	"proto"
+	"potionDB/src/antidote"
+	"potionDB/src/crdt"
+	"potionDB/src/proto"
 	"strconv"
 	"time"
 )
@@ -33,17 +33,20 @@ type MixClientResult struct {
 }
 
 type UpdateStats struct {
-	nNews, nDels, nIndex int
+	nNews, nDels, nIndex, nTxns int
+	latency                     int64 //Used when LATENCY_MODE is PER_BATCH
 }
 
 type IndexInfo struct {
-	q3   SingleQ3
-	q5   SingleQ5
-	q14  SingleQ14
-	q15  SingleQ15
-	q18  SingleQ18
-	lq14 SingleLocalQ14
-	lq15 SingleLocalQ15
+	q3         SingleQ3
+	q5         SingleQ5
+	q14        SingleQ14
+	q15        SingleQ15
+	q15TopSum  SingleQ15TopSum
+	q18        SingleQ18
+	lq14       SingleLocalQ14
+	lq15       SingleLocalQ15
+	lq15TopSum SingleLocalQ15TopSum
 }
 
 //NOTE: THIS MOST LIKELY WON'T WORK WHEN INDEXES DON'T HAVE THE ALL DATA!
@@ -61,10 +64,12 @@ var (
 	UPD_RATE                             float64 //0 to 1.
 	START_UPD_FILE, FINISH_UPD_FILE      int     //Used by this client only. clientUpdates.go use N_UPDATE_FILES.
 	SPLIT_UPDATES, SPLIT_UPDATES_NO_WAIT bool    //Whenever each update should be its own transaction or not.
+	RECORD_LATENCY                       bool    //Filled automatically in startMixBench. When true, latency is measured every transaction.
 )
 
 func startMixBench() {
 	maxServers := len(servers)
+	RECORD_LATENCY = (LATENCY_MODE == PER_BATCH)
 
 	fmt.Println("Reading updates...")
 	readStart := time.Now().UnixNano()
@@ -91,10 +96,12 @@ func startMixBench() {
 		splitUpdatesPerRoutine(TEST_ROUTINES, ordersUpds, lineItemUpds, deleteKeys, lineItemSizes)
 	fmt.Println("Updates split.")
 
-	for i := 0; i < TEST_ROUTINES; i++ {
-		fmt.Printf("%d: %d %d %d %d %d\n", i, filesPerRoutine, len(routineOrders[i]), len(routineItems[i]),
-			len(routineDelete[i]), len(routineLineSizes[i]))
-	}
+	/*
+		for i := 0; i < TEST_ROUTINES; i++ {
+			fmt.Printf("%d: %d %d %d %d %d\n", i, filesPerRoutine, len(routineOrders[i]), len(routineItems[i]),
+				len(routineDelete[i]), len(routineLineSizes[i]))
+		}
+	*/
 
 	/*
 		fmt.Println("Last goroutine updates info:")
@@ -133,20 +140,23 @@ func startMixBench() {
 		collectQueryStats[i] = false
 	}
 
-	fmt.Printf("Waiting to start queries & upds... (ops per txn: %d)\n", READS_PER_TXN)
+	fmt.Printf("Waiting to start queries & upds... (ops per txn: %d; batch mode: %d; latency mode: %d)\n", READS_PER_TXN, BATCH_MODE, LATENCY_MODE)
 	time.Sleep(QUERY_WAIT*1000000 - time.Duration(time.Now().UnixNano()-times.startTime))
 	fmt.Println("Starting queries & upds...")
 	fmt.Println("Is using split: ", SPLIT_UPDATES)
 
 	if statisticsInterval > 0 {
+		fmt.Println("Called mixedInterval at", time.Now().String())
 		go doMixedStatsInterval()
 	}
 
 	for i := 0; i < TEST_ROUTINES; i++ {
+		fmt.Printf("Value of update stats for client %d: %t, started at: %s\n", i, collectQueryStats[i], time.Now().String())
 		go mixBench(0, i, serverPerClient[i], chans[i], filesPerRoutine, singleTableInfos[i],
 			routineOrders[i], routineItems[i], routineDelete[i], routineLineSizes[i])
 	}
 
+	fmt.Println("Sleeping for: ", time.Duration(TEST_DURATION)*time.Millisecond, "at", time.Now().String())
 	time.Sleep(time.Duration(TEST_DURATION) * time.Millisecond)
 	STOP_QUERIES = true
 	stopTime := time.Now().UnixNano()
@@ -200,30 +210,45 @@ func readUpdsByOrder() (ordersUpds [][]string, lineItemUpds [][]string, deleteKe
 }
 
 func updateMixStats(queryStats []QueryStats, updStats []UpdateStats, nReads, lastStatReads, nQueries, lastStatQueries int,
-	client *SingleTableInfo, lastStatTime int64) (newQStats []QueryStats, newUStats []UpdateStats, newNReads, newNQueries int, newLastStatTime int64) {
+	client *SingleTableInfo, lastStatTime, qTime, updTime int64, nTxnsQ, nTxnsU int) (newQStats []QueryStats, newUStats []UpdateStats,
+	newNReads, newNQueries int, newLastStatTime int64) {
 	currStatTime, currQStats, currUStats := time.Now().UnixNano()/1000000, QueryStats{}, *client.currUpdStat
 	diffT, diffR, diffQ := currStatTime-lastStatTime, nReads-lastStatReads, nQueries-lastStatQueries
-	if diffT < int64(statisticsInterval/100) {
+	if diffT < int64(statisticsInterval/100) && len(queryStats) > 0 {
 		//Replace
 		lastStatI := len(queryStats) - 1
 		queryStats[lastStatI].nReads += diffR
 		queryStats[lastStatI].nQueries += diffQ
 		queryStats[lastStatI].timeSpent += diffT
+		queryStats[lastStatI].latency += (qTime / 1000000)
+		queryStats[lastStatI].nTxns += nTxnsQ
 		updStats[lastStatI].nIndex += currUStats.nIndex
 		updStats[lastStatI].nNews += currUStats.nNews
 		updStats[lastStatI].nDels += currUStats.nDels
+		updStats[lastStatI].latency += (updTime / 1000000)
+		updStats[lastStatI].nTxns += nTxnsU
 	} else {
-		currQStats.nReads, currQStats.nQueries, currQStats.timeSpent = diffR, diffQ, diffT
+		currQStats.nReads, currQStats.nQueries, currQStats.timeSpent, currQStats.latency, currQStats.nTxns = diffR, diffQ, diffT, qTime/1000000, nTxnsQ
 		queryStats = append(queryStats, currQStats)
+		currUStats.latency, currUStats.nTxns = updTime/1000000, nTxnsU
 		updStats = append(updStats, currUStats)
 	}
 	client.currUpdStat = &UpdateStats{}
 	return queryStats, updStats, nReads, nQueries, currStatTime
 }
 
+func getCorrectDiffTime(statDiff, perBatchTime int64) int64 {
+	if RECORD_LATENCY {
+		return perBatchTime
+	}
+	return statDiff
+}
+
 func mixBench(seed int64, clientN int, defaultServer int, resultChan chan MixClientResult,
 	routineFiles int, tableInfo SingleTableInfo, orders, items [][]string,
 	delete []string, lineSizes []int) {
+
+	fmt.Println("Mix bench started at", time.Now().String())
 
 	tableInfo.indexServer = defaultServer
 	if SINGLE_INDEX_SERVER || !splitIndexLoad {
@@ -244,15 +269,6 @@ func mixBench(seed int64, clientN int, defaultServer int, resultChan chan MixCli
 
 	//Update preparation
 	orderI, lineI, lineF := 0, 0, lineSizes[0]
-	/*
-		orderS, lineS, orderF, lineF := 0, 0, -1, 0
-		if clientN == TEST_ROUTINES-1 {
-			routineFiles = N_UPDATE_FILES - (routineFiles * (TEST_ROUTINES))
-		}
-		if orders[0][0] > "1" {
-			orderF = 0
-		}
-	*/
 
 	//Query preparation
 	client := QueryClient{serverConns: conns, indexServer: defaultServer, rng: tableInfo.rng}
@@ -266,6 +282,8 @@ func mixBench(seed int64, clientN int, defaultServer int, resultChan chan MixCli
 	lastStatQDone, lastStatReads := 0, 0
 	startTime := time.Now().UnixNano() / 1000000
 	lastStatTime := startTime
+	startTxnTime, currUpdSpentTime, currQuerySpentTime := int64(0), int64(0), int64(0)
+	readTxns, updTxns := 0, 0
 
 	if READS_PER_TXN > 1 {
 		queryPos, nOpsTxn, previousQueryPos, replyPos, nUpdsDone := 0, 0, 0, 0, 0
@@ -279,7 +297,8 @@ func mixBench(seed int64, clientN int, defaultServer int, resultChan chan MixCli
 		for !STOP_QUERIES {
 			if collectQueryStats[clientN] {
 				queryStats, updStats, lastStatReads, lastStatQDone, lastStatTime = updateMixStats(queryStats, updStats, reads,
-					lastStatReads, qDone, lastStatQDone, &tableInfo, lastStatTime)
+					lastStatReads, qDone, lastStatQDone, &tableInfo, lastStatTime, currQuerySpentTime, currUpdSpentTime, readTxns, updTxns)
+				currUpdSpentTime, currQuerySpentTime, readTxns, updTxns = 0, 0, 0, 0
 				collectQueryStats[clientN] = false
 			}
 			random = tableInfo.rng.Float64()
@@ -287,6 +306,7 @@ func mixBench(seed int64, clientN int, defaultServer int, resultChan chan MixCli
 				if waitForUpds > READS_PER_TXN {
 					waitForUpds -= READS_PER_TXN
 				} else {
+					startTxnTime = recordStartLatency()
 					for waitForUpds < READS_PER_TXN {
 						nUpdsDone = tableInfo.getSingleDataChange(updBuf, updBufI, orders[orderI], items[lineI:lineF], delete[orderI])
 						waitForUpds += nUpdsDone
@@ -302,29 +322,53 @@ func mixBench(seed int64, clientN int, defaultServer int, resultChan chan MixCli
 					for i := range updBufI {
 						updBufI[i] = 0
 					}
+					currUpdSpentTime += recordFinishLatency(startTxnTime)
+					updTxns++
+					updsDone += waitForUpds
 				}
 			} else {
-				for nOpsTxn < READS_PER_TXN {
-					nOpsTxn = getReadsFuncs[queryPos%nQueries](client, fullRBuf, partialRBuf, readBufI, nOpsTxn)
-					qDone++
-					queryPos++
+				startTxnTime = recordStartLatency()
+				if BATCH_MODE == CYCLE {
+					for nOpsTxn < READS_PER_TXN {
+						nOpsTxn = getReadsFuncs[queryPos%nQueries](client, fullRBuf, partialRBuf, readBufI, nOpsTxn)
+						qDone++
+						queryPos++
+					}
+				} else {
+					queryPos = (queryPos + 1) % nQueries
+					for nOpsTxn < READS_PER_TXN {
+						nOpsTxn = getReadsFuncs[queryPos](client, fullRBuf, partialRBuf, readBufI, nOpsTxn)
+						qDone++
+					}
+					previousQueryPos = queryPos
 				}
+
 				readReplies := sendReceiveReadProto(client, fullRBuf[:readBufI[0]], partialRBuf[:readBufI[1]], client.indexServer).GetObjects().GetObjects()
 				readBufI[1] = readBufI[0] //partial reads start when full reads end
 				readBufI[0] = 0
-				for replyPos < len(readReplies) {
-					replyPos = processReadReplies[previousQueryPos%nQueries](client, readReplies, readBufI, replyPos)
-					previousQueryPos++
+				if BATCH_MODE == CYCLE {
+					for replyPos < len(readReplies) {
+						replyPos = processReadReplies[previousQueryPos%nQueries](client, readReplies, readBufI, replyPos)
+						previousQueryPos++
+					}
+				} else {
+					for replyPos < len(readReplies) {
+						replyPos = processReadReplies[previousQueryPos](client, readReplies, readBufI, replyPos)
+					}
 				}
 				reads += nOpsTxn
+				readTxns++
 				previousQueryPos, nOpsTxn, replyPos, readBufI[0], readBufI[1] = queryPos, 0, 0, 0, 0
+
+				currQuerySpentTime += recordFinishLatency(startTxnTime)
 			}
 		}
 	} else {
 		for !STOP_QUERIES {
 			if collectQueryStats[clientN] {
 				queryStats, updStats, lastStatReads, lastStatQDone, lastStatTime = updateMixStats(queryStats, updStats, reads,
-					lastStatReads, qDone, lastStatQDone, &tableInfo, lastStatTime)
+					lastStatReads, qDone, lastStatQDone, &tableInfo, lastStatTime, currQuerySpentTime, currUpdSpentTime, readTxns, updTxns)
+				currQuerySpentTime, currUpdSpentTime, readTxns, updTxns = 0, 0, 0, 0
 				collectQueryStats[clientN] = false
 			}
 			random = tableInfo.rng.Float64()
@@ -333,10 +377,13 @@ func mixBench(seed int64, clientN int, defaultServer int, resultChan chan MixCli
 				if waitForUpds > 0 {
 					waitForUpds--
 				} else {
+					startTxnTime = recordStartLatency()
 					if SPLIT_UPDATES {
 						waitForUpds += tableInfo.sendDataIndividually(orders[orderI], items[lineI:lineF], delete[orderI])
+						updTxns += waitForUpds
 					} else {
 						waitForUpds += tableInfo.sendSingleDataChange(orders[orderI], items[lineI:lineF], delete[orderI])
+						updTxns++
 					}
 					updsDone += waitForUpds
 					orderI++
@@ -346,21 +393,48 @@ func mixBench(seed int64, clientN int, defaultServer int, resultChan chan MixCli
 						lineI += lineSizes[orderI]
 						lineF += lineSizes[orderI]
 					}
+					currUpdSpentTime += recordFinishLatency(startTxnTime)
 				}
 			} else {
 				//READ
+				startTxnTime = recordStartLatency()
 				reads += funcs[qDone%nQueries](client)
 				qDone++
+				currQuerySpentTime += recordFinishLatency(startTxnTime)
+				readTxns++
 			}
 		}
 	}
 
 	endTime := time.Now().UnixNano() / 1000000
 	queryStats, updStats, lastStatReads, lastStatQDone, lastStatTime = updateMixStats(queryStats, updStats, reads,
-		lastStatReads, qDone, lastStatQDone, &tableInfo, lastStatTime)
+		lastStatReads, qDone, lastStatQDone, &tableInfo, lastStatTime, currQuerySpentTime, currUpdSpentTime, readTxns, updTxns)
 	resultChan <- MixClientResult{QueryClientResult: QueryClientResult{duration: float64(endTime - startTime), nQueries: float64(qDone),
 		nReads: float64(reads), intermediateResults: queryStats}, updsDone: updsDone, updStats: updStats}
 }
+
+func recordStartLatency() int64 {
+	if RECORD_LATENCY {
+		return time.Now().UnixNano()
+	}
+	return 0
+}
+
+func recordFinishLatency(startTime int64) int64 {
+	if RECORD_LATENCY {
+		return time.Now().UnixNano() - startTime
+	}
+	return 0
+}
+
+//getReadsFuncs[queryPos%nQueries](client, fullRBuf, partialRBuf, readBufI, nOpsTxn)
+//fullRBuf, partialRBuf := make([]antidote.ReadObjectParams, READS_PER_TXN+1), make([]antidote.ReadObjectParams, READS_PER_TXN+1)
+
+/*
+func prepareNextQuery(client QueryClient, fullRBuf, partialRBuf []antidote.ReadObjectParams, readBufI []int, nOpsTxn int) {
+
+}
+*/
 
 /*
 func (ti SingleTableInfo) sendSingleDataChange(order []string, lineItems [][]string, deleteKey string) (updsDone int) {
@@ -426,7 +500,11 @@ func (ti SingleTableInfo) sendDataIndividually(order []string, lineItems [][]str
 			ti.sendIndividualIndex(updS, ti.makeSingleQ3UpdArgs(indexInfo.q3, deletedOrder, newOrder, updS, 0, INDEX_BKT), ti.indexServer)
 			ti.sendIndividualIndex(updS, ti.makeSingleQ5UpdArgs(indexInfo.q5, deletedOrder, newOrder, updS, 0, INDEX_BKT), ti.indexServer)
 			ti.sendIndividualIndex(updS, ti.makeSingleQ14UpdArgs(indexInfo.q14, deletedOrder, newOrder, updS, 0, INDEX_BKT), ti.indexServer)
-			ti.sendIndividualIndex(updS, ti.makeSingleQ15UpdArgs(indexInfo.q15, deletedOrder, newOrder, updS, 0, INDEX_BKT), ti.indexServer)
+			if !useTopSum {
+				ti.sendIndividualIndex(updS, ti.makeSingleQ15UpdArgs(indexInfo.q15, deletedOrder, newOrder, updS, 0, INDEX_BKT), ti.indexServer)
+			} else {
+				ti.sendIndividualIndex(updS, ti.makeSingleQ15TopSumUpdArgs(indexInfo.q15TopSum, deletedOrder, newOrder, updS, 0, INDEX_BKT), ti.indexServer)
+			}
 			ti.sendIndividualIndex(updS, ti.makeSingleQ18UpdArgs(indexInfo.q18, deletedOrder, newOrder, updS, 0, INDEX_BKT), ti.indexServer)
 		} else {
 			newI, remI := int(regN)+INDEX_BKT, int(regR)+INDEX_BKT
@@ -437,19 +515,32 @@ func (ti SingleTableInfo) sendDataIndividually(order []string, lineItems [][]str
 				ti.sendIndividualIndex(updS, ti.makeSingleQ5UpdArgs(indexInfo.q5, deletedOrder, newOrder, updS, 0, newI), newS)
 				ti.sendIndividualIndex(updS, ti.makeSingleQ14UpdArgs(SingleQ14{mapPromo: indexInfo.lq14.mapPromoRem, mapTotal: indexInfo.lq14.mapTotalRem}, deletedOrder, newOrder, updS, 0, newI), newS)
 				ti.sendIndividualIndex(updS, ti.makeSingleQ14UpdArgs(SingleQ14{mapPromo: indexInfo.lq14.mapPromoUpd, mapTotal: indexInfo.lq14.mapTotalUpd}, deletedOrder, newOrder, updS, 0, newI), newS)
-				ti.sendIndividualIndex(updS, ti.makeSingleLocalQ15UpdArgs(SingleQ15{updEntries: indexInfo.lq15.remEntries}, deletedOrder, newOrder, updS, 0, newI, regN), newS)
-				ti.sendIndividualIndex(updS, ti.makeSingleLocalQ15UpdArgs(SingleQ15{updEntries: indexInfo.lq15.updEntries}, deletedOrder, newOrder, updS, 0, newI, regN), newS)
+				if !useTopSum {
+					ti.sendIndividualIndex(updS, ti.makeSingleLocalQ15UpdArgs(SingleQ15{updEntries: indexInfo.lq15.remEntries}, deletedOrder, newOrder, updS, 0, newI, regN), newS)
+					ti.sendIndividualIndex(updS, ti.makeSingleLocalQ15UpdArgs(SingleQ15{updEntries: indexInfo.lq15.updEntries}, deletedOrder, newOrder, updS, 0, newI, regN), newS)
+				} else {
+					ti.sendIndividualIndex(updS, ti.makeSingleLocalQ15TopSumUpdArgs(SingleQ15TopSum{diffEntries: indexInfo.lq15TopSum.remEntries}, deletedOrder, newOrder, updS, 0, newI, regN), newS)
+					ti.sendIndividualIndex(updS, ti.makeSingleLocalQ15TopSumUpdArgs(SingleQ15TopSum{diffEntries: indexInfo.lq15TopSum.updEntries}, deletedOrder, newOrder, updS, 0, newI, regN), newS)
+				}
 				ti.sendIndividualIndex(updS, ti.makeSingleQ18UpdArgs(indexInfo.q18, deletedOrder, newOrder, updS, 0, newI), newS)
 			} else {
 				ti.sendIndividualIndex(updS, ti.makeSingleQ3UpdsArgsNews(indexInfo.q3, newOrder, updS, 0, newI), newS)
 				ti.sendIndividualIndex(updS, ti.makeSingleQ5UpdArgsHelper(*indexInfo.q5.updValue, 1.0, newOrder, updS, 0, newI), newS)
 				ti.sendIndividualIndex(updS, ti.makeSingleQ14UpdArgs(SingleQ14{mapPromo: indexInfo.lq14.mapPromoUpd, mapTotal: indexInfo.lq14.mapTotalUpd}, deletedOrder, newOrder, updS, 0, newI), newS)
-				ti.sendIndividualIndex(updS, ti.makeSingleLocalQ15UpdArgs(SingleQ15{updEntries: indexInfo.lq15.updEntries}, deletedOrder, newOrder, updS, 0, newI, regN), newS)
+				if !useTopSum {
+					ti.sendIndividualIndex(updS, ti.makeSingleLocalQ15UpdArgs(SingleQ15{updEntries: indexInfo.lq15.updEntries}, deletedOrder, newOrder, updS, 0, newI, regN), newS)
+				} else {
+					ti.sendIndividualIndex(updS, ti.makeSingleLocalQ15TopSumUpdArgs(SingleQ15TopSum{diffEntries: indexInfo.lq15TopSum.updEntries}, deletedOrder, newOrder, updS, 0, newI, regN), newS)
+				}
 				ti.sendIndividualIndex(updS, ti.makeSingleQ18UpdsArgsNews(indexInfo.q18, newOrder, updS, 0, newI), newS)
 				ti.sendIndividualIndex(updS, ti.makeSingleQ3UpdsArgsRems(indexInfo.q3, deletedOrder, updS, 0, remI), remS)
 				ti.sendIndividualIndex(updS, ti.makeSingleQ5UpdArgsHelper(*indexInfo.q5.remValue, -1.0, deletedOrder, updS, 0, remI), remS)
 				ti.sendIndividualIndex(updS, ti.makeSingleQ14UpdArgs(SingleQ14{mapPromo: indexInfo.lq14.mapPromoRem, mapTotal: indexInfo.lq14.mapTotalRem}, deletedOrder, newOrder, updS, 0, remI), remS)
-				ti.sendIndividualIndex(updS, ti.makeSingleLocalQ15UpdArgs(SingleQ15{updEntries: indexInfo.lq15.remEntries}, deletedOrder, newOrder, updS, 0, remI, regR), remS)
+				if !useTopSum {
+					ti.sendIndividualIndex(updS, ti.makeSingleLocalQ15UpdArgs(SingleQ15{updEntries: indexInfo.lq15.remEntries}, deletedOrder, newOrder, updS, 0, remI, regR), remS)
+				} else {
+					ti.sendIndividualIndex(updS, ti.makeSingleLocalQ15TopSumUpdArgs(SingleQ15TopSum{diffEntries: indexInfo.lq15TopSum.remEntries}, deletedOrder, newOrder, updS, 0, remI, regR), remS)
+				}
 				ti.sendIndividualIndex(updS, ti.makeSingleQ18UpdsArgsRems(indexInfo.q18, deletedOrder, updS, 0, remI), remS)
 			}
 		}
@@ -490,10 +581,16 @@ func (ti SingleTableInfo) genericGetSingleUpds(queryN int, newOrder *Orders, new
 		}
 	case 15:
 		if isIndexGlobal {
-			return ti.getSingleQ15Upds(remOrder, remItems, newOrder, newItems)
+			if !useTopSum {
+				return ti.getSingleQ15Upds(remOrder, remItems, newOrder, newItems)
+			}
+			return ti.getSingleQ15TopSumUpds(remOrder, remItems, newOrder, newItems)
 		} else {
 			newR, remR := ti.OrderToRegionkey(newOrder), ti.OrderToRegionkey(remOrder)
-			return ti.getSingleLocalQ15Upds(remOrder, remItems, newOrder, newItems, remR, newR)
+			if !useTopSum {
+				return ti.getSingleLocalQ15Upds(remOrder, remItems, newOrder, newItems, remR, newR)
+			}
+			return ti.getSingleLocalQ15TopSumUpds(remOrder, remItems, newOrder, newItems, remR, newR)
 		}
 	case 18:
 		if isIndexGlobal {
@@ -517,7 +614,11 @@ func (ti SingleTableInfo) genericSendIndividualIndex(info interface{}, queryN in
 	case 14:
 		ti.sendIndividualIndex(updS, ti.makeSingleQ14UpdArgs(info.(SingleQ14), deletedOrder, newOrder, updS, 0, INDEX_BKT), ti.indexServer)
 	case 15:
-		ti.sendIndividualIndex(updS, ti.makeSingleQ15UpdArgs(info.(SingleQ15), deletedOrder, newOrder, updS, 0, INDEX_BKT), ti.indexServer)
+		if !useTopSum {
+			ti.sendIndividualIndex(updS, ti.makeSingleQ15UpdArgs(info.(SingleQ15), deletedOrder, newOrder, updS, 0, INDEX_BKT), ti.indexServer)
+		} else {
+			ti.sendIndividualIndex(updS, ti.makeSingleQ15TopSumUpdArgs(info.(SingleQ15TopSum), deletedOrder, newOrder, updS, 0, INDEX_BKT), ti.indexServer)
+		}
 	case 18:
 		ti.sendIndividualIndex(updS, ti.makeSingleQ18UpdArgs(info.(SingleQ18), deletedOrder, newOrder, updS, 0, INDEX_BKT), ti.indexServer)
 	}
@@ -539,10 +640,17 @@ func (ti SingleTableInfo) genericLocalSameRSendIndividualIndex(info interface{},
 		ti.sendIndividualIndex(updS, ti.makeSingleQ14UpdArgs(remQ14, deletedOrder, newOrder, updS, 0, indexN), serverN)
 		ti.sendIndividualIndex(updS, ti.makeSingleQ14UpdArgs(newQ14, deletedOrder, newOrder, updS, 0, indexN), serverN)
 	case 15:
-		lq15 := info.(SingleLocalQ15)
-		remQ15, newQ15 := SingleQ15{updEntries: lq15.remEntries}, SingleQ15{updEntries: lq15.updEntries}
-		ti.sendIndividualIndex(updS, ti.makeSingleLocalQ15UpdArgs(remQ15, deletedOrder, newOrder, updS, 0, indexN, int8(indexN-INDEX_BKT)), serverN)
-		ti.sendIndividualIndex(updS, ti.makeSingleLocalQ15UpdArgs(newQ15, deletedOrder, newOrder, updS, 0, indexN, int8(indexN-INDEX_BKT)), serverN)
+		if !useTopSum {
+			lq15 := info.(SingleLocalQ15)
+			remQ15, newQ15 := SingleQ15{updEntries: lq15.remEntries}, SingleQ15{updEntries: lq15.updEntries}
+			ti.sendIndividualIndex(updS, ti.makeSingleLocalQ15UpdArgs(remQ15, deletedOrder, newOrder, updS, 0, indexN, int8(indexN-INDEX_BKT)), serverN)
+			ti.sendIndividualIndex(updS, ti.makeSingleLocalQ15UpdArgs(newQ15, deletedOrder, newOrder, updS, 0, indexN, int8(indexN-INDEX_BKT)), serverN)
+		} else {
+			lq15 := info.(SingleLocalQ15TopSum)
+			remQ15, newQ15 := SingleQ15TopSum{diffEntries: lq15.remEntries}, SingleQ15TopSum{diffEntries: lq15.updEntries}
+			ti.sendIndividualIndex(updS, ti.makeSingleLocalQ15TopSumUpdArgs(remQ15, deletedOrder, newOrder, updS, 0, indexN, int8(indexN-INDEX_BKT)), serverN)
+			ti.sendIndividualIndex(updS, ti.makeSingleLocalQ15TopSumUpdArgs(newQ15, deletedOrder, newOrder, updS, 0, indexN, int8(indexN-INDEX_BKT)), serverN)
+		}
 	case 18:
 		ti.sendIndividualIndex(updS, ti.makeSingleQ18UpdArgs(info.(SingleQ18), deletedOrder, newOrder, updS, 0, indexN), serverN)
 	}
@@ -568,10 +676,18 @@ func (ti SingleTableInfo) genericLocalSendIndividualIndex(info interface{}, quer
 		ti.sendIndividualIndex(updS, ti.makeSingleQ14UpdArgs(remQ14, deletedOrder, newOrder, updS, 0, indexR), serverR)
 		ti.sendIndividualIndex(updS, ti.makeSingleQ14UpdArgs(newQ14, deletedOrder, newOrder, updS, 0, indexN), serverN)
 	case 15:
-		lq15 := info.(SingleLocalQ15)
-		remQ15, newQ15 := SingleQ15{updEntries: lq15.remEntries}, SingleQ15{updEntries: lq15.updEntries}
-		ti.sendIndividualIndex(updS, ti.makeSingleLocalQ15UpdArgs(remQ15, deletedOrder, newOrder, updS, 0, indexR, int8(serverR)), serverR)
-		ti.sendIndividualIndex(updS, ti.makeSingleLocalQ15UpdArgs(newQ15, deletedOrder, newOrder, updS, 0, indexN, int8(serverN)), serverN)
+		if !useTopSum {
+			lq15 := info.(SingleLocalQ15)
+			remQ15, newQ15 := SingleQ15{updEntries: lq15.remEntries}, SingleQ15{updEntries: lq15.updEntries}
+			ti.sendIndividualIndex(updS, ti.makeSingleLocalQ15UpdArgs(remQ15, deletedOrder, newOrder, updS, 0, indexR, int8(serverR)), serverR)
+			ti.sendIndividualIndex(updS, ti.makeSingleLocalQ15UpdArgs(newQ15, deletedOrder, newOrder, updS, 0, indexN, int8(serverN)), serverN)
+		} else {
+			lq15 := info.(SingleLocalQ15TopSum)
+			remQ15, newQ15 := SingleQ15TopSum{diffEntries: lq15.remEntries}, SingleQ15TopSum{diffEntries: lq15.updEntries}
+			ti.sendIndividualIndex(updS, ti.makeSingleLocalQ15TopSumUpdArgs(remQ15, deletedOrder, newOrder, updS, 0, indexR, int8(serverR)), serverR)
+			ti.sendIndividualIndex(updS, ti.makeSingleLocalQ15TopSumUpdArgs(newQ15, deletedOrder, newOrder, updS, 0, indexN, int8(serverN)), serverN)
+		}
+
 	case 18:
 		q18 := info.(SingleQ18)
 		ti.sendIndividualIndex(updS, ti.makeSingleQ18UpdsArgsNews(q18, newOrder, updS, 0, indexN), serverN)
@@ -604,44 +720,6 @@ func (ti SingleTableInfo) sendSpecificIndexIndividual(deleteKey string, newOrder
 			}
 		}
 	}
-
-	/*
-
-		regN, regR := ti.OrderToRegionkey(newOrder), ti.OrderToRegionkey(deletedOrder)
-		updS := updParams[0] //Doesn't matter which buffer is used
-
-		if isIndexGlobal {
-			ti.sendIndividualIndex(updS, ti.makeSingleQ3UpdArgs(indexInfo.q3, deletedOrder, newOrder, updS, 0, INDEX_BKT), ti.indexServer)
-			ti.sendIndividualIndex(updS, ti.makeSingleQ5UpdArgs(indexInfo.q5, deletedOrder, newOrder, updS, 0, INDEX_BKT), ti.indexServer)
-			ti.sendIndividualIndex(updS, ti.makeSingleQ14UpdArgs(indexInfo.q14, deletedOrder, newOrder, updS, 0, INDEX_BKT), ti.indexServer)
-			ti.sendIndividualIndex(updS, ti.makeSingleQ15UpdArgs(indexInfo.q15, deletedOrder, newOrder, updS, 0, INDEX_BKT), ti.indexServer)
-			ti.sendIndividualIndex(updS, ti.makeSingleQ18UpdArgs(indexInfo.q18, deletedOrder, newOrder, updS, 0, INDEX_BKT), ti.indexServer)
-		} else {
-			newI, remI := int(regN)+INDEX_BKT, int(regR)+INDEX_BKT
-			newS, remS := int(regN), int(regR)
-			if regN == regR {
-				//Single msg for both new & rem
-				ti.sendIndividualIndex(updS, ti.makeSingleQ3UpdArgs(indexInfo.q3, deletedOrder, newOrder, updS, 0, newI), newS)
-				ti.sendIndividualIndex(updS, ti.makeSingleQ5UpdArgs(indexInfo.q5, deletedOrder, newOrder, updS, 0, newI), newS)
-				ti.sendIndividualIndex(updS, ti.makeSingleQ14UpdArgs(SingleQ14{mapPromo: indexInfo.lq14.mapPromoRem, mapTotal: indexInfo.lq14.mapTotalRem}, deletedOrder, newOrder, updS, 0, newI), newS)
-				ti.sendIndividualIndex(updS, ti.makeSingleQ14UpdArgs(SingleQ14{mapPromo: indexInfo.lq14.mapPromoUpd, mapTotal: indexInfo.lq14.mapTotalUpd}, deletedOrder, newOrder, updS, 0, newI), newS)
-				ti.sendIndividualIndex(updS, ti.makeSingleLocalQ15UpdArgs(SingleQ15{updEntries: indexInfo.lq15.remEntries}, deletedOrder, newOrder, updS, 0, newI, regN), newS)
-				ti.sendIndividualIndex(updS, ti.makeSingleLocalQ15UpdArgs(SingleQ15{updEntries: indexInfo.lq15.updEntries}, deletedOrder, newOrder, updS, 0, newI, regN), newS)
-				ti.sendIndividualIndex(updS, ti.makeSingleQ18UpdArgs(indexInfo.q18, deletedOrder, newOrder, updS, 0, newI), newS)
-			} else {
-				ti.sendIndividualIndex(updS, ti.makeSingleQ3UpdsArgsNews(indexInfo.q3, newOrder, updS, 0, newI), newS)
-				ti.sendIndividualIndex(updS, ti.makeSingleQ5UpdArgsHelper(*indexInfo.q5.updValue, 1.0, newOrder, updS, 0, newI), newS)
-				ti.sendIndividualIndex(updS, ti.makeSingleQ14UpdArgs(SingleQ14{mapPromo: indexInfo.lq14.mapPromoUpd, mapTotal: indexInfo.lq14.mapTotalUpd}, deletedOrder, newOrder, updS, 0, newI), newS)
-				ti.sendIndividualIndex(updS, ti.makeSingleLocalQ15UpdArgs(SingleQ15{updEntries: indexInfo.lq15.updEntries}, deletedOrder, newOrder, updS, 0, newI, regN), newS)
-				ti.sendIndividualIndex(updS, ti.makeSingleQ18UpdsArgsNews(indexInfo.q18, newOrder, updS, 0, newI), newS)
-				ti.sendIndividualIndex(updS, ti.makeSingleQ3UpdsArgsRems(indexInfo.q3, deletedOrder, updS, 0, remI), remS)
-				ti.sendIndividualIndex(updS, ti.makeSingleQ5UpdArgsHelper(*indexInfo.q5.remValue, -1.0, deletedOrder, updS, 0, remI), remS)
-				ti.sendIndividualIndex(updS, ti.makeSingleQ14UpdArgs(SingleQ14{mapPromo: indexInfo.lq14.mapPromoRem, mapTotal: indexInfo.lq14.mapTotalRem}, deletedOrder, newOrder, updS, 0, remI), remS)
-				ti.sendIndividualIndex(updS, ti.makeSingleLocalQ15UpdArgs(SingleQ15{updEntries: indexInfo.lq15.remEntries}, deletedOrder, newOrder, updS, 0, remI, regR), remS)
-				ti.sendIndividualIndex(updS, ti.makeSingleQ18UpdsArgsRems(indexInfo.q18, deletedOrder, updS, 0, remI), remS)
-			}
-		}
-	*/
 }
 
 func (ti SingleTableInfo) sendIndividualUpdates(upds [][]antidote.UpdateObjectParams, bufI []int) {
@@ -691,7 +769,11 @@ func (ti SingleTableInfo) getSingleDataChange(updParams [][]antidote.UpdateObjec
 			bufS = ti.makeSingleQ3UpdArgs(indexInfo.q3, deletedOrder, newOrder, updS, bufS, INDEX_BKT)
 			bufS = ti.makeSingleQ5UpdArgs(indexInfo.q5, deletedOrder, newOrder, updS, bufS, INDEX_BKT)
 			bufS = ti.makeSingleQ14UpdArgs(indexInfo.q14, deletedOrder, newOrder, updS, bufS, INDEX_BKT)
-			bufS = ti.makeSingleQ15UpdArgs(indexInfo.q15, deletedOrder, newOrder, updS, bufS, INDEX_BKT)
+			if !useTopSum {
+				bufS = ti.makeSingleQ15UpdArgs(indexInfo.q15, deletedOrder, newOrder, updS, bufS, INDEX_BKT)
+			} else {
+				bufS = ti.makeSingleQ15TopSumUpdArgs(indexInfo.q15TopSum, deletedOrder, newOrder, updS, bufS, INDEX_BKT)
+			}
 			bufS = ti.makeSingleQ18UpdArgs(indexInfo.q18, deletedOrder, newOrder, updS, bufS, INDEX_BKT)
 			bufI[ti.indexServer] = bufS
 		} else {
@@ -703,8 +785,13 @@ func (ti SingleTableInfo) getSingleDataChange(updParams [][]antidote.UpdateObjec
 				bufN = ti.makeSingleQ5UpdArgs(indexInfo.q5, deletedOrder, newOrder, updN, bufN, newI)
 				bufN = ti.makeSingleQ14UpdArgs(SingleQ14{mapPromo: indexInfo.lq14.mapPromoRem, mapTotal: indexInfo.lq14.mapTotalRem}, deletedOrder, newOrder, updN, bufN, newI)
 				bufN = ti.makeSingleQ14UpdArgs(SingleQ14{mapPromo: indexInfo.lq14.mapPromoUpd, mapTotal: indexInfo.lq14.mapTotalUpd}, deletedOrder, newOrder, updN, bufN, newI)
-				bufN = ti.makeSingleLocalQ15UpdArgs(SingleQ15{updEntries: indexInfo.lq15.remEntries}, deletedOrder, newOrder, updN, bufN, newI, regN)
-				bufN = ti.makeSingleLocalQ15UpdArgs(SingleQ15{updEntries: indexInfo.lq15.updEntries}, deletedOrder, newOrder, updN, bufN, newI, regN)
+				if !useTopSum {
+					bufN = ti.makeSingleLocalQ15UpdArgs(SingleQ15{updEntries: indexInfo.lq15.remEntries}, deletedOrder, newOrder, updN, bufN, newI, regN)
+					bufN = ti.makeSingleLocalQ15UpdArgs(SingleQ15{updEntries: indexInfo.lq15.updEntries}, deletedOrder, newOrder, updN, bufN, newI, regN)
+				} else {
+					bufN = ti.makeSingleLocalQ15TopSumUpdArgs(SingleQ15TopSum{diffEntries: indexInfo.lq15TopSum.remEntries}, deletedOrder, newOrder, updN, bufN, newI, regN)
+					bufN = ti.makeSingleLocalQ15TopSumUpdArgs(SingleQ15TopSum{diffEntries: indexInfo.lq15TopSum.updEntries}, deletedOrder, newOrder, updN, bufN, newI, regN)
+				}
 				bufN = ti.makeSingleQ18UpdArgs(indexInfo.q18, deletedOrder, newOrder, updN, bufN, newI)
 				bufI[regN] = bufN
 			} else {
@@ -712,12 +799,20 @@ func (ti SingleTableInfo) getSingleDataChange(updParams [][]antidote.UpdateObjec
 				bufN = ti.makeSingleQ3UpdsArgsNews(indexInfo.q3, newOrder, updN, bufN, newI)
 				bufN = ti.makeSingleQ5UpdArgsHelper(*indexInfo.q5.updValue, 1.0, newOrder, updN, bufN, newI)
 				bufN = ti.makeSingleQ14UpdArgs(SingleQ14{mapPromo: indexInfo.lq14.mapPromoUpd, mapTotal: indexInfo.lq14.mapTotalUpd}, deletedOrder, newOrder, updN, bufN, newI)
-				bufN = ti.makeSingleLocalQ15UpdArgs(SingleQ15{updEntries: indexInfo.lq15.updEntries}, deletedOrder, newOrder, updN, bufN, newI, regN)
+				if !useTopSum {
+					bufN = ti.makeSingleLocalQ15UpdArgs(SingleQ15{updEntries: indexInfo.lq15.updEntries}, deletedOrder, newOrder, updN, bufN, newI, regN)
+				} else {
+					bufN = ti.makeSingleLocalQ15TopSumUpdArgs(SingleQ15TopSum{diffEntries: indexInfo.lq15TopSum.updEntries}, deletedOrder, newOrder, updN, bufN, newI, regN)
+				}
 				bufN = ti.makeSingleQ18UpdsArgsNews(indexInfo.q18, newOrder, updN, bufN, newI)
 				bufR = ti.makeSingleQ3UpdsArgsRems(indexInfo.q3, deletedOrder, updR, bufR, remI)
 				bufR = ti.makeSingleQ5UpdArgsHelper(*indexInfo.q5.remValue, -1.0, deletedOrder, updR, bufR, remI)
 				bufR = ti.makeSingleQ14UpdArgs(SingleQ14{mapPromo: indexInfo.lq14.mapPromoRem, mapTotal: indexInfo.lq14.mapTotalRem}, deletedOrder, newOrder, updR, bufR, remI)
-				bufR = ti.makeSingleLocalQ15UpdArgs(SingleQ15{updEntries: indexInfo.lq15.remEntries}, deletedOrder, newOrder, updR, bufR, remI, regR)
+				if !useTopSum {
+					bufR = ti.makeSingleLocalQ15UpdArgs(SingleQ15{updEntries: indexInfo.lq15.remEntries}, deletedOrder, newOrder, updR, bufR, remI, regR)
+				} else {
+					bufR = ti.makeSingleLocalQ15TopSumUpdArgs(SingleQ15TopSum{diffEntries: indexInfo.lq15TopSum.remEntries}, deletedOrder, newOrder, updR, bufR, remI, regR)
+				}
 				bufR = ti.makeSingleQ18UpdsArgsRems(indexInfo.q18, deletedOrder, updR, bufR, remI)
 				bufI[regN], bufI[regR] = bufN, bufR
 			}
@@ -847,7 +942,11 @@ func (ti SingleTableInfo) sendSingleDataChange(order []string, lineItems [][]str
 			bufS = ti.makeSingleQ3UpdArgs(indexInfo.q3, deletedOrder, newOrder, updS, bufS, INDEX_BKT)
 			bufS = ti.makeSingleQ5UpdArgs(indexInfo.q5, deletedOrder, newOrder, updS, bufS, INDEX_BKT)
 			bufS = ti.makeSingleQ14UpdArgs(indexInfo.q14, deletedOrder, newOrder, updS, bufS, INDEX_BKT)
-			bufS = ti.makeSingleQ15UpdArgs(indexInfo.q15, deletedOrder, newOrder, updS, bufS, INDEX_BKT)
+			if !useTopSum {
+				bufS = ti.makeSingleQ15UpdArgs(indexInfo.q15, deletedOrder, newOrder, updS, bufS, INDEX_BKT)
+			} else {
+				bufS = ti.makeSingleQ15TopSumUpdArgs(indexInfo.q15TopSum, deletedOrder, newOrder, updS, bufS, INDEX_BKT)
+			}
 			bufS = ti.makeSingleQ18UpdArgs(indexInfo.q18, deletedOrder, newOrder, updS, bufS, INDEX_BKT)
 			bufI[ti.indexServer] = bufS
 		} else {
@@ -859,8 +958,13 @@ func (ti SingleTableInfo) sendSingleDataChange(order []string, lineItems [][]str
 				bufN = ti.makeSingleQ5UpdArgs(indexInfo.q5, deletedOrder, newOrder, updN, bufN, newI)
 				bufN = ti.makeSingleQ14UpdArgs(SingleQ14{mapPromo: indexInfo.lq14.mapPromoRem, mapTotal: indexInfo.lq14.mapTotalRem}, deletedOrder, newOrder, updN, bufN, newI)
 				bufN = ti.makeSingleQ14UpdArgs(SingleQ14{mapPromo: indexInfo.lq14.mapPromoUpd, mapTotal: indexInfo.lq14.mapTotalUpd}, deletedOrder, newOrder, updN, bufN, newI)
-				bufN = ti.makeSingleLocalQ15UpdArgs(SingleQ15{updEntries: indexInfo.lq15.remEntries}, deletedOrder, newOrder, updN, bufN, newI, regN)
-				bufN = ti.makeSingleLocalQ15UpdArgs(SingleQ15{updEntries: indexInfo.lq15.updEntries}, deletedOrder, newOrder, updN, bufN, newI, regN)
+				if !useTopSum {
+					bufN = ti.makeSingleLocalQ15UpdArgs(SingleQ15{updEntries: indexInfo.lq15.remEntries}, deletedOrder, newOrder, updN, bufN, newI, regN)
+					bufN = ti.makeSingleLocalQ15UpdArgs(SingleQ15{updEntries: indexInfo.lq15.updEntries}, deletedOrder, newOrder, updN, bufN, newI, regN)
+				} else {
+					bufN = ti.makeSingleLocalQ15TopSumUpdArgs(SingleQ15TopSum{diffEntries: indexInfo.lq15TopSum.remEntries}, deletedOrder, newOrder, updN, bufN, newI, regN)
+					bufN = ti.makeSingleLocalQ15TopSumUpdArgs(SingleQ15TopSum{diffEntries: indexInfo.lq15TopSum.updEntries}, deletedOrder, newOrder, updN, bufN, newI, regN)
+				}
 				bufN = ti.makeSingleQ18UpdArgs(indexInfo.q18, deletedOrder, newOrder, updN, bufN, newI)
 				bufI[regN] = bufN
 			} else {
@@ -868,12 +972,20 @@ func (ti SingleTableInfo) sendSingleDataChange(order []string, lineItems [][]str
 				bufN = ti.makeSingleQ3UpdsArgsNews(indexInfo.q3, newOrder, updN, bufN, newI)
 				bufN = ti.makeSingleQ5UpdArgsHelper(*indexInfo.q5.updValue, 1.0, newOrder, updN, bufN, newI)
 				bufN = ti.makeSingleQ14UpdArgs(SingleQ14{mapPromo: indexInfo.lq14.mapPromoUpd, mapTotal: indexInfo.lq14.mapTotalUpd}, deletedOrder, newOrder, updN, bufN, newI)
-				bufN = ti.makeSingleLocalQ15UpdArgs(SingleQ15{updEntries: indexInfo.lq15.updEntries}, deletedOrder, newOrder, updN, bufN, newI, regN)
+				if !useTopSum {
+					bufN = ti.makeSingleLocalQ15UpdArgs(SingleQ15{updEntries: indexInfo.lq15.updEntries}, deletedOrder, newOrder, updN, bufN, newI, regN)
+				} else {
+					bufN = ti.makeSingleLocalQ15TopSumUpdArgs(SingleQ15TopSum{diffEntries: indexInfo.lq15TopSum.updEntries}, deletedOrder, newOrder, updN, bufN, newI, regN)
+				}
 				bufN = ti.makeSingleQ18UpdsArgsNews(indexInfo.q18, newOrder, updN, bufN, newI)
 				bufR = ti.makeSingleQ3UpdsArgsRems(indexInfo.q3, deletedOrder, updR, bufR, remI)
 				bufR = ti.makeSingleQ5UpdArgsHelper(*indexInfo.q5.remValue, -1.0, deletedOrder, updR, bufR, remI)
 				bufR = ti.makeSingleQ14UpdArgs(SingleQ14{mapPromo: indexInfo.lq14.mapPromoRem, mapTotal: indexInfo.lq14.mapTotalRem}, deletedOrder, newOrder, updR, bufR, remI)
-				bufR = ti.makeSingleLocalQ15UpdArgs(SingleQ15{updEntries: indexInfo.lq15.remEntries}, deletedOrder, newOrder, updR, bufR, remI, regR)
+				if !useTopSum {
+					bufR = ti.makeSingleLocalQ15UpdArgs(SingleQ15{updEntries: indexInfo.lq15.remEntries}, deletedOrder, newOrder, updR, bufR, remI, regR)
+				} else {
+					bufR = ti.makeSingleLocalQ15TopSumUpdArgs(SingleQ15TopSum{diffEntries: indexInfo.lq15TopSum.remEntries}, deletedOrder, newOrder, updR, bufR, remI, regR)
+				}
 				bufR = ti.makeSingleQ18UpdsArgsRems(indexInfo.q18, deletedOrder, updR, bufR, remI)
 				bufI[regN], bufI[regR] = bufN, bufR
 			}
@@ -1207,19 +1319,30 @@ func getSingleDataUpdateParams(key string, updArgs crdt.UpdateArguments, name st
 func (ti SingleTableInfo) getSingleIndexUpds(deleteKey string, newOrder *Orders, newItems []*LineItem,
 	remOrder *Orders, remItems []*LineItem) (nUpdsN, nUpdsR, nUpdsStats int, indexInfo IndexInfo) {
 	if isIndexGlobal {
-		q3, q5, q14, q15, q18 := ti.getSingleQ3Upds(remOrder, remItems, newOrder, newItems),
-			ti.getSingleQ5Upds(remOrder, remItems, newOrder, newItems), ti.getSingleQ14Upds(remOrder, remItems, newOrder, newItems),
-			ti.getSingleQ15Upds(remOrder, remItems, newOrder, newItems), ti.getSingleQ18Upds(remOrder, remItems, newOrder, newItems)
+		q15, q15TopSum := SingleQ15{}, SingleQ15TopSum{}
+		q3, q5, q14, q18 := ti.getSingleQ3Upds(remOrder, remItems, newOrder, newItems), ti.getSingleQ5Upds(remOrder, remItems, newOrder, newItems),
+			ti.getSingleQ14Upds(remOrder, remItems, newOrder, newItems), ti.getSingleQ18Upds(remOrder, remItems, newOrder, newItems)
+		if !useTopSum {
+			q15 = ti.getSingleQ15Upds(remOrder, remItems, newOrder, newItems)
+		} else {
+			q15TopSum = ti.getSingleQ15TopSumUpds(remOrder, remItems, newOrder, newItems)
+		}
 
-		nUpdsN, nUpdsStats = ti.getNUpdObjs(q3, q5, q14, q15, q18)
-		indexInfo = IndexInfo{q3: q3, q5: q5, q14: q14, q15: q15, q18: q18}
+		nUpdsN, nUpdsStats = ti.getNUpdObjs(q3, q5, q14, q15, q15TopSum, q18)
+		indexInfo = IndexInfo{q3: q3, q5: q5, q14: q14, q15: q15, q15TopSum: q15TopSum, q18: q18}
 	} else {
 		newR, remR := ti.OrderToRegionkey(newOrder), ti.OrderToRegionkey(remOrder)
-		q3, q5, q14, q15, q18 := ti.getSingleQ3Upds(remOrder, remItems, newOrder, newItems),
+		q15, q15TopSum := SingleLocalQ15{}, SingleLocalQ15TopSum{}
+		q3, q5, q14, q18 := ti.getSingleQ3Upds(remOrder, remItems, newOrder, newItems),
 			ti.getSingleQ5Upds(remOrder, remItems, newOrder, newItems), ti.getSingleLocalQ14Upds(remOrder, remItems, newOrder, newItems),
-			ti.getSingleLocalQ15Upds(remOrder, remItems, newOrder, newItems, remR, newR), ti.getSingleQ18Upds(remOrder, remItems, newOrder, newItems)
-		nUpdsR, nUpdsN, nUpdsStats = ti.getNUpdLocalObjs(q3, q5, q14, q15, q18, remR, newR)
-		indexInfo = IndexInfo{q3: q3, q5: q5, lq14: q14, lq15: q15, q18: q18}
+			ti.getSingleQ18Upds(remOrder, remItems, newOrder, newItems)
+		if !useTopSum {
+			q15 = ti.getSingleLocalQ15Upds(remOrder, remItems, newOrder, newItems, remR, newR)
+		} else {
+			q15TopSum = ti.getSingleLocalQ15TopSumUpds(remOrder, remItems, newOrder, newItems, remR, newR)
+		}
+		nUpdsR, nUpdsN, nUpdsStats = ti.getNUpdLocalObjs(q3, q5, q14, q15, q15TopSum, q18, remR, newR)
+		indexInfo = IndexInfo{q3: q3, q5: q5, lq14: q14, lq15: q15, lq15TopSum: q15TopSum, q18: q18}
 	}
 	return
 }
@@ -1323,7 +1446,7 @@ func (ti SingleTableInfo) sendSingleGlobalIndexUpdates(deleteKey string, orderUp
 }
 */
 
-func (ti SingleTableInfo) getNUpdLocalObjs(q3 SingleQ3, q5 SingleQ5, q14 SingleLocalQ14, q15 SingleLocalQ15, q18 SingleQ18, remR,
+func (ti SingleTableInfo) getNUpdLocalObjs(q3 SingleQ3, q5 SingleQ5, q14 SingleLocalQ14, q15 SingleLocalQ15, q15TopSum SingleLocalQ15TopSum, q18 SingleQ18, remR,
 	newR int8) (nUpdsR, nUpdsN, nUpdsStats int) {
 
 	if q3.updStartPos > 0 {
@@ -1341,8 +1464,14 @@ func (ti SingleTableInfo) getNUpdLocalObjs(q3 SingleQ3, q5 SingleQ5, q14 SingleL
 	nUpdsR += ti.countQ18Upds(q18.remQuantity)
 	nUpdsN += ti.countQ18Upds(q18.updQuantity)
 	nUpdsStats = nUpdsN + nUpdsR
-	q15UpdsR, q15UpdsStatsR := ti.countQ15Upds(q15.remEntries)
-	q15UpdsN, q15UpdsStatsN := ti.countQ15Upds(q15.updEntries)
+	var q15UpdsR, q15UpdsN, q15UpdsStatsR, q15UpdsStatsN int
+	if !useTopSum {
+		q15UpdsR, q15UpdsStatsR = ti.countQ15Upds(q15.remEntries)
+		q15UpdsN, q15UpdsStatsN = ti.countQ15Upds(q15.updEntries)
+	} else {
+		q15UpdsR, q15UpdsStatsR = ti.countQ15TopSumUpds(q15TopSum.remEntries)
+		q15UpdsN, q15UpdsStatsN = ti.countQ15TopSumUpds(q15TopSum.updEntries)
+	}
 	nUpdsR += q15UpdsR
 	nUpdsN += q15UpdsN
 	nUpdsStats += q15UpdsStatsN + q15UpdsStatsR
@@ -1363,7 +1492,7 @@ func (ti SingleTableInfo) getNUpdLocalObjs(q3 SingleQ3, q5 SingleQ5, q14 SingleL
 	return
 }
 
-func (ti SingleTableInfo) getNUpdObjs(q3 SingleQ3, q5 SingleQ5, q14 SingleQ14, q15 SingleQ15, q18 SingleQ18) (nUpds int, nUpdsStats int) {
+func (ti SingleTableInfo) getNUpdObjs(q3 SingleQ3, q5 SingleQ5, q14 SingleQ14, q15 SingleQ15, q15TopSum SingleQ15TopSum, q18 SingleQ18) (nUpds int, nUpdsStats int) {
 	nUpds += q3.totalUpds
 	if *q5.remValue != 0 {
 		nUpds += 1
@@ -1375,7 +1504,12 @@ func (ti SingleTableInfo) getNUpdObjs(q3 SingleQ3, q5 SingleQ5, q14 SingleQ14, q
 	nUpds += ti.countQ18Upds(q18.remQuantity)
 	nUpds += ti.countQ18Upds(q18.updQuantity)
 	nUpdsStats = nUpds
-	q15Upds, q15UpdsStats := ti.countQ15Upds(q15.updEntries)
+	var q15Upds, q15UpdsStats int
+	if !useTopSum {
+		q15Upds, q15UpdsStats = ti.countQ15Upds(q15.updEntries)
+	} else {
+		q15Upds, q15UpdsStats = ti.countQ15TopSumUpds(q15TopSum.diffEntries)
+	}
 	nUpds += q15Upds
 	nUpdsStats += q15UpdsStats
 
@@ -1391,6 +1525,46 @@ func (ti SingleTableInfo) getNUpdObjs(q3 SingleQ3, q5 SingleQ5, q14 SingleQ14, q
 		fmt.Println(nUpds, nUpdsStats, q3.totalUpds, q5Upds, len(q14.mapTotal), q15Upds, q15UpdsStats, ti.countQ18Upds(q18.remQuantity), ti.countQ18Upds(q18.updQuantity))
 	*/
 	return
+}
+
+func (ti SingleTableInfo) countQ15TopSumUpds(diffEntries map[int16]map[int8]map[int32]float64) (nUpds, nPosUpd int) {
+	if !useTopKAll {
+		for _, monthMap := range diffEntries {
+			for _, suppMap := range monthMap {
+				nUpds += len(suppMap)
+			}
+		}
+	} else {
+		var suppMapValues map[int32]*float64
+		foundInc, foundDec := 0, 0
+		for year, monthMap := range diffEntries {
+			for month, suppMap := range monthMap {
+				if len(suppMap) == 1 {
+					nUpds++
+					nPosUpd++
+				} else {
+					suppMapValues = q15Map[year][month]
+					for _, value := range suppMapValues {
+						if *value > 0 {
+							foundInc++
+						} else {
+							foundDec++
+						}
+					}
+					nPosUpd += foundInc + foundDec
+					if foundInc > 0 {
+						nUpds++
+						foundInc = 0
+					}
+					if foundDec > 0 {
+						nUpds++
+						foundDec = 0
+					}
+				}
+			}
+		}
+	}
+	return nUpds, nUpds
 }
 
 func (ti SingleTableInfo) countQ15Upds(updEntries map[int16]map[int8]map[int32]struct{}) (nUpds, nPosUpd int) {
@@ -1608,6 +1782,31 @@ func (ti SingleTableInfo) q14SingleUpdsCalcHelper(multiplier float64, order *Ord
 	}
 }
 
+type SingleLocalQ15TopSum struct {
+	updEntries, remEntries map[int16]map[int8]map[int32]float64
+}
+
+type SingleQ15TopSum struct {
+	diffEntries map[int16]map[int8]map[int32]float64
+}
+
+func (ti SingleTableInfo) getSingleLocalQ15TopSumUpds(remOrder *Orders, remItems []*LineItem, newOrder *Orders, newItems []*LineItem,
+	remKey, updKey int8) SingleLocalQ15TopSum {
+	remEntries, updEntries := createQ15TopSumEntriesMap(), createQ15TopSumEntriesMap()
+	q15TopSumUpdsRemCalcHelper(remItems, q15LocalMap[remKey], remEntries)
+	q15TopSumUpdsNewCalcHelper(newItems, q15LocalMap[updKey], updEntries)
+	return SingleLocalQ15TopSum{remEntries: remEntries, updEntries: updEntries}
+}
+
+func (ti SingleTableInfo) getSingleQ15TopSumUpds(remOrder *Orders, remItems []*LineItem, newOrder *Orders, newItems []*LineItem) SingleQ15TopSum {
+
+	diffEntries := createQ15TopSumEntriesMap()
+	q15TopSumUpdsRemCalcHelper(remItems, q15Map, diffEntries)
+	q15TopSumUpdsNewCalcHelper(newItems, q15Map, diffEntries)
+
+	return SingleQ15TopSum{diffEntries: diffEntries}
+}
+
 type SingleLocalQ15 struct {
 	remEntries, updEntries map[int16]map[int8]map[int32]struct{}
 }
@@ -1755,6 +1954,20 @@ func (ti SingleTableInfo) makeSingleQ14UpdArgs(q14Info SingleQ14, newOrder *Orde
 	return bufI
 }
 
+func (ti SingleTableInfo) makeSingleLocalQ15TopSumUpdArgs(q15Info SingleQ15TopSum, newOrder *Orders, remOrder *Orders,
+	buf []antidote.UpdateObjectParams, bufI int, bucketI int, regKey int8) (newBufI int) {
+
+	newBufI, _ = makeQ15TopSumIndexUpdsDeletesHelper(q15LocalMap[regKey], q15Info.diffEntries, bucketI, buf, bufI)
+	return newBufI
+}
+
+func (ti SingleTableInfo) makeSingleQ15TopSumUpdArgs(q15Info SingleQ15TopSum, newOrder *Orders, remOrder *Orders,
+	buf []antidote.UpdateObjectParams, bufI int, bucketI int) (newBufI int) {
+
+	newBufI, _ = makeQ15TopSumIndexUpdsDeletesHelper(q15Map, q15Info.diffEntries, INDEX_BKT, buf, bufI)
+	return newBufI
+}
+
 func (ti SingleTableInfo) makeSingleLocalQ15UpdArgs(q15Info SingleQ15, newOrder *Orders, remOrder *Orders,
 	buf []antidote.UpdateObjectParams, bufI int, bucketI int, regKey int8) (newBufI int) {
 
@@ -1850,64 +2063,123 @@ func doMixedStatsInterval() {
 	}
 }
 
+//TODO: Need to update the conversions most likely
 func writeMixStatsFile(stats []MixClientResult) {
 	//I should write the total, avg, best and worse for each part.
 	//Also write the total, avg, best and worse for the "final"
+
+	//TODO: Latency
 
 	qStatsPerPart, uStatsPerPart := convertMixStats(stats)
 	nFuncs := len(queryFuncs)
 
 	totalData := make([][]string, len(qStatsPerPart)+1) //space for final data as well
+	var latencyString []string
 
-	header := []string{"Total time", "Section time", "Queries txns", "Queries", "Reads", "Query txns/s", "Query/s", "Read/s",
-		"Updates", "Updates/s", "New upds", "Del upds", "Index upds", "Ops", "Ops/s", "Average latency (ms)"}
+	if LATENCY_MODE == AVG_OP {
+		latencyString = []string{"Average latency (ms)(AO)"}
+	} else if LATENCY_MODE == AVG_BATCH {
+		latencyString = []string{"Average latency (ms)(AB)", "Average latency (ms)(AO)"}
+	} else { //PER_OP
+		latencyString = []string{"AvgQ latency", "AvgU latency", "AvgAll latency (ms)", "Avg latency (ms)(AO)"}
+	}
 
-	partQueries, partReads, partTime, partQueryTxns, partUpds, partNews, partDels, partIndexes := 0, 0, int64(0), 0, 0, 0, 0, 0
-	totalQueries, totalReads, totalTime, totalNews, totalDels, totalIndexes := 0, 0, int64(0), 0, 0, 0
-	queryTxnsS, queryS, readS, updS, latency := 0.0, 0.0, 0.0, 0.0, 0.0
+	header := append([]string{"Total time", "Section time", "Queries cycles", "Queries", "Reads", "Query cycles/s", "Query/s", "Read/s",
+		"Query txns", "Query txns/s", "Updates", "Updates/s", "New upds", "Del upds", "Index upds", "Update txns", "Update txns/s", "Ops", "Ops/s",
+		"Txns", "Txn/s"}, latencyString...)
+
+	partQueries, partReads, partTime, partQueryCycles, partUpds, partNews, partDels, partIndexes, partQTime, partUTime := 0, 0, int64(0), 0, 0, 0, 0, 0, int64(0), int64(0)
+	partQTxns, partUTxns := 0, 0
+	totalQueries, totalReads, totalTime, totalNews, totalDels, totalIndexes, totalQTime, totalUTime, totalQTxns, totalUTxns := 0, 0, int64(0), 0, 0, 0, int64(0), int64(0), 0, 0
+	queryCycleS, queryS, readS, updS, latency, latencyPerOp, qTxnsS, uTxnsS := 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
 
 	for i, partStats := range qStatsPerPart {
 		for _, clientQStat := range partStats {
 			partQueries += clientQStat.nQueries
 			partReads += clientQStat.nReads
 			partTime += clientQStat.timeSpent
+			partQTime += clientQStat.latency
+			partQTxns += clientQStat.nTxns
 		}
 		for _, clientUStat := range uStatsPerPart[i] {
 			partNews += clientUStat.nNews
 			partDels += clientUStat.nDels
 			partIndexes += clientUStat.nIndex
+			partUTime += clientUStat.latency
+			partUTxns += clientUStat.nTxns
 		}
-		partQueryTxns, partUpds = partQueries/nFuncs, partNews+partDels+partIndexes
+		partQueryCycles, partUpds = partQueries/nFuncs, partNews+partDels+partIndexes
 		partTime /= int64(TEST_ROUTINES)
-		queryTxnsS, queryS, updS = (float64(partQueryTxns)/float64(partTime))*1000, (float64(partQueries)/float64(partTime))*1000, (float64(partUpds)/float64(partTime))*1000
-		readS, latency = (float64(partReads)/float64(partTime))*1000, float64(partTime*int64(TEST_ROUTINES))/float64(partQueries+partUpds)
+		queryCycleS, queryS = (float64(partQueryCycles)/float64(partTime))*1000, (float64(partQueries)/float64(partTime))*1000
+		updS, readS = (float64(partUpds)/float64(partTime))*1000, (float64(partReads)/float64(partTime))*1000
+		qTxnsS, uTxnsS = (float64(partQTxns)/float64(partTime))*1000, (float64(partUTxns)/float64(partTime))*1000
+		latencyPerOp = float64(partTime*int64(TEST_ROUTINES)) / float64(partQueries+partUpds)
+		latency = getStatsLatency(partTime, partQTime, partUTime, partQueries, partUpds, partQTxns, partUTxns)
 		totalQueries += partQueries
 		totalReads += partReads
 		totalTime += partTime
 		totalNews += partNews
 		totalDels += partDels
 		totalIndexes += partIndexes
+		totalQTime += partQTime
+		totalUTime += partUTime
+		totalQTxns += partQTxns
+		totalUTxns += partUTxns
+
+		//header := append([]string{"Total time", "Section time", "Queries cycles", "Queries", "Reads", "Query cycles/s", "Query/s", "Read/s",
+		//"Query txns", "Query txns/s", "Updates", "Updates/s", "New upds", "Del upds", "Index upds", "Update txns", "Update txns/s", "Ops", "Ops/s",
+		//"Txns", "Txn/s"}, latencyString...)
 
 		totalData[i] = []string{strconv.FormatInt(totalTime, 10), strconv.FormatInt(partTime, 10),
-			strconv.FormatInt(int64(partQueryTxns), 10), strconv.FormatInt(int64(partQueries), 10), strconv.FormatInt(int64(partReads), 10),
-			strconv.FormatFloat(queryTxnsS, 'f', 10, 64), strconv.FormatFloat(queryS, 'f', 10, 64),
-			strconv.FormatFloat(readS, 'f', 10, 64), strconv.FormatInt(int64(partUpds), 10), strconv.FormatFloat(updS, 'f', 10, 64),
+			strconv.FormatInt(int64(partQueryCycles), 10), strconv.FormatInt(int64(partQueries), 10), strconv.FormatInt(int64(partReads), 10),
+			strconv.FormatFloat(queryCycleS, 'f', 10, 64), strconv.FormatFloat(queryS, 'f', 10, 64),
+			strconv.FormatFloat(readS, 'f', 10, 64), strconv.FormatInt(int64(partQTxns), 10), strconv.FormatFloat(qTxnsS, 'f', 10, 64),
+			strconv.FormatInt(int64(partUpds), 10), strconv.FormatFloat(updS, 'f', 10, 64),
 			strconv.FormatInt(int64(partNews), 10), strconv.FormatInt(int64(partDels), 10), strconv.FormatInt(int64(partIndexes), 10),
-			strconv.FormatInt(int64(partQueries+partUpds), 10), strconv.FormatFloat(queryS+updS, 'f', 10, 64), strconv.FormatFloat(latency, 'f', 10, 64)}
+			strconv.FormatInt(int64(partUTxns), 10), strconv.FormatFloat(uTxnsS, 'f', 10, 64),
+			strconv.FormatInt(int64(partQueries+partUpds), 10), strconv.FormatFloat(queryS+updS, 'f', 10, 64),
+			strconv.FormatInt(int64(partQTxns+partUTxns), 10), strconv.FormatFloat(qTxnsS+uTxnsS, 'f', 10, 64)}
 
-		partQueryTxns, partQueries, partReads, partTime, partUpds, partNews, partDels, partIndexes = 0, 0, 0, 0, 0, 0, 0, 0
+		if LATENCY_MODE == PER_BATCH {
+			qLatency, uLatency := float64(partQTime)/float64(partQTxns), float64(partUTime)/float64(partUTxns)
+			totalData[i] = append(totalData[i], strconv.FormatFloat(qLatency, 'f', 10, 64), strconv.FormatFloat(uLatency, 'f', 10, 64), strconv.FormatFloat(latency, 'f', 10, 64))
+			//fmt.Printf("Time, qTime, uTime, qTxns, uTxns, qLatency, uLatency: %d %d %d %d %d %f %f\n", totalTime, totalQTime, totalUTime, totalQTxns, totalUTxns, qLatency, uLatency)
+		} else if LATENCY_MODE == AVG_BATCH {
+			totalData[i] = append(totalData[i], strconv.FormatFloat(latency, 'f', 10, 64))
+		}
+		//All modes use AVG_OP
+		totalData[i] = append(totalData[i], strconv.FormatFloat(latencyPerOp, 'f', 10, 64))
+		//qLatency, uLatency = float64(partQTxns)/float64(partQTime), float64(partUTxns)/float64(partUTime)
+
+		partQueryCycles, partQueries, partReads, partTime, partUpds, partNews, partDels, partIndexes, partQTime, partQTxns, partUTime, partUTxns = 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0
 	}
 
 	totalQueryTxns, totalUpds := totalQueries/nFuncs, totalNews+totalDels+totalIndexes
-	queryTxnsS, queryS, updS = (float64(totalQueryTxns)/float64(totalTime))*1000, (float64(totalQueries)/float64(totalTime))*1000, (float64(totalUpds)/float64(totalTime))*1000
-	readS, latency = (float64(totalReads)/float64(totalTime))*1000, float64(totalTime*int64(TEST_ROUTINES))/float64(totalQueries+totalUpds)
+	queryCycleS, queryS, updS = (float64(totalQueryTxns)/float64(totalTime))*1000, (float64(totalQueries)/float64(totalTime))*1000, (float64(totalUpds)/float64(totalTime))*1000
+	readS = (float64(totalReads) / float64(totalTime)) * 1000
+	qTxnsS, uTxnsS = (float64(totalQTxns)/float64(totalTime))*1000, (float64(totalUTxns)/float64(totalTime))*1000
+	latencyPerOp = float64(totalTime*int64(TEST_ROUTINES)) / float64(totalQueries+totalUpds)
+	latency = getStatsLatency(totalTime, totalQTime, totalUTime, totalQueries, totalUpds, totalQTxns, totalUTxns)
 
 	finalData := []string{strconv.FormatInt(totalTime, 10), strconv.FormatInt(totalTime, 10),
 		strconv.FormatInt(int64(totalQueryTxns), 10), strconv.FormatInt(int64(totalQueries), 10), strconv.FormatInt(int64(totalReads), 10),
-		strconv.FormatFloat(queryTxnsS, 'f', 10, 64), strconv.FormatFloat(queryS, 'f', 10, 64),
-		strconv.FormatFloat(readS, 'f', 10, 64), strconv.FormatInt(int64(totalUpds), 10), strconv.FormatFloat(updS, 'f', 10, 64),
+		strconv.FormatFloat(queryCycleS, 'f', 10, 64), strconv.FormatFloat(queryS, 'f', 10, 64),
+		strconv.FormatFloat(readS, 'f', 10, 64), strconv.FormatInt(int64(totalQTxns), 10), strconv.FormatFloat(qTxnsS, 'f', 10, 64),
+		strconv.FormatInt(int64(totalUpds), 10), strconv.FormatFloat(updS, 'f', 10, 64),
 		strconv.FormatInt(int64(totalNews), 10), strconv.FormatInt(int64(totalDels), 10), strconv.FormatInt(int64(totalIndexes), 10),
-		strconv.FormatInt(int64(totalQueries+totalUpds), 10), strconv.FormatFloat(queryS+updS, 'f', 10, 64), strconv.FormatFloat(latency, 'f', 10, 64)}
+		strconv.FormatInt(int64(totalUTxns), 10), strconv.FormatFloat(uTxnsS, 'f', 10, 64),
+		strconv.FormatInt(int64(totalQueries+totalUpds), 10), strconv.FormatFloat(queryS+updS, 'f', 10, 64),
+		strconv.FormatInt(int64(totalQTxns+totalUTxns), 10), strconv.FormatFloat(qTxnsS+uTxnsS, 'f', 10, 64)}
+
+	if LATENCY_MODE == PER_BATCH {
+		qLatency, uLatency := float64(totalQTime)/float64(totalQTxns), float64(totalUTime)/float64(totalUTxns)
+		finalData = append(finalData, strconv.FormatFloat(qLatency, 'f', 10, 64), strconv.FormatFloat(uLatency, 'f', 10, 64), strconv.FormatFloat(latency, 'f', 10, 64))
+	} else if LATENCY_MODE == AVG_BATCH {
+		finalData = append(finalData, strconv.FormatFloat(latency, 'f', 10, 64))
+	}
+	//All modes use AVG_OP
+	finalData = append(finalData, strconv.FormatFloat(latencyPerOp, 'f', 10, 64))
+
 	totalData[len(totalData)-1] = finalData
 
 	file := getStatsFileToWrite("mixStats")
@@ -1924,7 +2196,16 @@ func writeMixStatsFile(stats []MixClientResult) {
 		writer.Write(line)
 	}
 
-	fmt.Println("Mix statistics saved successfully.")
+	fmt.Println("Mix statistics saved successfully to " + file.Name())
+}
+
+func getStatsLatency(partTime, qTime, uTime int64, nQueries, nUpds, nQueryTxns, nUpdTxns int) float64 {
+	if LATENCY_MODE == AVG_OP {
+		return float64(partTime*int64(TEST_ROUTINES)) / float64(nQueries+nUpds)
+	} else if LATENCY_MODE == AVG_BATCH {
+		return float64(partTime*int64(TEST_ROUTINES)) / float64(nQueryTxns+nUpdTxns)
+	}
+	return float64(qTime+uTime) / float64(nQueryTxns+nUpdTxns)
 }
 
 func convertMixStats(stats []MixClientResult) (qStats [][]QueryStats, uStats [][]UpdateStats) {

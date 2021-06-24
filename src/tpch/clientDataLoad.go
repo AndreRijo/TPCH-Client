@@ -1,11 +1,11 @@
 package tpch
 
 import (
-	"antidote"
-	"crdt"
+	"potionDB/src/antidote"
+	"potionDB/src/crdt"
 	"fmt"
 	"math"
-	"proto"
+	"potionDB/src/proto"
 	"runtime"
 	"strings"
 	"time"
