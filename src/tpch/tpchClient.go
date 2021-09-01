@@ -344,7 +344,7 @@ func loadConfigsFile(configs *tools.ConfigLoader) {
 	if *configFolder == "none" {
 		fmt.Println("Non-defined configFolder, using defaults")
 		isMulti, splitIndexLoad, memDebug, profiling, scaleFactor, maxUpdSize, useTopKAll, useTopSum = true, true, false, false, 0.1, 2000, false, false
-		commonFolder = "/Users/a.rijo/Documents/University_6th_year/potionDB docs/"
+		commonFolder = "/Users/sofiabraz/5º Ano/Tese/tpc-h/TPC-H_Tools_v3.0.0/dbgen/"
 		MAX_BUFF_PROTOS, QUERY_WAIT, FORCE_PROTO_CLEAN, TEST_DURATION = 200, 5000, 10000, 20000
 
 		PRINT_QUERY, QUERY_BENCH, CRDT_BENCH = true, false, false
@@ -481,15 +481,6 @@ func StartClient() {
 			i += 10
 		}
 	}()
-
-	if DOES_QUERIES && !DOES_UPDATES {
-		//If it's a mixed client, it'll be started on clientDataLoad.go
-		if QUERY_BENCH {
-			go startQueriesBench()
-		} else {
-			go sendQueries(conns[0])
-		}
-	}
 
 	startTime := time.Now().UnixNano()
 	rand.Seed(startTime)

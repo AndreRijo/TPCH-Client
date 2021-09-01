@@ -1,18 +1,18 @@
 package tpch
 
 import (
-	"potionDB/src/antidote"
 	"encoding/csv"
 	"fmt"
 	"net"
 	"os"
+	"potionDB/src/antidote"
 	"potionDB/src/proto"
+	"potionDB/src/tools"
 	"runtime"
 	"strconv"
 	"strings"
 	"sync/atomic"
 	"time"
-	"potionDB/src/tools"
 
 	pb "github.com/golang/protobuf/proto"
 )
@@ -48,8 +48,8 @@ const (
 var (
 	//servers = []string{"127.0.0.1:8087"}
 	//servers = []string{"127.0.0.1:8087", "127.0.0.1:8087", "127.0.0.1:8087", "127.0.0.1:8087", "127.0.0.1:8087"}
-	//servers = []string{"127.0.0.1:8087", "127.0.0.1:8088", "127.0.0.1:8089", "127.0.0.1:8090", "127.0.0.1:8091"}
-	servers []string
+	servers = []string{"192.168.68.118:8087", "192.168.68.118:8088", "192.168.68.118:8089", "192.168.68.118:8090", "192.168.68.118:8091"}
+	//servers []string
 
 	channels = Channels{
 		//First two are used internally by clientDataLoad. The later two are initialized in tpchClient.go

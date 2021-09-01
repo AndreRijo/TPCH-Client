@@ -106,6 +106,10 @@ func handleTableProcessing() {
 		//Read only order updates in order to know the new orderIDs added by the update client.
 		go readOrderUpdates()
 	}
+	if DOES_QUERIES && !DOES_UPDATES {
+		//If it's a mixed client, it'll be started on clientDataLoad.go
+		go myTestGlobal()
+	}
 }
 
 func handlePrepareSend() {
