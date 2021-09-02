@@ -9,6 +9,7 @@ import (
 	"potionDB/src/proto"
 	"potionDB/src/tools"
 	"runtime"
+	"runtime/debug"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -113,6 +114,8 @@ func handleServerComm(connIndex int) {
 	}
 	dataloadStats.Unlock()
 	fmt.Printf("Time to send dataProtos for %d: %d\n", connIndex, end-start)
+
+	debug.FreeOSMemory()
 
 	if !isIndexGlobal || (splitIndexLoad && !SINGLE_INDEX_SERVER) || connIndex == 0 {
 		handleIndexComm(connIndex)

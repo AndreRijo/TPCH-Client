@@ -108,8 +108,11 @@ func myNewTest() {
 }
 
 func myTestGlobal() {
-	time.Sleep(200 * time.Second)
-	localRatio := [11]int{100, 90, 80, 70, 60, 50, 40, 30, 20, 10, 0}
+	time.Sleep(20 * time.Second)
+	//time.Sleep(200 * time.Second)
+	//localRatio := [11]int{100, 90, 80, 70, 60, 50, 40, 30, 20, 10, 0}
+	localRatio := [10]int{90, 80, 70, 60, 50, 40, 30, 20, 10, 0}
+	//localRatio := [2]int{50, 40}
 	for _, ratio := range localRatio {
 		myTestGlobalAux(ratio)
 	}
@@ -118,6 +121,7 @@ func myTestGlobal() {
 func myTestGlobalAux(ratio int) {
 	conns := make([]net.Conn, len(servers))
 	for i := range conns {
+		fmt.Println("Connecting to ", servers[i])
 		conns[i], _ = net.Dial("tcp", servers[i])
 	}
 
@@ -140,7 +144,8 @@ func myTestGlobalAux(ratio int) {
 	nTxns := 0
 
 	fmt.Println("Starting the Sofia test...")
-	for start := time.Now(); time.Since(start) < time.Minute*2; {
+	for start := time.Now(); time.Since(start) < time.Minute; {
+		//for start := time.Now(); time.Since(start) < time.Minute*2; {
 		rand.Seed(time.Now().UnixNano())
 		isLocal := rand.Intn(100) <= ratio
 		if isLocal {
@@ -191,6 +196,7 @@ func myTestGlobalAux(ratio int) {
 }
 
 func bothLocal(conns []net.Conn, queryStats []QueryStats, updStats []UpdateStats, lastStatQueries int, lastStatReads int, queries int, reads int, lastStatTime int64, startTxnTime int64, currUpdSpentTime int64, currQuerySpentTime int64, readTxns int, updTxns int, successQueries int, localReads int, rmtReads int, localUpds int, rmtUpds int, updsDone int) (newConns []net.Conn, newQueryStats []QueryStats, newUpdStats []UpdateStats, newLastStatQueries int, newLastStatReads int, newQueries int, newReads int, newLastStatTime int64, newStartTxnTime int64, newCurrUpdSpentTime int64, newCurrQuerySpentTime int64, newReadTxns int, newUpdTxns int, newSuccessQueries int, newLocalReads int, newRmtReads int, newLocalUpds int, newRmtUpds int, newUpdsDone int) {
+	fmt.Println("2Local")
 	rand.Seed(time.Now().UnixNano())
 
 	readParams := make([]antidote.ReadObjectParams, 2)
@@ -310,6 +316,7 @@ func bothLocal(conns []net.Conn, queryStats []QueryStats, updStats []UpdateStats
 }
 
 func order1Local2Remote(conns []net.Conn, queryStats []QueryStats, updStats []UpdateStats, lastStatQueries int, lastStatReads int, queries int, reads int, lastStatTime int64, startTxnTime int64, currUpdSpentTime int64, currQuerySpentTime int64, readTxns int, updTxns int, successQueries int, localReads int, rmtReads int, localUpds int, rmtUpds int, updsDone int) (newConns []net.Conn, newQueryStats []QueryStats, newUpdStats []UpdateStats, newLastStatQueries int, newLastStatReads int, newQueries int, newReads int, newLastStatTime int64, newStartTxnTime int64, newCurrUpdSpentTime int64, newCurrQuerySpentTime int64, newReadTxns int, newUpdTxns int, newSuccessQueries int, newLocalReads int, newRmtReads int, newLocalUpds int, newRmtUpds int, newUpdsDone int) {
+	fmt.Println("1local2remote")
 	rand.Seed(time.Now().UnixNano())
 	readParams := make([]antidote.ReadObjectParams, 2)
 	updParams := make([]antidote.UpdateObjectParams, 2)
@@ -332,6 +339,7 @@ func order1Local2Remote(conns []net.Conn, queryStats []QueryStats, updStats []Up
 	startTxn := antidote.CreateStartTransaction(nil)
 	antidote.SendProto(antidote.StartTrans, startTxn, conns[regKey1])
 	_, txnReplyProto, _ := antidote.ReceiveProto(conns[regKey1])
+	fmt.Println("Start txn ok")
 	txnId := txnReplyProto.(*proto.ApbStartTransactionResp).GetTransactionDescriptor()
 	startTxnTime = recordStartLatency()
 
@@ -347,6 +355,7 @@ func order1Local2Remote(conns []net.Conn, queryStats []QueryStats, updStats []Up
 	}}
 	antidote.SendProto(antidote.ReadObjs, antidote.CreateReadObjs(txnId, readParams), conns[regKey1])
 	protoTypeRead, _, _ := antidote.ReceiveProto(conns[regKey1])
+	fmt.Println("First read ok")
 	//fmt.Println("FIRST READ:", protoTypeRead, protobufRead)
 	if protoTypeRead == antidote.ReadObjsReply {
 		successQueries++
@@ -367,6 +376,7 @@ func order1Local2Remote(conns []net.Conn, queryStats []QueryStats, updStats []Up
 	}
 	antidote.SendProto(antidote.UpdateObjs, antidote.CreateUpdateObjs(txnId, updParams), conns[regKey1])
 	protoTypeUp, protobufUp, _ := antidote.ReceiveProto(conns[regKey1])
+	fmt.Println("First upd ok")
 	//fmt.Println("FIRST UPDATE:", protoTypeUp, protobufUp)
 	if protoTypeUp == antidote.OpReply && *protobufUp.(*proto.ApbOperationResp).Success {
 		localUpds++
@@ -380,6 +390,7 @@ func order1Local2Remote(conns []net.Conn, queryStats []QueryStats, updStats []Up
 
 	antidote.SendProto(antidote.ReadObjs, antidote.CreateReadObjs(txnId, readParams), conns[regKey1])
 	protoTypeRead, _, _ = antidote.ReceiveProto(conns[regKey1])
+	fmt.Println("Second read ok")
 	//fmt.Println("SECOND READ:", protoTypeRead, protobufRead)
 	if protoTypeRead == antidote.ReadObjsReply {
 		successQueries++
@@ -400,6 +411,7 @@ func order1Local2Remote(conns []net.Conn, queryStats []QueryStats, updStats []Up
 	}
 	antidote.SendProto(antidote.UpdateObjs, antidote.CreateUpdateObjs(txnId, updParams), conns[regKey1])
 	protoTypeUp, protobufUp, _ = antidote.ReceiveProto(conns[regKey1])
+	fmt.Println("Second upd ok")
 	//fmt.Println("SECOND UPDATE:", protoTypeUp, protobufUp)
 	if protoTypeUp == antidote.OpReply && *protobufUp.(*proto.ApbOperationResp).Success {
 		localUpds++
@@ -414,6 +426,7 @@ func order1Local2Remote(conns []net.Conn, queryStats []QueryStats, updStats []Up
 
 	antidote.SendProto(antidote.ReadObjs, antidote.CreateReadObjs(txnId, readParams), conns[regKey1])
 	protoTypeRead, _, _ = antidote.ReceiveProto(conns[regKey1])
+	fmt.Println("Third read ok")
 	//fmt.Println("THIRD READ:", protoTypeRead, protobufRead)
 	if protoTypeRead == antidote.ReadObjsReply {
 		successQueries++
@@ -429,11 +442,13 @@ func order1Local2Remote(conns []net.Conn, queryStats []QueryStats, updStats []Up
 
 	antidote.SendProto(antidote.CommitTrans, antidote.CreateCommitTransaction(txnId), conns[regKey1])
 	antidote.ReceiveProto(conns[regKey1])
+	fmt.Println("Commit ok")
 
 	return conns, queryStats, updStats, lastStatQueries, lastStatReads, queries, reads, lastStatTime, startTxnTime, currUpdSpentTime, currQuerySpentTime, readTxns, updTxns, successQueries, localReads, rmtReads, localUpds, rmtUpds, updsDone
 }
 
 func order1Remote2Local(conns []net.Conn, queryStats []QueryStats, updStats []UpdateStats, lastStatQueries int, lastStatReads int, queries int, reads int, lastStatTime int64, startTxnTime int64, currUpdSpentTime int64, currQuerySpentTime int64, readTxns int, updTxns int, successQueries int, localReads int, rmtReads int, localUpds int, rmtUpds int, updsDone int) (newConns []net.Conn, newQueryStats []QueryStats, newUpdStats []UpdateStats, newLastStatQueries int, newLastStatReads int, newQueries int, newReads int, newLastStatTime int64, newStartTxnTime int64, newCurrUpdSpentTime int64, newCurrQuerySpentTime int64, newReadTxns int, newUpdTxns int, newSuccessQueries int, newLocalReads int, newRmtReads int, newLocalUpds int, newRmtUpds int, newUpdsDone int) {
+	fmt.Println("1remote2local")
 	rand.Seed(time.Now().UnixNano())
 	readParams := make([]antidote.ReadObjectParams, 2)
 	updParams := make([]antidote.UpdateObjectParams, 2)
@@ -558,6 +573,7 @@ func order1Remote2Local(conns []net.Conn, queryStats []QueryStats, updStats []Up
 }
 
 func bothRemote(conns []net.Conn, queryStats []QueryStats, updStats []UpdateStats, lastStatQueries int, lastStatReads int, queries int, reads int, lastStatTime int64, startTxnTime int64, currUpdSpentTime int64, currQuerySpentTime int64, readTxns int, updTxns int, successQueries int, localReads int, rmtReads int, localUpds int, rmtUpds int, updsDone int) (newConns []net.Conn, newQueryStats []QueryStats, newUpdStats []UpdateStats, newLastStatQueries int, newLastStatReads int, newQueries int, newReads int, newLastStatTime int64, newStartTxnTime int64, newCurrUpdSpentTime int64, newCurrQuerySpentTime int64, newReadTxns int, newUpdTxns int, newSuccessQueries int, newLocalReads int, newRmtReads int, newLocalUpds int, newRmtUpds int, newUpdsDone int) {
+	fmt.Println("2remote")
 	rand.Seed(time.Now().UnixNano())
 	readParams := make([]antidote.ReadObjectParams, 2)
 	updParams := make([]antidote.UpdateObjectParams, 2)
