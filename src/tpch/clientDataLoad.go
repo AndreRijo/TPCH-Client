@@ -108,7 +108,7 @@ func handleTableProcessing() {
 	}
 	if DOES_QUERIES && !DOES_UPDATES {
 		//If it's a mixed client, it'll be started on clientDataLoad.go
-		go myTestGlobal()
+		go startMyTest()
 	}
 }
 
