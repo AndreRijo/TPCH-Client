@@ -15,9 +15,12 @@ import (
 )
 
 const (
-	NR_THREADS = 20
+	NR_THREADS = 1
 	DURATION   = 2
 )
+
+var localChunks [][]int
+var rmtChunks [][]int
 
 type MyClientResult struct {
 	QueryClientResult
@@ -31,7 +34,7 @@ type MyClientResult struct {
 }
 
 func startMyTest() {
-	time.Sleep(20 * time.Second)
+	time.Sleep(200 * time.Second)
 	chans := make([][]chan MyClientResult, NR_THREADS)
 	results := make([][]MyClientResult, NR_THREADS)
 	localRatio := [11]int{100, 90, 80, 70, 60, 50, 40, 30, 20, 10, 0}
@@ -43,8 +46,43 @@ func startMyTest() {
 			chans[i][j] = make(chan MyClientResult)
 		}
 	}
+
+	var localRegKeys []int
+	var remoteRegKeys []int
+	for i := 1; i < len(procTables.Orders)-1; i++ {
+		orkey := procTables.Orders[i].O_ORDERKEY
+		regKey := procTables.orderkeyToRegionkey(orkey)
+		if regKey == 0 {
+			localRegKeys = append(localRegKeys, i)
+		} else {
+			remoteRegKeys = append(remoteRegKeys, i)
+		}
+
+	}
+
+	chunkSize := len(remoteRegKeys) / 11
+	for i := 0; i < len(remoteRegKeys); i += chunkSize {
+		end := i + chunkSize
+		// necessary check to avoid slicing beyond
+		// slice capacity
+		if end > len(remoteRegKeys) {
+			end = len(remoteRegKeys)
+		}
+		rmtChunks = append(rmtChunks, remoteRegKeys[i:end])
+	}
+
+	chunkSize = len(localRegKeys) / 11
+	for i := 0; i < len(localRegKeys); i += chunkSize {
+		end := i + chunkSize
+		// necessary check to avoid slicing beyond
+		// slice capacity
+		if end > len(localRegKeys) {
+			end = len(localRegKeys)
+		}
+		localChunks = append(localChunks, localRegKeys[i:end])
+	}
+
 	for i := 0; i < NR_THREADS; i++ {
-		//go interFunc(chans[i])
 		go func(i int) {
 			resultsByClient := make([]MyClientResult, len(localRatio))
 			for ratioIdx, ratio := range localRatio {
@@ -52,7 +90,6 @@ func startMyTest() {
 				fmt.Println("I INSIDE GO FUNC:", i)
 				resultsByClient = myTestGlobalAux2(ratioIdx, ratio, resultsByClient)
 			}
-			//fmt.Println("LEN RESULTS BY CLIENT:", len(resultsByClient))
 			for j, client := range resultsByClient {
 				chans[i][j] <- client
 			}
@@ -65,15 +102,8 @@ func startMyTest() {
 				results[i][j] = <-channel[j]
 			}
 		}
-		//Notify update channels that there's no further updates
-		/*
-			for _, channel := range channels.updateChans {
-				channel <- QueuedMsgWithStat{QueuedMsg: QueuedMsg{code: QUEUE_COMPLETE}}
-			}
-		*/
-		//fmt.Printf("Time (ms) from test end until all clients replied: %d (ms)\n", (time.Now().UnixNano()-stopTime)/1000000)
+
 		fmt.Println("All query/upd clients have finished.")
-		//totalQueries, totalReads, avgDuration, totalUpds, nFuncs := 0.0, 0.0, 0.0, 0.0, float64(len(queryFuncs))
 		for i, resSlice := range results {
 			for _, result := range resSlice {
 
@@ -89,7 +119,7 @@ func startMyTest() {
 				fmt.Println("Total number of remote updates executed successfully:", result.rmtUpds)
 
 			}
-			writeMyStatsFile(resSlice)
+			writeMyStatsFile(resSlice, i)
 		}
 		os.Exit(0)
 	}()
@@ -117,19 +147,18 @@ func myTestGlobalAux2(ratioIdx int, ratio int, resultsByClient []MyClientResult)
 		rand.Seed(time.Now().UnixNano())
 		isLocal := rand.Intn(100) <= ratio
 		if isLocal {
-			conns, queryStats, updStats, lastStatQueries, lastStatReads, queries, reads, lastStatTime, startTxnTime, currUpdSpentTime, currQuerySpentTime, localReads, rmtReads, localUpds, rmtUpds = bothLocal2(conns, queryStats, updStats, lastStatQueries, lastStatReads, queries, reads, lastStatTime, startTxnTime, currUpdSpentTime, currQuerySpentTime, localReads, rmtReads, localUpds, rmtUpds)
+			conns, queryStats, updStats, lastStatQueries, lastStatReads, queries, reads, lastStatTime, startTxnTime, currUpdSpentTime, currQuerySpentTime, localReads, rmtReads, localUpds, rmtUpds = bothLocal2(ratioIdx, conns, queryStats, updStats, lastStatQueries, lastStatReads, queries, reads, lastStatTime, startTxnTime, currUpdSpentTime, currQuerySpentTime, localReads, rmtReads, localUpds, rmtUpds)
 			nTxns++
 		} else {
 			numLocal := rand.Intn(3)
 			if numLocal == 0 {
-				conns, queryStats, updStats, lastStatQueries, lastStatReads, queries, reads, lastStatTime, startTxnTime, currUpdSpentTime, currQuerySpentTime, localReads, rmtReads, localUpds, rmtUpds = bothRemote2(conns, queryStats, updStats, lastStatQueries, lastStatReads, queries, reads, lastStatTime, startTxnTime, currUpdSpentTime, currQuerySpentTime, localReads, rmtReads, localUpds, rmtUpds)
+				conns, queryStats, updStats, lastStatQueries, lastStatReads, queries, reads, lastStatTime, startTxnTime, currUpdSpentTime, currQuerySpentTime, localReads, rmtReads, localUpds, rmtUpds = firstRead(ratioIdx, conns, queryStats, updStats, lastStatQueries, lastStatReads, queries, reads, lastStatTime, startTxnTime, currUpdSpentTime, currQuerySpentTime, localReads, rmtReads, localUpds, rmtUpds)
 				nTxns++
 			} else if numLocal == 1 {
-				conns, queryStats, updStats, lastStatQueries, lastStatReads, queries, reads, lastStatTime, startTxnTime, currUpdSpentTime, currQuerySpentTime, localReads, rmtReads, localUpds, rmtUpds = order1Local2Remote2(conns, queryStats, updStats, lastStatQueries, lastStatReads, queries, reads, lastStatTime, startTxnTime, currUpdSpentTime, currQuerySpentTime, localReads, rmtReads, localUpds, rmtUpds)
+				conns, queryStats, updStats, lastStatQueries, lastStatReads, queries, reads, lastStatTime, startTxnTime, currUpdSpentTime, currQuerySpentTime, localReads, rmtReads, localUpds, rmtUpds = firstUpdate(ratioIdx, conns, queryStats, updStats, lastStatQueries, lastStatReads, queries, reads, lastStatTime, startTxnTime, currUpdSpentTime, currQuerySpentTime, localReads, rmtReads, localUpds, rmtUpds)
 				nTxns++
 			} else {
-				conns, queryStats, updStats, lastStatQueries, lastStatReads, queries, reads, lastStatTime, startTxnTime, currUpdSpentTime, currQuerySpentTime, localReads, rmtReads, localUpds, rmtUpds = order1Remote2Local2(conns, queryStats, updStats, lastStatQueries, lastStatReads, queries, reads, lastStatTime, startTxnTime, currUpdSpentTime, currQuerySpentTime, localReads, rmtReads, localUpds, rmtUpds)
-				nTxns++
+				conns, queryStats, updStats, lastStatQueries, lastStatReads, queries, reads, lastStatTime, startTxnTime, currUpdSpentTime, currQuerySpentTime, localReads, rmtReads, localUpds, rmtUpds = bothRemote2(ratioIdx, conns, queryStats, updStats, lastStatQueries, lastStatReads, queries, reads, lastStatTime, startTxnTime, currUpdSpentTime, currQuerySpentTime, localReads, rmtReads, localUpds, rmtUpds)
 			}
 		}
 	}
@@ -146,26 +175,38 @@ func myTestGlobalAux2(ratioIdx int, ratio int, resultsByClient []MyClientResult)
 		localUpds:  localUpds,
 		rmtUpds:    rmtUpds,
 	}
+	for i := range conns {
+		err := conns[i].Close()
+		if err != nil {
+			return nil
+		}
+	}
 
 	return resultsByClient
 }
 
-func order1Remote2Local2(conns []net.Conn, queryStats []QueryStats, updStats []UpdateStats, lastStatQueries int, lastStatReads int, queries int, reads int, lastStatTime int64, startTxnTime int64, currUpdSpentTime int64, currQuerySpentTime int64, localReads int, rmtReads int, localUpds int, rmtUpds int) ([]net.Conn, []QueryStats, []UpdateStats, int, int, int, int, int64, int64, int64, int64, int, int, int, int) {
-	//fmt.Println("1remote2local")
+func firstUpdate(ratioIdx int, conns []net.Conn, queryStats []QueryStats, updStats []UpdateStats, lastStatQueries int, lastStatReads int, queries int, reads int, lastStatTime int64, startTxnTime int64, currUpdSpentTime int64, currQuerySpentTime int64, localReads int, rmtReads int, localUpds int, rmtUpds int) ([]net.Conn, []QueryStats, []UpdateStats, int, int, int, int, int64, int64, int64, int64, int, int, int, int) {
 	rand.Seed(time.Now().UnixNano())
 	readParams := make([]antidote.ReadObjectParams, 2)
 	updParams := make([]antidote.UpdateObjectParams, 2)
 
-	orderRand2 := rand.Intn(len(procTables.Orders)-2) + 1
-	orkey2 := procTables.Orders[orderRand2+1].O_ORDERKEY
-	regKey2 := procTables.orderkeyToRegionkey(orkey2)
-
 	var orkey1 int32 = -1
 	var regKey1 int8 = -1
 	for {
-		orderRand1 := rand.Intn(len(procTables.Orders)-2) + 1
-		orkey1 = procTables.Orders[orderRand1+1].O_ORDERKEY
+		orderRand1 := localChunks[ratioIdx][rand.Intn(len(localChunks[ratioIdx]))]
+		orkey1 = procTables.Orders[orderRand1].O_ORDERKEY
 		regKey1 = procTables.orderkeyToRegionkey(orkey1)
+		if regKey1 == 0 {
+			break
+		}
+	}
+
+	var orkey2 int32 = -1
+	var regKey2 int8 = -1
+	for {
+		orderRand2 := rmtChunks[ratioIdx][rand.Intn(len(rmtChunks[ratioIdx]))]
+		orkey2 = procTables.Orders[orderRand2].O_ORDERKEY
+		regKey2 = procTables.orderkeyToRegionkey(orkey2)
 		if regKey2 != regKey1 {
 			break
 		}
@@ -174,8 +215,28 @@ func order1Remote2Local2(conns []net.Conn, queryStats []QueryStats, updStats []U
 	startTxn := antidote.CreateStartTransaction(nil)
 	antidote.SendProto(antidote.StartTrans, startTxn, conns[regKey1])
 	_, txnReplyProto, _ := antidote.ReceiveProto(conns[regKey1])
+	//fmt.Println("Start txn ok")
 	txnId := txnReplyProto.(*proto.ApbStartTransactionResp).GetTransactionDescriptor()
 	startTxnTime = recordStartLatency()
+
+	var mapUpd crdt.UpdateArguments = crdt.EmbMapUpdate{Key: "-c", Upd: crdt.SetValue{NewValue: "a"}}
+	updParams = []antidote.UpdateObjectParams{{
+		KeyParams: antidote.KeyParams{Key: tableNames[ORDERS] + strconv.Itoa(int(orkey1)), CrdtType: proto.CRDTType_RRMAP, Bucket: buckets[regKey1]}, UpdateArgs: &mapUpd},
+		{
+			KeyParams: antidote.KeyParams{Key: tableNames[ORDERS] + strconv.Itoa(int(orkey2)), CrdtType: proto.CRDTType_RRMAP, Bucket: buckets[regKey2]}, UpdateArgs: &mapUpd},
+	}
+	antidote.SendProto(antidote.UpdateObjs, antidote.CreateUpdateObjs(txnId, updParams), conns[regKey1])
+	protoTypeUp, protobufUp, _ := antidote.ReceiveProto(conns[regKey1])
+	//fmt.Println("First upd ok")
+	//fmt.Println("FIRST UPDATE:", protoTypeUp, protobufUp)
+	if protoTypeUp == antidote.OpReply && *protobufUp.(*proto.ApbOperationResp).Success {
+		localUpds++
+		rmtUpds++
+		queries++
+		currUpdSpentTime += recordFinishLatency(startTxnTime)
+		queryStats, updStats, lastStatReads, lastStatQueries, lastStatTime = updateMyQueryStatsNew(queryStats, updStats, reads, lastStatReads, queries, lastStatQueries, lastStatTime, currQuerySpentTime, currUpdSpentTime)
+		currUpdSpentTime, currQuerySpentTime = 0, 0
+	}
 
 	kParams1 := antidote.CreateKeyParams(tableNames[ORDERS]+strconv.Itoa(int(orkey1)), proto.CRDTType_RRMAP, buckets[regKey1])
 	kParams2 := antidote.CreateKeyParams(tableNames[ORDERS]+strconv.Itoa(int(orkey2)), proto.CRDTType_RRMAP, buckets[regKey2])
@@ -189,6 +250,7 @@ func order1Remote2Local2(conns []net.Conn, queryStats []QueryStats, updStats []U
 	}}
 	antidote.SendProto(antidote.ReadObjs, antidote.CreateReadObjs(txnId, readParams), conns[regKey1])
 	protoTypeRead, _, _ := antidote.ReceiveProto(conns[regKey1])
+	//fmt.Println("First read ok")
 	//fmt.Println("FIRST READ:", protoTypeRead, protobufRead)
 	if protoTypeRead == antidote.ReadObjsReply {
 		localReads++
@@ -200,26 +262,16 @@ func order1Remote2Local2(conns []net.Conn, queryStats []QueryStats, updStats []U
 		currUpdSpentTime, currQuerySpentTime = 0, 0
 	}
 
-	var mapUpd crdt.UpdateArguments = crdt.EmbMapUpdate{Key: "-c", Upd: crdt.SetValue{NewValue: "a"}}
-	updParams = []antidote.UpdateObjectParams{{
-		KeyParams: antidote.KeyParams{Key: tableNames[ORDERS] + strconv.Itoa(int(orkey1)), CrdtType: proto.CRDTType_RRMAP, Bucket: buckets[regKey1]}, UpdateArgs: &mapUpd},
-		{
-			KeyParams: antidote.KeyParams{Key: tableNames[ORDERS] + strconv.Itoa(int(orkey2)), CrdtType: proto.CRDTType_RRMAP, Bucket: buckets[regKey2]}, UpdateArgs: &mapUpd},
-	}
-	antidote.SendProto(antidote.UpdateObjs, antidote.CreateUpdateObjs(txnId, updParams), conns[regKey1])
-	protoTypeUp, protobufUp, _ := antidote.ReceiveProto(conns[regKey1])
-	//fmt.Println("FIRST UPDATE:", protoTypeUp, protobufUp)
-	if protoTypeUp == antidote.OpReply && *protobufUp.(*proto.ApbOperationResp).Success {
-		localUpds++
-		rmtUpds++
-		queries++
-		currUpdSpentTime += recordFinishLatency(startTxnTime)
-		queryStats, updStats, lastStatReads, lastStatQueries, lastStatTime = updateMyQueryStatsNew(queryStats, updStats, reads, lastStatReads, queries, lastStatQueries, lastStatTime, currQuerySpentTime, currUpdSpentTime)
-		currUpdSpentTime, currQuerySpentTime = 0, 0
-	}
-
+	readParams = []antidote.ReadObjectParams{{
+		KeyParams: kParams1,
+		ReadArgs:  crdt.StateReadArguments{},
+	}, {
+		KeyParams: kParams2,
+		ReadArgs:  crdt.StateReadArguments{},
+	}}
 	antidote.SendProto(antidote.ReadObjs, antidote.CreateReadObjs(txnId, readParams), conns[regKey1])
 	protoTypeRead, _, _ = antidote.ReceiveProto(conns[regKey1])
+	//fmt.Println("Second read ok")
 	//fmt.Println("SECOND READ:", protoTypeRead, protobufRead)
 	if protoTypeRead == antidote.ReadObjsReply {
 		localReads++
@@ -263,26 +315,32 @@ func order1Remote2Local2(conns []net.Conn, queryStats []QueryStats, updStats []U
 	}
 
 	antidote.SendProto(antidote.CommitTrans, antidote.CreateCommitTransaction(txnId), conns[regKey1])
-	antidote.ReceiveProto(conns[regKey1])
+	_, _, _ = antidote.ReceiveProto(conns[regKey1])
 
 	return conns, queryStats, updStats, lastStatQueries, lastStatReads, queries, reads, lastStatTime, startTxnTime, currUpdSpentTime, currQuerySpentTime, localReads, rmtReads, localUpds, rmtUpds
 }
 
-func order1Local2Remote2(conns []net.Conn, queryStats []QueryStats, updStats []UpdateStats, lastStatQueries int, lastStatReads int, queries int, reads int, lastStatTime int64, startTxnTime int64, currUpdSpentTime int64, currQuerySpentTime int64, localReads int, rmtReads int, localUpds int, rmtUpds int) ([]net.Conn, []QueryStats, []UpdateStats, int, int, int, int, int64, int64, int64, int64, int, int, int, int) {
-	//fmt.Println("1local2remote")
+func firstRead(ratioIdx int, conns []net.Conn, queryStats []QueryStats, updStats []UpdateStats, lastStatQueries int, lastStatReads int, queries int, reads int, lastStatTime int64, startTxnTime int64, currUpdSpentTime int64, currQuerySpentTime int64, localReads int, rmtReads int, localUpds int, rmtUpds int) ([]net.Conn, []QueryStats, []UpdateStats, int, int, int, int, int64, int64, int64, int64, int, int, int, int) {
 	rand.Seed(time.Now().UnixNano())
 	readParams := make([]antidote.ReadObjectParams, 2)
 	updParams := make([]antidote.UpdateObjectParams, 2)
 
-	orderRand1 := rand.Intn(len(procTables.Orders)-2) + 1
-	orkey1 := procTables.Orders[orderRand1+1].O_ORDERKEY
-	regKey1 := procTables.orderkeyToRegionkey(orkey1)
+	var orkey1 int32 = -1
+	var regKey1 int8 = -1
+	for {
+		orderRand1 := localChunks[ratioIdx][rand.Intn(len(localChunks[ratioIdx]))]
+		orkey1 = procTables.Orders[orderRand1].O_ORDERKEY
+		regKey1 = procTables.orderkeyToRegionkey(orkey1)
+		if regKey1 == 0 {
+			break
+		}
+	}
 
 	var orkey2 int32 = -1
 	var regKey2 int8 = -1
 	for {
-		orderRand2 := rand.Intn(len(procTables.Orders)-2) + 1
-		orkey2 = procTables.Orders[orderRand2+1].O_ORDERKEY
+		orderRand2 := rmtChunks[ratioIdx][rand.Intn(len(rmtChunks[ratioIdx]))]
+		orkey2 = procTables.Orders[orderRand2].O_ORDERKEY
 		regKey2 = procTables.orderkeyToRegionkey(orkey2)
 		if regKey2 != regKey1 {
 			break
@@ -387,31 +445,48 @@ func order1Local2Remote2(conns []net.Conn, queryStats []QueryStats, updStats []U
 	}
 
 	antidote.SendProto(antidote.CommitTrans, antidote.CreateCommitTransaction(txnId), conns[regKey1])
-	antidote.ReceiveProto(conns[regKey1])
+	_, _, _ = antidote.ReceiveProto(conns[regKey1])
 	//fmt.Println("Commit ok")
 
 	return conns, queryStats, updStats, lastStatQueries, lastStatReads, queries, reads, lastStatTime, startTxnTime, currUpdSpentTime, currQuerySpentTime, localReads, rmtReads, localUpds, rmtUpds
 
 }
 
-func bothRemote2(conns []net.Conn, queryStats []QueryStats, updStats []UpdateStats, lastStatQueries int, lastStatReads int, queries int, reads int, lastStatTime int64, startTxnTime int64, currUpdSpentTime int64, currQuerySpentTime int64, localReads int, rmtReads int, localUpds int, rmtUpds int) ([]net.Conn, []QueryStats, []UpdateStats, int, int, int, int, int64, int64, int64, int64, int, int, int, int) {
+func bothRemote2(ratioIdx int, conns []net.Conn, queryStats []QueryStats, updStats []UpdateStats, lastStatQueries int, lastStatReads int, queries int, reads int, lastStatTime int64, startTxnTime int64, currUpdSpentTime int64, currQuerySpentTime int64, localReads int, rmtReads int, localUpds int, rmtUpds int) ([]net.Conn, []QueryStats, []UpdateStats, int, int, int, int, int64, int64, int64, int64, int, int, int, int) {
 	//fmt.Println("2remote")
 	rand.Seed(time.Now().UnixNano())
 	readParams := make([]antidote.ReadObjectParams, 2)
 	updParams := make([]antidote.UpdateObjectParams, 2)
 
-	orderRand1 := rand.Intn(len(procTables.Orders)-2) + 1
-	orkey1 := procTables.Orders[orderRand1+1].O_ORDERKEY
-	regKey1 := procTables.orderkeyToRegionkey(orkey1)
-	regKey := (regKey1 + 1) % int8(len(procTables.Regions))
+	var orkey1 int32 = -1
+	var regKey1 int8 = -1
+	for {
+		orderRand1 := localChunks[ratioIdx][rand.Intn(len(localChunks[ratioIdx]))]
+		orkey1 = procTables.Orders[orderRand1].O_ORDERKEY
+		regKey1 = procTables.orderkeyToRegionkey(orkey1)
+		if regKey1 == 0 {
+			break
+		}
+	}
 
 	var orkey2 int32 = -1
 	var regKey2 int8 = -1
 	for {
-		orderRand2 := rand.Intn(len(procTables.Orders)-2) + 1
-		orkey2 = procTables.Orders[orderRand2+1].O_ORDERKEY
+		orderRand2 := rmtChunks[ratioIdx][rand.Intn(len(rmtChunks[ratioIdx]))]
+		orkey2 = procTables.Orders[orderRand2].O_ORDERKEY
 		regKey2 = procTables.orderkeyToRegionkey(orkey2)
-		if regKey2 != regKey {
+		if regKey2 != regKey1 {
+			break
+		}
+	}
+
+	var orkey3 int32 = -1
+	var regKey3 int8 = -1
+	for {
+		orderRand3 := rmtChunks[ratioIdx][rand.Intn(len(rmtChunks[ratioIdx]))]
+		orkey3 = procTables.Orders[orderRand3].O_ORDERKEY
+		regKey3 = procTables.orderkeyToRegionkey(orkey3)
+		if regKey3 != regKey1 {
 			break
 		}
 	}
@@ -422,7 +497,7 @@ func bothRemote2(conns []net.Conn, queryStats []QueryStats, updStats []UpdateSta
 	txnId := txnReplyProto.(*proto.ApbStartTransactionResp).GetTransactionDescriptor()
 	startTxnTime = recordStartLatency()
 
-	kParams1 := antidote.CreateKeyParams(tableNames[ORDERS]+strconv.Itoa(int(orkey1)), proto.CRDTType_RRMAP, buckets[regKey1])
+	kParams1 := antidote.CreateKeyParams(tableNames[ORDERS]+strconv.Itoa(int(orkey3)), proto.CRDTType_RRMAP, buckets[regKey3])
 	kParams2 := antidote.CreateKeyParams(tableNames[ORDERS]+strconv.Itoa(int(orkey2)), proto.CRDTType_RRMAP, buckets[regKey2])
 
 	readParams = []antidote.ReadObjectParams{{
@@ -446,7 +521,7 @@ func bothRemote2(conns []net.Conn, queryStats []QueryStats, updStats []UpdateSta
 
 	var mapUpd crdt.UpdateArguments = crdt.EmbMapUpdate{Key: "-c", Upd: crdt.SetValue{NewValue: "a"}}
 	updParams = []antidote.UpdateObjectParams{{
-		KeyParams: antidote.KeyParams{Key: tableNames[ORDERS] + strconv.Itoa(int(orkey1)), CrdtType: proto.CRDTType_RRMAP, Bucket: buckets[regKey1]}, UpdateArgs: &mapUpd},
+		KeyParams: antidote.KeyParams{Key: tableNames[ORDERS] + strconv.Itoa(int(orkey3)), CrdtType: proto.CRDTType_RRMAP, Bucket: buckets[regKey3]}, UpdateArgs: &mapUpd},
 		{
 			KeyParams: antidote.KeyParams{Key: tableNames[ORDERS] + strconv.Itoa(int(orkey2)), CrdtType: proto.CRDTType_RRMAP, Bucket: buckets[regKey2]}, UpdateArgs: &mapUpd},
 	}
@@ -475,7 +550,7 @@ func bothRemote2(conns []net.Conn, queryStats []QueryStats, updStats []UpdateSta
 
 	mapUpd = crdt.EmbMapUpdate{Key: "-c", Upd: crdt.SetValue{NewValue: "z"}}
 	updParams = []antidote.UpdateObjectParams{{
-		KeyParams: antidote.KeyParams{Key: tableNames[ORDERS] + strconv.Itoa(int(orkey1)), CrdtType: proto.CRDTType_RRMAP, Bucket: buckets[regKey1]}, UpdateArgs: &mapUpd},
+		KeyParams: antidote.KeyParams{Key: tableNames[ORDERS] + strconv.Itoa(int(orkey3)), CrdtType: proto.CRDTType_RRMAP, Bucket: buckets[regKey3]}, UpdateArgs: &mapUpd},
 		{
 			KeyParams: antidote.KeyParams{Key: tableNames[ORDERS] + strconv.Itoa(int(orkey2)), CrdtType: proto.CRDTType_RRMAP, Bucket: buckets[regKey2]}, UpdateArgs: &mapUpd},
 	}
@@ -503,26 +578,34 @@ func bothRemote2(conns []net.Conn, queryStats []QueryStats, updStats []UpdateSta
 	}
 
 	antidote.SendProto(antidote.CommitTrans, antidote.CreateCommitTransaction(txnId), conns[regKey1])
-	antidote.ReceiveProto(conns[regKey1])
+	_, _, _ = antidote.ReceiveProto(conns[regKey1])
 
 	return conns, queryStats, updStats, lastStatQueries, lastStatReads, queries, reads, lastStatTime, startTxnTime, currUpdSpentTime, currQuerySpentTime, localReads, rmtReads, localUpds, rmtUpds
 
 }
 
-func bothLocal2(conns []net.Conn, queryStats []QueryStats, updStats []UpdateStats, lastStatQueries int, lastStatReads int, queries int, reads int, lastStatTime int64, startTxnTime int64, currUpdSpentTime int64, currQuerySpentTime int64, localReads int, rmtReads int, localUpds int, rmtUpds int) ([]net.Conn, []QueryStats, []UpdateStats, int, int, int, int, int64, int64, int64, int64, int, int, int, int) {
+func bothLocal2(ratioIdx int, conns []net.Conn, queryStats []QueryStats, updStats []UpdateStats, lastStatQueries int, lastStatReads int, queries int, reads int, lastStatTime int64, startTxnTime int64, currUpdSpentTime int64, currQuerySpentTime int64, localReads int, rmtReads int, localUpds int, rmtUpds int) ([]net.Conn, []QueryStats, []UpdateStats, int, int, int, int, int64, int64, int64, int64, int, int, int, int) {
 	rand.Seed(time.Now().UnixNano())
 
 	readParams := make([]antidote.ReadObjectParams, 2)
 	updParams := make([]antidote.UpdateObjectParams, 2)
-	orderRand1 := rand.Intn(len(procTables.Orders)-2) + 1
-	orkey1 := procTables.Orders[orderRand1+1].O_ORDERKEY
-	regKey1 := procTables.orderkeyToRegionkey(orkey1)
+
+	var orkey1 int32 = -1
+	var regKey1 int8 = -1
+	for {
+		orderRand1 := localChunks[ratioIdx][rand.Intn(len(localChunks[ratioIdx]))]
+		orkey1 = procTables.Orders[orderRand1].O_ORDERKEY
+		regKey1 = procTables.orderkeyToRegionkey(orkey1)
+		if regKey1 == 0 {
+			break
+		}
+	}
 
 	var orkey2 int32 = -1
 	var regKey2 int8 = -1
 	for {
-		orderRand2 := rand.Intn(len(procTables.Orders)-2) + 1
-		orkey2 = procTables.Orders[orderRand2+1].O_ORDERKEY
+		orderRand2 := localChunks[ratioIdx][rand.Intn(len(localChunks[ratioIdx]))]
+		orkey2 = procTables.Orders[orderRand2].O_ORDERKEY
 		regKey2 = procTables.orderkeyToRegionkey(orkey2)
 		if regKey2 == regKey1 {
 			break
@@ -616,7 +699,7 @@ func bothLocal2(conns []net.Conn, queryStats []QueryStats, updStats []UpdateStat
 	}
 
 	antidote.SendProto(antidote.CommitTrans, antidote.CreateCommitTransaction(txnId), conns[regKey1])
-	antidote.ReceiveProto(conns[regKey1])
+	_, _, _ = antidote.ReceiveProto(conns[regKey1])
 
 	return conns, queryStats, updStats, lastStatQueries, lastStatReads, queries, reads, lastStatTime, startTxnTime, currUpdSpentTime, currQuerySpentTime, localReads, rmtReads, localUpds, rmtUpds
 
@@ -634,8 +717,8 @@ func updateMyQueryStatsNew(stats []QueryStats, updStats []UpdateStats, nReads, l
 		stats[lastStatI].nReads += diffR
 		stats[lastStatI].nQueries += diffQ
 		stats[lastStatI].timeSpent += diffT
-		stats[lastStatI].latency += (qTime / 1000000)
-		updStats[lastStatI].latency += (updTime / 1000000)
+		stats[lastStatI].latency += qTime / 1000000
+		updStats[lastStatI].latency += updTime / 1000000
 	} else {
 		currQueryStats.nReads, currQueryStats.nQueries, currQueryStats.timeSpent, currQueryStats.latency = diffR, diffQ, diffT, qTime/1000000
 		stats = append(stats, currQueryStats)
@@ -678,7 +761,7 @@ func convertMyStats(stats []MyClientResult) (qStats [][]QueryStats, uStats [][]U
 	return
 }
 
-func writeMyStatsFile(stats []MyClientResult) {
+func writeMyStatsFile(stats []MyClientResult, index int) {
 
 	_, _, localUpds, localReads, rmtUpds, rmtReads, nTxns, duration := convertMyStats(stats)
 
@@ -692,8 +775,8 @@ func writeMyStatsFile(stats []MyClientResult) {
 	for i := range localUpds {
 		totalTime += duration[i]
 		ops := nTxns[i] * 5
-		opsPerSec := float64(ops) / duration[i]
-		txnPerSec := float64(nTxns[i]) / duration[i]
+		opsPerSec := (float64(ops) / duration[i]) * 1000
+		txnPerSec := (float64(nTxns[i]) / duration[i]) * 1000
 		latency := duration[i] / float64(ops)
 		totalData[i] = []string{strconv.FormatFloat(totalTime, 'f', 10, 64), strconv.FormatFloat(duration[i], 'f', 10, 64),
 			strconv.FormatInt(int64(localReads[i]), 10), strconv.FormatInt(int64(rmtReads[i]), 10), strconv.FormatInt(int64(localUpds[i]), 10),
@@ -703,7 +786,7 @@ func writeMyStatsFile(stats []MyClientResult) {
 
 	}
 
-	file := getStatsFileToWrite("mixStats")
+	file := getMyStatsFileToWrite("3mixStats", index)
 	if file == nil {
 		return
 	}
@@ -718,4 +801,26 @@ func writeMyStatsFile(stats []MyClientResult) {
 	}
 
 	fmt.Println("Mix statistics saved successfully to " + file.Name())
+}
+
+func getMyStatsFileToWrite(filename string, index int) (file *os.File) {
+	if statisticsInterval == -1 {
+		fmt.Println("Not writing stats file as statisticsInterval is -1.")
+		return
+	}
+	//os.Mkdir(statsSaveLocation, os.ModeDir)
+	os.Mkdir(statsSaveLocation, 0777)
+	fileCreated := false
+	idLock.Lock()
+	defer idLock.Unlock()
+	var err error
+	for !fileCreated {
+		fileCreated = true
+		file, err = os.Create(statsSaveLocation + filename + strconv.FormatInt(int64(index), 10) + ".csv")
+		if err != nil {
+			fmt.Println("[DATASAVE][ERROR]Failed to create stats file with name "+filename+id+".csv. Error:", err)
+			return
+		}
+	}
+	return
 }

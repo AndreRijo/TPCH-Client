@@ -7,15 +7,14 @@ RUN go get github.com/golang/protobuf/proto; \
 	go get github.com/streadway/amqp
 
 # Adding src and building
-COPY potionDB/src/clocksi /go/src/clocksi
-COPY potionDB/src/tools /go/src/tools
-COPY potionDB/src/crdt /go/src/crdt
-COPY potionDB/src/proto /go/src/proto
-COPY potionDB/src/antidote /go/src/antidote
-COPY potionDB/src/shared /go/src/shared
-COPY tpch_client/src/ /go/src/
-COPY tpch_client/dockerstuff/ /go/
-RUN go install main
+WORKDIR /go/src
+COPY potionDB potionDB
+COPY tpch_client tpch_client
+WORKDIR /go/src/tpch_client
+RUN go mod download
+RUN go build -o /bin/main src/main/tpchMain.go
+WORKDIR /
+COPY tpch_client/dockerstuff/start.sh .
 
 #Arguments
 ENV CONFIG "configs/docker/default" \
