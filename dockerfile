@@ -2,20 +2,27 @@
 FROM golang
 
 # Dependencies
-RUN go get github.com/golang/protobuf/proto; \
-	go get github.com/twmb/murmur3; \
-	go get github.com/streadway/amqp
+#RUN go get github.com/golang/protobuf/proto; \
+	#go get github.com/twmb/murmur3; \
+	#go get github.com/streadway/amqp
 
 # Adding src and building
-COPY potionDB/src/clocksi /go/src/clocksi
-COPY potionDB/src/tools /go/src/tools
-COPY potionDB/src/crdt /go/src/crdt
-COPY potionDB/src/proto /go/src/proto
-COPY potionDB/src/antidote /go/src/antidote
-COPY potionDB/src/shared /go/src/shared
-COPY tpch_client/src/ /go/src/
-COPY tpch_client/dockerstuff/ /go/
-RUN go install main
+COPY potionDB/go.mod /go/potionDB/
+COPY potionDB/go.sum /go/potionDB/
+COPY tpch_client/go.mod /go/tpch_client/
+COPY tpch_client/go.sum /go/tpch_client/
+RUN cd tpch_client && go mod download
+
+COPY potionDB/src/clocksi /go/potionDB/src/clocksi
+COPY potionDB/src/tools /go/potionDB/src/tools
+COPY potionDB/src/crdt /go/potionDB/src/crdt
+COPY potionDB/src/proto /go/potionDB/src/proto
+COPY potionDB/src/antidote /go/potionDB/src/antidote
+COPY potionDB/src/shared /go/potionDB/src/shared
+COPY tpch_client/src /go/tpch_client/src
+COPY tpch_client/dockerstuff /go/tpch_client/
+RUN cd tpch_client/src/main && go build
+#RUN go install main
 
 #Arguments
 ENV CONFIG "configs/docker/default" \
@@ -32,7 +39,11 @@ N_READS_TXN "none" \
 BATCH_MODE "none" \
 LATENCY_MODE "none" \
 SERVERS "none" \
-USE_TOP_SUM "none" 
+USE_TOP_SUM "none" \
+LOCAL_MODE "none" \
+SF "none" \
+NON_RANDOM_SERVERS "none" \
+LOCAL_REGION_ONLY "none"
 #Bench args
 ENV B_N_KEYS "none" \
 B_KEY_TYPE "none" \
@@ -57,5 +68,5 @@ B_MAX_N_ADDS "none"
 ADD tpch_client/configs configs/
 
 # Run the client
-CMD ["bash", "start.sh"]
+CMD ["bash", "tpch_client/start.sh"]
 #CMD ["bash"]

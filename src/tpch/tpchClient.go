@@ -20,6 +20,7 @@ import (
 	"time"
 )
 
+//TODO: Old client modes (clientQueries, clientUpdates) do not support, in the local mode, to have servers forward their requests.
 //TODO: Support on the benchmark thing coupling multiple queries in one txn? That may lead to higher (or lower) queries/s.
 /*
 	A possible solution:
@@ -151,6 +152,8 @@ const (
 	O_ORDERDATE, C_MKTSEGMENT, L_SHIPDATE, L_EXTENDEDPRICE, L_DISCOUNT, O_SHIPPRIOTITY, O_ORDERKEY   = 4, 6, 10, 5, 6, 5, 0
 
 	AVG_OP, AVG_BATCH, PER_BATCH = 0, 1, 2 //LATENCY_MODE. Note that only the latter supports recording latencies for queries separated from update latencies.
+
+	LOCAL_DIRECT, LOCAL_SERVER = true, false //DIRECT: contacts right server; SERVER: contacts any server, which forwards the request for the client.
 )
 
 var (
@@ -158,15 +161,15 @@ var (
 	tableFolder, updFolder, commonFolder, headerLoc string
 	scaleFactor                                     float64
 	//TODO: Finish useTopSum.
-	isIndexGlobal, isMulti, memDebug, profiling, splitIndexLoad, useTopKAll, useTopSum bool
-	maxUpdSize                                                                         int //Max number of entries for a single upd msg. To avoid sending the whole table in one request...
-	INDEX_WITH_FULL_DATA, CRDT_PER_OBJ, SINGLE_INDEX_SERVER                            bool
-	DOES_DATA_LOAD, DOES_QUERIES, DOES_UPDATES, CRDT_BENCH                             bool
-	withUpdates                                                                        bool //Also loads the necessary update data in order to still be able to do the queries with updates.
-	updCompleteFilename                                                                [3]string
-	statisticsInterval                                                                 time.Duration //Milliseconds. A negative number means that no statistics need to be collected.
-	statsSaveLocation                                                                  string
-	LATENCY_MODE                                                                       int //OP_AVG, BATCH_AVG, PER_BATCH
+	isIndexGlobal, isMulti, memDebug, profiling, splitIndexLoad, useTopKAll, useTopSum, localMode bool
+	maxUpdSize                                                                                    int //Max number of entries for a single upd msg. To avoid sending the whole table in one request...
+	INDEX_WITH_FULL_DATA, CRDT_PER_OBJ, SINGLE_INDEX_SERVER                                       bool
+	DOES_DATA_LOAD, DOES_QUERIES, DOES_UPDATES, CRDT_BENCH                                        bool
+	withUpdates                                                                                   bool //Also loads the necessary update data in order to still be able to do the queries with updates.
+	updCompleteFilename                                                                           [3]string
+	statisticsInterval                                                                            time.Duration //Milliseconds. A negative number means that no statistics need to be collected.
+	statsSaveLocation                                                                             string
+	LATENCY_MODE                                                                                  int //OP_AVG, BATCH_AVG, PER_BATCH
 
 	//Constants...
 	tableNames = [...]string{"customer", "lineitem", "nation", "orders", "part", "partsupp", "region", "supplier"}
@@ -211,7 +214,8 @@ var (
 	dataloadStats                                                                                                    = DataloadStats{}
 	configFolder, indexGlobalString, testRoutinesString, statsSaveLocationString, singleIndexString, updRateString   *string
 	idString, updateIndexString, splitUpdatesString, splitUpdatesNoWaitString, updateBaseString, notifyAddressString *string
-	nReadsTxn, updateSpecificIndex, batchModeS, latencyModeS, useTopSumString, serversString                         *string
+	nReadsTxn, updateSpecificIndex, batchModeS, latencyModeS, useTopSumString, serversString, localModeString        *string
+	scaleString, nonRandomServersString, localRegionOnlyQueries                                                      *string
 	//Bench
 	nKeysString, keysTypeString, addRateString, partReadRateString, queryRatesString, opsPerTxnString, nTxnsBeforeWaitString, nElemsString,
 	maxIDString, maxScoreString, topNString, topAboveString, rndDataSizeString, minChangeString, maxChangeString, maxSumString, maxNAddsString *string
@@ -235,8 +239,8 @@ func loadFlags() (configs *tools.ConfigLoader) {
 	singleIndexString = flag.String("single_index_server", "none", "if only the first server has the index, or all have the index. Ignored if global_index is false.")
 	updRateString = flag.String("upd_rate", "none", "rate of updates for mix clients. Ignored if this is a query only client or update only client")
 	idString = flag.String("id", "none", "id to use for statistics file. Should be set when multiple client instances are running on the same disk.")
-	updateIndexString = flag.String("updateIndex", "none", "if indexes should be updated or not. Dataload client ignores this.")
-	updateBaseString = flag.String("updateBase", "none", "if base data should be updated or not. Dataload client ignores this.")
+	updateIndexString = flag.String("update_index", "none", "if indexes should be updated or not. Dataload client ignores this.")
+	updateBaseString = flag.String("update_base", "none", "if base data should be updated or not. Dataload client ignores this.")
 	splitUpdatesString = flag.String("split_updates", "none", "if each update should be sent in its own transaction or not. Only mix clients support this.")
 	splitUpdatesNoWaitString = flag.String("split_updates_no_wait", "none", "if true, all updates related to an order are sent before waiting for a reply.")
 	notifyAddressString = flag.String("notify_address", "none", "ip:port to notify when test is complete. 'none' (or don't provide this flag) if notification isn't desired.")
@@ -246,12 +250,16 @@ func loadFlags() (configs *tools.ConfigLoader) {
 	latencyModeS = flag.String("latency_mode", "none", "how is latency measured - AVG_OP, AVG_BATCH, PER_BATCH.")
 	useTopSumString = flag.String("use_top_sum", "none", "for supported queries (Q15), if true TopSum will be used instead of TopK.")
 	serversString = flag.String("servers", "none", "list of servers to connect to.")
+	localModeString = flag.String("local_mode", "none", "'direct' to contact the right server; 'server' to contact any server and have PotionDB do the forwarding.")
+	scaleString = flag.String("scale", "none", "scale (SF) of the tpch test")
+	nonRandomServersString = flag.String("non_random_servers", "none", "if true, clients won't pick their index server at random - it will be split equally.")
+	localRegionOnlyQueries = flag.String("local_region_only", "none", "if true, for queries based on regions/nations, the client will only query the region of his server")
+
 	//fmt.Println("On flag: ", *serversString)
 
 	registerBenchFlags()
 
 	flag.Parse()
-	fmt.Println("On flag after parse: ", *serversString)
 	fmt.Println("ConfigFolder after parse:", *configFolder)
 
 	configs = &tools.ConfigLoader{}
@@ -316,11 +324,21 @@ func loadFlags() (configs *tools.ConfigLoader) {
 		configs.ReplaceConfig("useTopSum", *useTopSumString)
 	}
 	if isFlagValid(serversString) {
-		fmt.Println("ServersString is valid")
 		processServersCommandLine(configs)
-		fmt.Println("On configs: ", configs.GetConfig("servers"))
 	} else {
 		fmt.Println("ServersString is not valid as its value is:", *serversString)
+	}
+	if isFlagValid(localModeString) {
+		configs.ReplaceConfig("localMode", *localModeString)
+	}
+	if isFlagValid(scaleString) {
+		configs.ReplaceConfig("scale", *scaleString)
+	}
+	if isFlagValid(nonRandomServersString) {
+		configs.ReplaceConfig("nonRandomServers", *nonRandomServersString)
+	}
+	if isFlagValid(localRegionOnlyQueries) {
+		configs.ReplaceConfig("localRegionOnly", *localRegionOnlyQueries)
 	}
 	loadBenchFlags(configs)
 	return
@@ -344,7 +362,7 @@ func loadConfigsFile(configs *tools.ConfigLoader) {
 	//All remaining are non-flag configs
 	if *configFolder == "none" {
 		fmt.Println("Non-defined configFolder, using defaults")
-		isMulti, splitIndexLoad, memDebug, profiling, scaleFactor, maxUpdSize, useTopKAll, useTopSum = true, true, false, false, 0.1, 2000, false, false
+		isMulti, splitIndexLoad, memDebug, profiling, scaleFactor, maxUpdSize, useTopKAll, useTopSum, localMode = true, true, false, false, 0.1, 2000, false, false, LOCAL_DIRECT
 		commonFolder = "/Users/a.rijo/Documents/University_6th_year/potionDB docs/"
 		MAX_BUFF_PROTOS, QUERY_WAIT, FORCE_PROTO_CLEAN, TEST_DURATION = 200, 5000, 10000, 20000
 
@@ -354,16 +372,24 @@ func loadConfigsFile(configs *tools.ConfigLoader) {
 		queryFuncs = []func(QueryClient) int{sendQ3, sendQ5, sendQ11, sendQ14, sendQ15, sendQ18}
 		statisticsInterval, q15CrdtType = -1, proto.CRDTType_TOPSUM
 		MAX_LINEITEM_GOROUTINES, UPDATES_GOROUTINES, READS_PER_TXN = 16, 16, 1
-		UPDATE_INDEX, UPDATE_SPECIFIC_INDEX_ONLY, BATCH_MODE = true, false, CYCLE
+		UPDATE_INDEX, UPDATE_SPECIFIC_INDEX_ONLY, BATCH_MODE, NON_RANDOM_SERVERS, ONLY_LOCAL_DATA_QUERY = true, false, CYCLE, false, false
 	} else {
 		fmt.Println("Defined config folder.")
-		isMulti, splitIndexLoad, useTopKAll = configs.GetBoolConfig("multiServer", true),
-			configs.GetBoolConfig("splitIndexLoad", true), configs.GetBoolConfig("useTopKAll", false)
-		useTopSum = configs.GetBoolConfig("useTopSum", false)
+		isMulti, splitIndexLoad, useTopKAll, useTopSum, *localModeString = configs.GetBoolConfig("multiServer", true),
+			configs.GetBoolConfig("splitIndexLoad", true), configs.GetBoolConfig("useTopKAll", false),
+			configs.GetBoolConfig("useTopSum", false), configs.GetOrDefault("localMode", "direct")
 		if useTopSum {
 			q15CrdtType = proto.CRDTType_TOPSUM
 		} else {
 			q15CrdtType = proto.CRDTType_TOPK_RMV
+		}
+		if strings.EqualFold(*localModeString, "direct") {
+			localMode = LOCAL_DIRECT
+		} else if strings.EqualFold(*localModeString, "server") {
+			localMode = LOCAL_SERVER
+		} else if *localModeString != "" {
+			fmt.Printf("Warning - unknown value of localMode %s. Assuming 'direct'.\n", *localModeString)
+			localMode = LOCAL_DIRECT
 		}
 		memDebug, profiling = configs.GetBoolConfig("memDebug", true), configs.GetBoolConfig("profiling", false)
 		scaleFactor, _ = strconv.ParseFloat(configs.GetConfig("scale"), 64)
@@ -385,9 +411,16 @@ func loadConfigsFile(configs *tools.ConfigLoader) {
 			configs.GetBoolConfig("splitUpdatesNoWait", true), configs.GetBoolConfig("updateBase", true), configs.GetOrDefault("notifyAddress", "")
 		READS_PER_TXN, UPDATE_SPECIFIC_INDEX_ONLY = configs.GetIntConfig("nReadsTxn", 1), configs.GetBoolConfig("updateSpecificIndex", false)
 		BATCH_MODE, LATENCY_MODE = batchModeStringToInt(configs.GetOrDefault("batchMode", "CYCLE")), latencyModeStringToInt(configs.GetOrDefault("latencyMode", "AVG_OP"))
-
+		NON_RANDOM_SERVERS, ONLY_LOCAL_DATA_QUERY = configs.GetBoolConfig("nonRandomServers", false), configs.GetBoolConfig("localRegionOnly", false)
 		queryNumbers := strings.Split(configs.GetOrDefault("queries", "3, 5, 11, 14, 15, 18"), " ")
-		setQueryList(queryNumbers)
+
+		if isIndexGlobal {
+			setQueryList(queryNumbers)
+		} else if localMode == LOCAL_DIRECT {
+			setLocalDirectQueryList(queryNumbers)
+		} else {
+			setLocalServerQueryList(queryNumbers)
+		}
 
 		if useTopSum {
 			fmt.Println("[TPCH_CLIENT]Using top-sum!")
@@ -395,12 +428,10 @@ func loadConfigsFile(configs *tools.ConfigLoader) {
 		if CRDT_BENCH {
 			loadBenchConfigs(configs)
 		}
-		fmt.Println("Servers loaded from configs: ", servers)
 	}
 }
 
 func prepareConfigs() {
-	fmt.Println("Servers before prepare configs:", servers)
 	scaleFactorS := strconv.FormatFloat(scaleFactor, 'f', -1, 64)
 	tableFolder, updFolder = commonFolder+fmt.Sprintf(tableFormat, scaleFactorS), commonFolder+fmt.Sprintf(updFormat, scaleFactorS)
 	updCompleteFilename = [3]string{updFolder + updsNames[0] + updExtension, updFolder + updsNames[1] + updExtension,
@@ -466,7 +497,6 @@ func prepareConfigs() {
 		updEntries = []int{1500, 6001, 1500}
 	}
 
-	fmt.Println("Servers after prepareConfigs:", servers)
 }
 
 func StartClient() {
@@ -750,6 +780,7 @@ func singleRegion(obj []string) int8 {
 }
 
 func setQueryList(queryStrings []string) {
+	fmt.Println("Setting global/single query list")
 	queryFuncs, getReadsFuncs = make([]func(QueryClient) int, len(queryStrings)),
 		make([]func(QueryClient, []antidote.ReadObjectParams, []antidote.ReadObjectParams, []int, int) int, len(queryStrings))
 	processReadReplies = make([]func(QueryClient, []*proto.ApbReadObjectResp, []int, int) int, len(queryStrings))
@@ -770,6 +801,64 @@ func setQueryList(queryStrings []string) {
 			queryFuncs[i], getReadsFuncs[i], processReadReplies[i], indexesToUpd[i] = sendQ15, getQ15Reads, processQ15Reply, 15
 		case "18":
 			queryFuncs[i], getReadsFuncs[i], processReadReplies[i], indexesToUpd[i] = sendQ18, getQ18Reads, processQ18Reply, 18
+		}
+		i++
+	}
+	sort.Ints(indexesToUpd)
+	return
+}
+
+func setLocalDirectQueryList(queryStrings []string) {
+	fmt.Println("Setting local (direct) query list")
+	queryFuncs, getReadsLocalDirectFuncs = make([]func(QueryClient) int, len(queryStrings)),
+		make([]func(QueryClient, [][]antidote.ReadObjectParams, [][]antidote.ReadObjectParams, [][]int, []int, int, int) (int, int), len(queryStrings))
+	processLocalDirectReadReplies = make([]func(QueryClient, [][]*proto.ApbReadObjectResp, [][]int, []int, int, int) int, len(queryStrings))
+	indexesToUpd = make([]int, len(queryStrings))
+	i := 0
+	for _, queryN := range queryStrings {
+		switch queryN {
+		case "3":
+			queryFuncs[i], getReadsLocalDirectFuncs[i], processLocalDirectReadReplies[i], indexesToUpd[i] = sendQ3, getQ3LocalDirectReads, processQ3LocalDirectReply, 3
+		case "5":
+			queryFuncs[i], getReadsLocalDirectFuncs[i], processLocalDirectReadReplies[i], indexesToUpd[i] = sendQ5, getQ5LocalDirectReads, processQ5LocalDirectReply, 5
+		case "11":
+			//Q11 doens't have updates
+			queryFuncs[i], getReadsLocalDirectFuncs[i], processLocalDirectReadReplies[i] = sendQ11, getQ11LocalDirectReads, processQ11LocalDirectReply
+		case "14":
+			queryFuncs[i], getReadsLocalDirectFuncs[i], processLocalDirectReadReplies[i], indexesToUpd[i] = sendQ14, getQ14LocalDirectReads, processQ14LocalDirectReply, 14
+		case "15":
+			queryFuncs[i], getReadsLocalDirectFuncs[i], processLocalDirectReadReplies[i], indexesToUpd[i] = sendQ15, getQ15LocalDirectReads, processQ15LocalDirectReply, 15
+		case "18":
+			queryFuncs[i], getReadsLocalDirectFuncs[i], processLocalDirectReadReplies[i], indexesToUpd[i] = sendQ18, getQ18LocalDirectReads, processQ18LocalDirectReply, 18
+		}
+		i++
+	}
+	sort.Ints(indexesToUpd)
+	return
+}
+
+func setLocalServerQueryList(queryStrings []string) {
+	fmt.Println("Setting local (server) query list")
+	queryFuncs, getReadsFuncs = make([]func(QueryClient) int, len(queryStrings)),
+		make([]func(QueryClient, []antidote.ReadObjectParams, []antidote.ReadObjectParams, []int, int) int, len(queryStrings))
+	processReadReplies = make([]func(QueryClient, []*proto.ApbReadObjectResp, []int, int) int, len(queryStrings))
+	indexesToUpd = make([]int, len(queryStrings))
+	i := 0
+	for _, queryN := range queryStrings {
+		switch queryN {
+		case "3":
+			queryFuncs[i], getReadsFuncs[i], processReadReplies[i], indexesToUpd[i] = sendQ3, getQ3LocalServerReads, processQ3LocalServerReply, 3
+		case "5":
+			queryFuncs[i], getReadsFuncs[i], processReadReplies[i], indexesToUpd[i] = sendQ5, getQ5LocalServerReads, processQ5Reply, 5
+		case "11":
+			//Q11 doens't have updates
+			queryFuncs[i], getReadsFuncs[i], processReadReplies[i] = sendQ11, getQ11LocalServerReads, processQ11Reply
+		case "14":
+			queryFuncs[i], getReadsFuncs[i], processReadReplies[i], indexesToUpd[i] = sendQ14, getQ14LocalServerReads, processQ14LocalServerReply, 14
+		case "15":
+			queryFuncs[i], getReadsFuncs[i], processReadReplies[i], indexesToUpd[i] = sendQ15, getQ15LocalServerReads, processQ15LocalServerReply, 15
+		case "18":
+			queryFuncs[i], getReadsFuncs[i], processReadReplies[i], indexesToUpd[i] = sendQ18, getQ18LocalServerReads, processQ18LocalServerReply, 18
 		}
 		i++
 	}

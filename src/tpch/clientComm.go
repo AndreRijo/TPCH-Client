@@ -1,18 +1,18 @@
 package tpch
 
 import (
-	"potionDB/src/antidote"
 	"encoding/csv"
 	"fmt"
 	"net"
 	"os"
+	"potionDB/src/antidote"
 	"potionDB/src/proto"
+	"potionDB/src/tools"
 	"runtime"
 	"strconv"
 	"strings"
 	"sync/atomic"
 	"time"
-	"potionDB/src/tools"
 
 	pb "github.com/golang/protobuf/proto"
 )
@@ -162,6 +162,9 @@ func handleIndexComm(connIndex int) {
 	if dataloadStats.nSendersDone == len(conns) || !splitIndexLoad || SINGLE_INDEX_SERVER {
 		writeDataloadStatsFile()
 		if !DOES_QUERIES && !DOES_UPDATES {
+			for _, conn := range conns {
+				conn.Close()
+			}
 			os.Exit(0)
 		}
 	}
@@ -292,7 +295,7 @@ func getStatsFileToWrite(filename string) (file *os.File) {
 		return
 	}
 	//os.Mkdir(statsSaveLocation, os.ModeDir)
-	os.Mkdir(statsSaveLocation, 0777)
+	os.MkdirAll(statsSaveLocation, 0777)
 	fileCreated := false
 	idLock.Lock()
 	defer idLock.Unlock()

@@ -1,5 +1,7 @@
 package tpch
 
+//TODO: Maybe refactor all the reply/process/query things as objects? Preferably in some other file?
+
 import (
 	"encoding/csv"
 	"fmt"
@@ -38,18 +40,21 @@ const (
 
 var (
 	//Filled automatically by configLoader
-	PRINT_QUERY, QUERY_BENCH bool
-	TEST_ROUTINES            int
-	TEST_DURATION            int64
-	STOP_QUERIES             bool //Becomes true when the execution time for the queries is over
-	READS_PER_TXN            int
-	QUERY_WAIT               time.Duration
-	BATCH_MODE               int                     //CYCLE or SINGLE. Only supported by mix clients atm.
-	queryFuncs               []func(QueryClient) int //queries to execute
-	collectQueryStats        []bool                  //Becomes true when enough time has passed to collect statistics again. One entry per queryClient
-	getReadsFuncs            []func(QueryClient, []antidote.ReadObjectParams, []antidote.ReadObjectParams, []int, int) int
-	processReadReplies       []func(QueryClient, []*proto.ApbReadObjectResp, []int, int) int //int[]: fullReadPos, partialReadPos. int: reads done
-	q15CrdtType              proto.CRDTType                                                  //Q15 can be implemented with either TopK or TopSum.
+	PRINT_QUERY, QUERY_BENCH      bool
+	TEST_ROUTINES                 int
+	TEST_DURATION                 int64
+	STOP_QUERIES                  bool //Becomes true when the execution time for the queries is over
+	READS_PER_TXN                 int
+	QUERY_WAIT                    time.Duration
+	ONLY_LOCAL_DATA_QUERY         bool                    //if true, the client always asks for data of the server he's connected to
+	BATCH_MODE                    int                     //CYCLE or SINGLE. Only supported by mix clients atm.
+	queryFuncs                    []func(QueryClient) int //queries to execute
+	collectQueryStats             []bool                  //Becomes true when enough time has passed to collect statistics again. One entry per queryClient
+	getReadsFuncs                 []func(QueryClient, []antidote.ReadObjectParams, []antidote.ReadObjectParams, []int, int) int
+	getReadsLocalDirectFuncs      []func(QueryClient, [][]antidote.ReadObjectParams, [][]antidote.ReadObjectParams, [][]int, []int, int, int) (int, int) //For local mode, LOCAL_DIRECT
+	processReadReplies            []func(QueryClient, []*proto.ApbReadObjectResp, []int, int) int                                                        //int[]: fullReadPos, partialReadPos. int: reads done
+	processLocalDirectReadReplies []func(QueryClient, [][]*proto.ApbReadObjectResp, [][]int, []int, int, int) int
+	q15CrdtType                   proto.CRDTType //Q15 can be implemented with either TopK or TopSum.
 )
 
 func startQueriesBench() {
@@ -245,6 +250,47 @@ func sendQueries(conn net.Conn) {
 	//sendDataChangesV2(readUpds())
 }
 
+//Converts [][]int into []int
+func localDirectBufIToServerBufI(bufI [][]int, subIndex int) (newBufI []int) {
+	newBufI = make([]int, len(bufI))
+	for i, subBufI := range bufI {
+		newBufI[i] = subBufI[subIndex]
+	}
+	return
+}
+
+func incrementAllBufILocalDirect(bufI [][]int, subIndex int) {
+	for _, subBufI := range bufI {
+		subBufI[subIndex]++
+	}
+}
+
+//BufI: server -> full/partial
+func getQ3LocalDirectReads(client QueryClient, fullR, partialR [][]antidote.ReadObjectParams, bufI [][]int, rngRegions []int, rngRegionsI, reads int) (newReads, rngRegion int) {
+	rndSeg, rndDay, nRegions := procTables.Segments[client.rng.Intn(5)], 1+client.rng.Int63n(31), len(fullR)
+	for i := 0; i < nRegions; i++ {
+		partialR[i][bufI[i][1]] = antidote.ReadObjectParams{
+			KeyParams: antidote.KeyParams{Key: SEGM_DELAY + rndSeg + strconv.FormatInt(rndDay, 10), CrdtType: proto.CRDTType_TOPK_RMV, Bucket: buckets[INDEX_BKT+i]},
+			ReadArgs:  crdt.GetTopNArguments{NumberEntries: 10},
+		}
+		bufI[i][1]++
+	}
+	return reads + nRegions, 0
+}
+
+func getQ3LocalServerReads(client QueryClient, fullR, partialR []antidote.ReadObjectParams, bufI []int, reads int) (newReads int) {
+	rndSeg, rndDay := procTables.Segments[client.rng.Intn(5)], 1+client.rng.Int63n(31)
+	offset, nRegions := bufI[1], len(client.serverConns)
+	for i := 0; i < nRegions; i++ {
+		partialR[offset+i] = antidote.ReadObjectParams{
+			KeyParams: antidote.KeyParams{Key: SEGM_DELAY + rndSeg + strconv.FormatInt(rndDay, 10), CrdtType: proto.CRDTType_TOPK_RMV, Bucket: buckets[INDEX_BKT+i]},
+			ReadArgs:  crdt.GetTopNArguments{NumberEntries: 10},
+		}
+	}
+	bufI[1] += nRegions
+	return reads + nRegions
+}
+
 //Assuming global-only for now
 func getQ3Reads(client QueryClient, fullR, partialR []antidote.ReadObjectParams, bufI []int, reads int) (newReads int) {
 	rndSeg, rndDay := procTables.Segments[client.rng.Intn(5)], 1+client.rng.Int63n(31)
@@ -253,17 +299,63 @@ func getQ3Reads(client QueryClient, fullR, partialR []antidote.ReadObjectParams,
 		ReadArgs:  crdt.GetTopNArguments{NumberEntries: 10},
 	}
 	bufI[1]++
+	if PRINT_QUERY {
+		fmt.Printf("[ClientQuery][Top10N]Q3 query: requesting day %d for segment %s\n", rndDay, rndSeg)
+	}
 	return reads + 1
 }
 
 func processQ3Reply(client QueryClient, replies []*proto.ApbReadObjectResp, bufI []int, reads int) (newReads int) {
-	topKProto := replies[bufI[1]].GetTopk()
-	values := topKProto.GetValues()
-	for _, pair := range values {
-		unpackIndexExtraData(pair.GetData(), Q3_N_EXTRA_DATA)
-	}
+	processQ3ReplyProto(replies[bufI[1]])
 	bufI[1]++
 	return reads + 1
+}
+
+func processQ3LocalServerReply(client QueryClient, replies []*proto.ApbReadObjectResp, bufI []int, reads int) (newRead int) {
+	nRegions := len(client.serverConns)
+	start, end := bufI[1], bufI[1]+nRegions
+	/*
+		fmt.Println("[ClientQuery][Q3Reply][server]")
+		for i := start; i < end; i++ {
+			fmt.Println("[ClientQuery][Q3Reply]Got this topK (unmerged):")
+			values := replies[i].GetTopk().GetValues()
+			for _, pair := range values {
+				orderData := unpackIndexExtraData(pair.GetData(), Q3_N_EXTRA_DATA)
+				fmt.Printf("%d | %d | %s | %s\n", pair.GetPlayerId(), pair.GetScore(), orderData[0], orderData[1])
+			}
+		}
+	*/
+	processQ3ReplyProto(mergeQ3IndexReply(replies[start:end])[0])
+	bufI[1] += nRegions
+	return reads + nRegions
+}
+
+func processQ3LocalDirectReply(client QueryClient, replies [][]*proto.ApbReadObjectResp, bufI [][]int, rngRegions []int, rngRegionsI int, reads int) (newReads int) {
+	//fmt.Println("[ClientQuery][Q3Reply][direct]")
+	nRegions := len(client.serverConns)
+	bufI1 := localDirectBufIToServerBufI(bufI, 1)
+	relevantReplies := readRepliesToOneSlice(replies, bufI1)
+	processQ3ReplyProto(mergeQ3IndexReply(relevantReplies)[0])
+	incrementAllBufILocalDirect(bufI, 1)
+	return reads + nRegions
+}
+
+func processQ3ReplyProto(proto *proto.ApbReadObjectResp) {
+	values := proto.GetTopk().GetValues()
+	if PRINT_QUERY {
+		fmt.Println("[ClientQuery]Q3 results:")
+		var orderData []string
+		for _, pair := range values {
+			//unpackIndexExtraData(pair.GetData(), Q3_N_EXTRA_DATA)
+			orderData = unpackIndexExtraData(pair.GetData(), Q3_N_EXTRA_DATA)
+			fmt.Printf("%d | %d | %s | %s\n", pair.GetPlayerId(), pair.GetScore(), orderData[0], orderData[1])
+		}
+	} else {
+		//Still process data
+		for _, pair := range values {
+			unpackIndexExtraData(pair.GetData(), Q3_N_EXTRA_DATA)
+		}
+	}
 }
 
 func sendQ3(client QueryClient) (nRequests int) {
@@ -333,10 +425,36 @@ func sendQ3(client QueryClient) (nRequests int) {
 }
 
 func getQ5Reads(client QueryClient, fullR, partialR []antidote.ReadObjectParams, bufI []int, reads int) (newReads int) {
-	rndRegion, rndYear := client.rng.Intn(len(procTables.Regions)), 1993+client.rng.Int63n(5)
+	rndRegion, rndYear := client.getRngRegion(), 1993+client.rng.Int63n(5)
 	rndRegionN := procTables.Regions[rndRegion].R_NAME
 	fullR[bufI[0]] = antidote.ReadObjectParams{KeyParams: antidote.KeyParams{
 		Key: NATION_REVENUE + rndRegionN + strconv.FormatInt(rndYear, 10), CrdtType: proto.CRDTType_RRMAP, Bucket: buckets[INDEX_BKT]},
+		ReadArgs: crdt.StateReadArguments{},
+	}
+	bufI[0]++
+	if PRINT_QUERY {
+		fmt.Printf("[ClientQuery][Map[Counters]StateRead]Q5 query: requesting all nation data for region %s for year %d\n", rndRegionN, rndYear)
+	}
+	return reads + 1
+}
+
+func getQ5LocalDirectReads(client QueryClient, fullR, partialR [][]antidote.ReadObjectParams, bufI [][]int, rngRegions []int, rngRegionsI, reads int) (newReads, rngRegion int) {
+	rndRegion, rndYear := client.getRngRegion(), 1993+client.rng.Int63n(5)
+	rndRegionN := procTables.Regions[rndRegion].R_NAME
+	fullR[rndRegion][bufI[rndRegion][0]] = antidote.ReadObjectParams{KeyParams: antidote.KeyParams{
+		Key: NATION_REVENUE + rndRegionN + strconv.FormatInt(rndYear, 10), CrdtType: proto.CRDTType_RRMAP, Bucket: buckets[INDEX_BKT+rndRegion]},
+		ReadArgs: crdt.StateReadArguments{},
+	}
+	bufI[rndRegion][0]++
+	rngRegions[rngRegionsI] = rndRegion
+	return reads + 1, rndRegion
+}
+
+func getQ5LocalServerReads(client QueryClient, fullR, partialR []antidote.ReadObjectParams, bufI []int, reads int) (newReads int) {
+	rndRegion, rndYear := client.getRngRegion(), 1993+client.rng.Int63n(5)
+	rndRegionN := procTables.Regions[rndRegion].R_NAME
+	fullR[bufI[0]] = antidote.ReadObjectParams{KeyParams: antidote.KeyParams{
+		Key: NATION_REVENUE + rndRegionN + strconv.FormatInt(rndYear, 10), CrdtType: proto.CRDTType_RRMAP, Bucket: buckets[INDEX_BKT+rndRegion]},
 		ReadArgs: crdt.StateReadArguments{},
 	}
 	bufI[0]++
@@ -345,13 +463,29 @@ func getQ5Reads(client QueryClient, fullR, partialR []antidote.ReadObjectParams,
 
 func processQ5Reply(client QueryClient, replies []*proto.ApbReadObjectResp, bufI []int, reads int) (newReads int) {
 	//Just to force usual processing
-	ignore(crdt.ReadRespProtoToAntidoteState(replies[bufI[0]], proto.CRDTType_RRMAP, proto.READType_FULL).(crdt.EmbMapEntryState))
+	//ignore(crdt.ReadRespProtoToAntidoteState(replies[bufI[0]], proto.CRDTType_RRMAP, proto.READType_FULL).(crdt.EmbMapEntryState))
+	mapState := crdt.ReadRespProtoToAntidoteState(replies[bufI[0]], proto.CRDTType_RRMAP, proto.READType_FULL).(crdt.EmbMapEntryState)
 	bufI[0]++
+
+	if PRINT_QUERY {
+		fmt.Println("[ClientQuery]Q5 results:")
+		for nation, state := range mapState.States {
+			fmt.Printf("%s: %d\n", nation, state.(crdt.CounterState).Value)
+		}
+	}
+	return reads + 1
+}
+
+func processQ5LocalDirectReply(client QueryClient, replies [][]*proto.ApbReadObjectResp, bufI [][]int, rngRegions []int, rngRegionsI int, reads int) (newReads int) {
+	//fmt.Println("[ClientQuery][Q5Reply][direct]")
+	index := rngRegions[rngRegionsI]
+	ignore(crdt.ReadRespProtoToAntidoteState(replies[index][bufI[index][0]], proto.CRDTType_RRMAP, proto.READType_FULL).(crdt.EmbMapEntryState))
+	bufI[index][0]++
 	return reads + 1
 }
 
 func sendQ5(client QueryClient) (nRequests int) {
-	rndRegion := client.rng.Intn(len(procTables.Regions))
+	rndRegion := client.getRngRegion()
 	rndRegionN := procTables.Regions[rndRegion].R_NAME
 	rndYear := 1993 + client.rng.Int63n(5)
 	bktI, serverI := getIndexOffset(client, rndRegion)
@@ -375,12 +509,42 @@ func sendQ5(client QueryClient) (nRequests int) {
 }
 
 func getQ11Reads(client QueryClient, fullR, partialR []antidote.ReadObjectParams, bufI []int, reads int) (newReads int) {
-	rndNation := procTables.Nations[client.rng.Intn(len(procTables.Nations))]
+	rndNation := procTables.Nations[client.getRngNation()]
 	rndNationN := rndNation.N_NAME
 	fullR[bufI[0]] = antidote.ReadObjectParams{KeyParams: antidote.KeyParams{Key: IMP_SUPPLY + rndNationN, CrdtType: proto.CRDTType_TOPK_RMV, Bucket: buckets[INDEX_BKT]},
 		ReadArgs: crdt.StateReadArguments{},
 	}
-	fullR[bufI[0]+1] = antidote.ReadObjectParams{KeyParams: antidote.KeyParams{Key: IMP_SUPPLY + rndNationN, CrdtType: proto.CRDTType_TOPK_RMV, Bucket: buckets[INDEX_BKT]},
+	fullR[bufI[0]+1] = antidote.ReadObjectParams{KeyParams: antidote.KeyParams{Key: IMP_SUPPLY + rndNationN, CrdtType: proto.CRDTType_COUNTER, Bucket: buckets[INDEX_BKT]},
+		ReadArgs: crdt.StateReadArguments{},
+	}
+	bufI[0] += 2
+	if PRINT_QUERY {
+		fmt.Printf("[ClientQuery][TopK_StateRead+Counter]Q11 query: requesting topK and counter from nation %s\n", rndNationN)
+	}
+	return reads + 2
+}
+
+func getQ11LocalDirectReads(client QueryClient, fullR, partialR [][]antidote.ReadObjectParams, bufI [][]int, rngRegions []int, rngRegionsI, reads int) (newReads, rngNation int) {
+	rndNation := procTables.Nations[client.getRngNation()]
+	rndNationN, rndNationR := rndNation.N_NAME, rndNation.N_REGIONKEY
+	fullR[rndNationR][bufI[rndNationR][0]] = antidote.ReadObjectParams{KeyParams: antidote.KeyParams{Key: IMP_SUPPLY + rndNationN, CrdtType: proto.CRDTType_TOPK_RMV, Bucket: buckets[INDEX_BKT+rndNationR]},
+		ReadArgs: crdt.StateReadArguments{},
+	}
+	fullR[rndNationR][bufI[rndNationR][0]+1] = antidote.ReadObjectParams{KeyParams: antidote.KeyParams{Key: IMP_SUPPLY + rndNationN, CrdtType: proto.CRDTType_COUNTER, Bucket: buckets[INDEX_BKT+rndNationR]},
+		ReadArgs: crdt.StateReadArguments{},
+	}
+	bufI[rndNationR][0] += 2
+	rngRegions[rngRegionsI] = int(rndNationR)
+	return reads + 2, int(rndNationR)
+}
+
+func getQ11LocalServerReads(client QueryClient, fullR, partialR []antidote.ReadObjectParams, bufI []int, reads int) (newReads int) {
+	rndNation := procTables.Nations[client.getRngNation()]
+	rndNationN, rndNationR := rndNation.N_NAME, rndNation.N_REGIONKEY
+	fullR[bufI[0]] = antidote.ReadObjectParams{KeyParams: antidote.KeyParams{Key: IMP_SUPPLY + rndNationN, CrdtType: proto.CRDTType_TOPK_RMV, Bucket: buckets[INDEX_BKT+rndNationR]},
+		ReadArgs: crdt.StateReadArguments{},
+	}
+	fullR[bufI[0]+1] = antidote.ReadObjectParams{KeyParams: antidote.KeyParams{Key: IMP_SUPPLY + rndNationN, CrdtType: proto.CRDTType_COUNTER, Bucket: buckets[INDEX_BKT+rndNationR]},
 		ReadArgs: crdt.StateReadArguments{},
 	}
 	bufI[0] += 2
@@ -391,12 +555,35 @@ func processQ11Reply(client QueryClient, replies []*proto.ApbReadObjectResp, buf
 	topKProto, counterProto := replies[bufI[0]].GetTopk(), replies[bufI[0]+1].GetCounter()
 	ignore(counterProto.GetValue(), topKProto)
 	bufI[0] += 2
+
+	if PRINT_QUERY {
+		fmt.Printf("[ClientQuery]Q11 results:\n")
+		values, minValue := topKProto.GetValues(), counterProto.GetValue()
+		sort.Slice(values, func(i, j int) bool { return values[i].GetScore() > values[j].GetScore() })
+		for _, pair := range values {
+			if pair.GetScore() < minValue {
+				fmt.Println("Break due to topK value being lower than", minValue)
+				break
+			}
+			fmt.Printf("%d: %d.\n", pair.GetPlayerId(), pair.GetScore())
+		}
+	}
+
+	return reads + 2
+}
+
+func processQ11LocalDirectReply(client QueryClient, replies [][]*proto.ApbReadObjectResp, bufI [][]int, rngRegions []int, rngRegionsI int, reads int) (newReads int) {
+	//fmt.Println("[ClientQuery][Q11Reply][direct]")
+	index := rngRegions[rngRegionsI]
+	topKProto, counterProto := replies[index][bufI[index][0]].GetTopk(), replies[index][bufI[index][0]+1].GetCounter()
+	ignore(counterProto.GetValue(), topKProto)
+	bufI[index][0] += 2
 	return reads + 2
 }
 
 func sendQ11(client QueryClient) (nRequests int) {
 	//Unfortunatelly we can't use the topk query of "only values above min" here as we need to fetch the min from the database first.
-	rndNation := procTables.Nations[client.rng.Intn(len(procTables.Nations))]
+	rndNation := procTables.Nations[client.getRngNation()]
 	//rndNation := procTables.Nations[0]
 	rndNationN, rndNationR := rndNation.N_NAME, rndNation.N_REGIONKEY
 	bktI, serverI := getIndexOffset(client, int(rndNationR))
@@ -439,17 +626,78 @@ func getQ14Reads(client QueryClient, fullR, partialR []antidote.ReadObjectParams
 		ReadArgs: crdt.StateReadArguments{},
 	}
 	bufI[0]++
+	if PRINT_QUERY {
+		fmt.Printf("[ClientQuery][Avg StateRead]Q14 query: requesting average for key %s (%d/%d).\n", PROMO_PERCENTAGE+date, month, year)
+	}
 	return reads + 1
 }
 
-func processQ14Reply(client QueryClient, replies []*proto.ApbReadObjectResp, bufI []int, reads int) (newReads int) {
-	topKProto := replies[bufI[0]].GetTopk()
-	values := topKProto.GetValues()
-	for _, pair := range values {
-		unpackIndexExtraData(pair.GetData(), Q3_N_EXTRA_DATA)
+//Local versions actually need an AvgFullRead instead of StateReadArguments (partial instead of full read)
+func getQ14LocalDirectReads(client QueryClient, fullR, partialR [][]antidote.ReadObjectParams, bufI [][]int, rngRegions []int, rngRegionsI, reads int) (newReads, rngRegion int) {
+	rndForDate, nRegions := client.rng.Int63n(60), len(client.serverConns)
+	year, month := 1993+rndForDate/12, 1+rndForDate%12
+	date := strconv.FormatInt(year, 10) + strconv.FormatInt(month, 10)
+	for i := 0; i < nRegions; i++ {
+		partialR[i][bufI[i][1]] = antidote.ReadObjectParams{KeyParams: antidote.KeyParams{Key: PROMO_PERCENTAGE + date, CrdtType: proto.CRDTType_AVG, Bucket: buckets[INDEX_BKT+i]},
+			ReadArgs: crdt.AvgGetFullArguments{},
+		}
+		bufI[i][1]++
 	}
+	return reads + nRegions, 0
+}
+
+func getQ14LocalServerReads(client QueryClient, fullR, partialR []antidote.ReadObjectParams, bufI []int, reads int) (newReads int) {
+	rndForDate, nRegions, offset := client.rng.Int63n(60), len(client.serverConns), bufI[1]
+	year, month := 1993+rndForDate/12, 1+rndForDate%12
+	date := strconv.FormatInt(year, 10) + strconv.FormatInt(month, 10)
+	for i := 0; i < nRegions; i++ {
+		partialR[offset+i] = antidote.ReadObjectParams{KeyParams: antidote.KeyParams{Key: PROMO_PERCENTAGE + date, CrdtType: proto.CRDTType_AVG, Bucket: buckets[INDEX_BKT+i]},
+			ReadArgs: crdt.AvgGetFullArguments{},
+		}
+	}
+	bufI[1] += nRegions
+	return reads + nRegions
+}
+
+func processQ14Reply(client QueryClient, replies []*proto.ApbReadObjectResp, bufI []int, reads int) (newReads int) {
+	avg := replies[bufI[0]].GetAvg().GetAvg()
 	bufI[0]++
+	if PRINT_QUERY {
+		fmt.Printf("[ClientQuery]Q14 result: %f.\n", avg)
+	}
 	return reads + 1
+}
+
+func processQ14LocalServerReply(client QueryClient, replies []*proto.ApbReadObjectResp, bufI []int, reads int) (newReads int) {
+	nRegions := len(client.serverConns)
+	start, end := bufI[1], bufI[1]+nRegions
+	/*
+		fmt.Println("[ClientQuery][Q14Reply][server]")
+		for i := start; i < end; i++ {
+			//fmt.Println("[ClientQuery][Q14Reply]Avg proto received (unprocessed):", replies[i].GetAvg().GetAvg())
+			currProto := replies[i].GetPartread().GetAvg().GetGetfull()
+			fmt.Println("[ClientQuery][Q14Reply]Avg proto received (unprocessed). Sum:",
+				currProto.GetSum(), "NAdds:", currProto.GetNAdds(), "Avg:", float64(currProto.GetSum())/float64(currProto.GetNAdds()))
+		}
+	*/
+	//mergeQ14IndexReply(replies[start:end])[0].GetAvg().GetAvg()
+	if PRINT_QUERY {
+		fmt.Printf("[ClientQuery]Q14 result: %f.\n", mergeQ14IndexReply(replies[start:end])[0].GetAvg().GetAvg())
+	} else {
+		mergeQ14IndexReply(replies[start:end])[0].GetAvg().GetAvg()
+	}
+	bufI[1] += nRegions
+	return reads + nRegions
+}
+
+func processQ14LocalDirectReply(client QueryClient, replies [][]*proto.ApbReadObjectResp, bufI [][]int, rngRegions []int, rngRegionsI int, reads int) (newReads int) {
+	//fmt.Println("[ClientQuery][Q14Reply][direct]")
+	nRegions := len(client.serverConns)
+	bufI1 := localDirectBufIToServerBufI(bufI, 1)
+	relevantReplies := readRepliesToOneSlice(replies, bufI1)
+	mergeQ14IndexReply(relevantReplies)[0].GetAvg().GetAvg()
+	incrementAllBufILocalDirect(bufI, 1)
+	return reads + nRegions
 }
 
 func sendQ14(client QueryClient) (nRequests int) {
@@ -490,16 +738,83 @@ func getQ15Reads(client QueryClient, fullR, partialR []antidote.ReadObjectParams
 		ReadArgs:  crdt.GetTopNArguments{NumberEntries: 1},
 	}
 	bufI[1]++
+	if PRINT_QUERY {
+		fmt.Printf("[ClientQuery][Top1]Q15 query: requesting top1 for %d/%d\n", rndQuarter, rndYear)
+	}
 	return reads + 1
 }
 
+func getQ15LocalDirectReads(client QueryClient, fullR, partialR [][]antidote.ReadObjectParams, bufI [][]int, rngRegions []int, rngRegionsI, reads int) (newReads, rngRegion int) {
+	rndQuarter, rndYear, nRegions := 1+3*client.rng.Int63n(4), 1993+client.rng.Int63n(5), len(client.serverConns)
+	date := strconv.FormatInt(rndYear, 10) + strconv.FormatInt(rndQuarter, 10)
+	for i := 0; i < nRegions; i++ {
+		partialR[i][bufI[i][1]] = antidote.ReadObjectParams{
+			KeyParams: antidote.KeyParams{Key: TOP_SUPPLIERS + date, CrdtType: q15CrdtType, Bucket: buckets[INDEX_BKT+i]},
+			ReadArgs:  crdt.GetTopNArguments{NumberEntries: 1},
+		}
+		bufI[i][1]++
+	}
+	return reads + nRegions, 0
+}
+
+func getQ15LocalServerReads(client QueryClient, fullR, partialR []antidote.ReadObjectParams, bufI []int, reads int) (newReads int) {
+	rndQuarter, rndYear, nRegions, offset := 1+3*client.rng.Int63n(4), 1993+client.rng.Int63n(5), len(client.serverConns), bufI[1]
+	date := strconv.FormatInt(rndYear, 10) + strconv.FormatInt(rndQuarter, 10)
+	for i := 0; i < nRegions; i++ {
+		partialR[offset+i] = antidote.ReadObjectParams{
+			KeyParams: antidote.KeyParams{Key: TOP_SUPPLIERS + date, CrdtType: q15CrdtType, Bucket: buckets[INDEX_BKT+i]},
+			ReadArgs:  crdt.GetTopNArguments{NumberEntries: 1},
+		}
+	}
+	bufI[1] += nRegions
+	return reads + nRegions
+}
+
 func processQ15Reply(client QueryClient, replies []*proto.ApbReadObjectResp, bufI []int, reads int) (newReads int) {
-	values := replies[bufI[1]].GetTopk().GetValues()
+	processQ15ReplyProto(replies[bufI[1]])
+	bufI[1]++
+	return reads + 1
+}
+
+func processQ15LocalServerReply(client QueryClient, replies []*proto.ApbReadObjectResp, bufI []int, reads int) (newReads int) {
+	nRegions := len(client.serverConns)
+	start, end := bufI[1], bufI[1]+nRegions
+	/*
+		fmt.Println("[ClientQuery][Q15Reply][server]")
+		for i := start; i < end; i++ {
+			fmt.Println("[ClientQuery][Q15Reply]TopN proto received (unprocessed):")
+			values := replies[i].GetTopk().GetValues()
+			for _, pair := range values {
+				fmt.Printf("%d: %d\n", pair.GetPlayerId(), pair.GetScore())
+			}
+		}
+	*/
+	processQ15ReplyProto(mergeQ15IndexReply(replies[start:end])[0])
+	bufI[1] += nRegions
+	return reads + nRegions
+}
+
+func processQ15LocalDirectReply(client QueryClient, replies [][]*proto.ApbReadObjectResp, bufI [][]int, rngRegions []int, rngRegionsI int, reads int) (newReads int) {
+	//fmt.Println("[ClientQuery][Q15Reply][direct]")
+	nRegions := len(client.serverConns)
+	bufI1 := localDirectBufIToServerBufI(bufI, 1)
+	relevantReplies := readRepliesToOneSlice(replies, bufI1)
+	processQ15ReplyProto(mergeQ15IndexReply(relevantReplies)[0])
+	incrementAllBufILocalDirect(bufI, 1)
+	return reads + nRegions
+}
+
+func processQ15ReplyProto(proto *proto.ApbReadObjectResp) {
+	values := proto.GetTopk().GetValues()
 	if len(values) > 1 {
 		sort.Slice(values, func(i, j int) bool { return values[i].GetScore() > values[j].GetScore() })
 	}
-	bufI[1]++
-	return reads + 1
+	if PRINT_QUERY {
+		fmt.Println("[ClientQuery]Q15 results:")
+		for _, pair := range values {
+			fmt.Printf("%d: %d\n", pair.GetPlayerId(), pair.GetScore())
+		}
+	}
 }
 
 func sendQ15(client QueryClient) (nRequests int) {
@@ -535,22 +850,103 @@ func sendQ15(client QueryClient) (nRequests int) {
 
 func getQ18Reads(client QueryClient, fullR, partialR []antidote.ReadObjectParams, bufI []int, reads int) (newReads int) {
 	rndQuantity := 312 + client.rng.Int31n(4)
-	fullR[bufI[0]+1] = antidote.ReadObjectParams{
+	//fmt.Println("[ClientQuery]Asking for: ", rndQuantity)
+	fullR[bufI[0]] = antidote.ReadObjectParams{
 		KeyParams: antidote.KeyParams{Key: LARGE_ORDERS + strconv.FormatInt(int64(rndQuantity), 10), CrdtType: proto.CRDTType_TOPK_RMV, Bucket: buckets[INDEX_BKT]},
 		ReadArgs:  crdt.StateReadArguments{},
 	}
 	bufI[0]++
+	if PRINT_QUERY {
+		fmt.Printf("[ClientQuery][TopK StateRead]Q18 query: requesting topK for quantity %d\n", rndQuantity)
+	}
 	return reads + 1
 }
 
-func processQ18Reply(client QueryClient, replies []*proto.ApbReadObjectResp, bufI []int, reads int) (newReads int) {
-	values := replies[bufI[0]].GetTopk().GetValues()
-	sort.Slice(values, func(i, j int) bool { return values[i].GetScore() > values[j].GetScore() })
-	for _, pair := range values {
-		unpackIndexExtraData(pair.GetData(), Q18_N_EXTRA_DATA)
+func getQ18LocalDirectReads(client QueryClient, fullR, partialR [][]antidote.ReadObjectParams, bufI [][]int, rngRegions []int, rngRegionsI, reads int) (newReads, rndRegion int) {
+	rndQuantity, nRegions := 312+client.rng.Int31n(4), len(client.serverConns)
+	for i := 0; i < nRegions; i++ {
+		fullR[i][bufI[i][0]] = antidote.ReadObjectParams{
+			KeyParams: antidote.KeyParams{Key: LARGE_ORDERS + strconv.FormatInt(int64(rndQuantity), 10), CrdtType: proto.CRDTType_TOPK_RMV, Bucket: buckets[INDEX_BKT+i]},
+			ReadArgs:  crdt.StateReadArguments{},
+		}
+		bufI[i][0]++
 	}
+	return reads + nRegions, 0
+}
+
+func getQ18LocalServerReads(client QueryClient, fullR, partialR []antidote.ReadObjectParams, bufI []int, reads int) (newReads int) {
+	rndQuantity, nRegions, offset := 312+client.rng.Int31n(4), len(client.serverConns), bufI[0]
+	for i := 0; i < nRegions; i++ {
+		fullR[offset+i] = antidote.ReadObjectParams{
+			KeyParams: antidote.KeyParams{Key: LARGE_ORDERS + strconv.FormatInt(int64(rndQuantity), 10), CrdtType: proto.CRDTType_TOPK_RMV, Bucket: buckets[INDEX_BKT+i]},
+			ReadArgs:  crdt.StateReadArguments{},
+		}
+	}
+	bufI[0] += nRegions
+	if PRINT_QUERY {
+		fmt.Printf("[ClientQuery][TopK StateRead]Q18 query: requesting topK for quantity %d\n", rndQuantity)
+	}
+	return reads + nRegions
+}
+
+func processQ18Reply(client QueryClient, replies []*proto.ApbReadObjectResp, bufI []int, reads int) (newReads int) {
+	processQ18ReplyProto(replies[bufI[0]])
 	bufI[0]++
 	return reads + 1
+}
+
+func processQ18LocalServerReply(client QueryClient, replies []*proto.ApbReadObjectResp, bufI []int, reads int) (newReads int) {
+	nRegions := len(client.serverConns)
+	start, end := bufI[0], bufI[0]+nRegions
+	/*
+		fmt.Println("[ClientQuery][Q18Reply][server]")
+		for i := start; i < end; i++ {
+			fmt.Println("[ClientQuery][Q18Reply]TopK proto received (unprocessed):")
+			values := replies[i].GetTopk().GetValues()
+			var sb strings.Builder
+			for _, pair := range values {
+				unpackIndexExtraData(pair.GetData(), Q18_N_EXTRA_DATA)
+				sb.WriteString(strconv.Itoa(int(pair.GetPlayerId())))
+				sb.WriteString(":")
+				sb.WriteString(strconv.Itoa(int(pair.GetScore())))
+				sb.WriteString(" ; ")
+			}
+			sb.WriteString("\n")
+			fmt.Print(sb.String())
+		}
+	*/
+	processQ18ReplyProto(mergeQ18IndexReply(replies[start:end])[0])
+	bufI[0] += nRegions
+	return reads + nRegions
+}
+
+func processQ18LocalDirectReply(client QueryClient, replies [][]*proto.ApbReadObjectResp, bufI [][]int, rngRegions []int, rngRegionsI int, reads int) (newReads int) {
+	//fmt.Println("[ClientQuery][Q18Reply][direct]")
+	nRegions := len(client.serverConns)
+	bufI0 := localDirectBufIToServerBufI(bufI, 0)
+	relevantReplies := readRepliesToOneSlice(replies, bufI0)
+	processQ18ReplyProto(mergeQ18IndexReply(relevantReplies)[0])
+	incrementAllBufILocalDirect(bufI, 0)
+	return reads + nRegions
+}
+
+func processQ18ReplyProto(proto *proto.ApbReadObjectResp) {
+	values := proto.GetTopk().GetValues()
+	sort.Slice(values, func(i, j int) bool { return values[i].GetScore() > values[j].GetScore() })
+
+	/*
+		var sb strings.Builder
+		sb.WriteString("[ClientQuery]Q18 result:\n")
+		for _, pair := range values {
+			unpackIndexExtraData(pair.GetData(), Q18_N_EXTRA_DATA)
+			sb.WriteString(strconv.Itoa(int(pair.GetPlayerId())))
+			sb.WriteString(":")
+			sb.WriteString(strconv.Itoa(int(pair.GetScore())))
+			sb.WriteString(" ; ")
+		}
+		sb.WriteString("\n")
+		fmt.Print(sb.String())
+	*/
 }
 
 func sendQ18(client QueryClient) (nRequests int) {
@@ -668,7 +1064,7 @@ func sendQ18(client QueryClient) (nRequests int) {
 			for _, pair := range values {
 				extraData = unpackIndexExtraData(pair.GetData(), Q18_N_EXTRA_DATA)
 				fmt.Printf("%s | %s | %d | %s | %s | %d\n",
-					extraData[0], extraData[1], pair.GetPlayerId(), extraData[2], extraData[3], pair.GetScore())
+					extraData[0], extraData[1], pair.GetPlayerId(), extraData[4]+"/"+extraData[3]+"/"+extraData[2], extraData[5], pair.GetScore())
 			}
 		}
 	} else {
@@ -739,6 +1135,25 @@ func sendReceiveReadProto(client QueryClient, fullReads []antidote.ReadObjectPar
 	antidote.SendProto(antidote.StaticRead, antidote.CreateStaticRead(nil, fullReads, partReads), client.serverConns[nConn])
 	_, tmpProto, _ := antidote.ReceiveProto(client.serverConns[nConn])
 	return tmpProto.(*proto.ApbStaticReadObjectsResp)
+}
+
+//Note: assumes len(fullReads) == len(partReads), and that each entry matches one connection in client.
+func sendReceiveMultipleReadProtos(client QueryClient, fullReads [][]antidote.ReadObjectParams, partReads [][]antidote.ReadObjectParams) (replyProtos []*proto.ApbStaticReadObjectsResp) {
+	var partR []antidote.ReadObjectParams
+	replyProtos = make([]*proto.ApbStaticReadObjectsResp, len(fullReads))
+	for i, fullR := range fullReads {
+		partR = partReads[i]
+		if len(fullR) > 0 || len(partR) > 0 {
+			antidote.SendProto(antidote.StaticRead, antidote.CreateStaticRead(nil, fullR, partR), client.serverConns[i])
+		}
+	}
+	for i, fullR := range fullReads {
+		if len(fullR) > 0 || len(partReads[i]) > 0 {
+			_, reply, _ := antidote.ReceiveProto(client.serverConns[i])
+			replyProtos[i] = reply.(*proto.ApbStaticReadObjectsResp)
+		}
+	}
+	return
 }
 
 /*
@@ -826,14 +1241,14 @@ func embMapRegisterToString(key string, state crdt.EmbMapEntryState) string {
 	return state.States[key].(crdt.RegisterState).Value.(string)
 }
 
-func sendReceiveIndexQuery(client QueryClient, fullReads []antidote.ReadObjectParams, partReads []antidote.ReadObjectParams) (replies []*proto.ApbStaticReadObjectsResp) {
+func sendReceiveIndexQuery(client QueryClient, fullReads, partReads []antidote.ReadObjectParams) (replies []*proto.ApbStaticReadObjectsResp) {
 	if isIndexGlobal {
 		if len(partReads) == 0 {
 			return []*proto.ApbStaticReadObjectsResp{sendReceiveReadObjsProto(client, fullReads, client.indexServer)}
 		} else {
 			return []*proto.ApbStaticReadObjectsResp{sendReceiveReadProto(client, fullReads, partReads, client.indexServer)}
 		}
-	} else {
+	} else if localMode == LOCAL_DIRECT {
 		fullReadsS := make([][]antidote.ReadObjectParams, len(procTables.Regions))
 		partReadsS := make([][]antidote.ReadObjectParams, len(procTables.Regions))
 		var currFull, currPart []antidote.ReadObjectParams
@@ -866,6 +1281,36 @@ func sendReceiveIndexQuery(client QueryClient, fullReads []antidote.ReadObjectPa
 			replyProtos[i] = tmpProto.(*proto.ApbStaticReadObjectsResp)
 		}
 		return replyProtos
+	} else {
+		//Still need to prepare multiple reads, but all for the same server
+		nRegions := len(procTables.Regions)
+		fullReadS := make([]antidote.ReadObjectParams, nRegions*len(fullReads))
+		partReadS := make([]antidote.ReadObjectParams, nRegions*len(partReads))
+		fullReadI, partReadI := 0, 0
+
+		for _, param := range fullReads {
+			for j := 0; j < nRegions; j, fullReadI = j+1, fullReadI+1 {
+				fullReadS[fullReadI] = antidote.ReadObjectParams{
+					KeyParams: antidote.KeyParams{Key: param.Key, CrdtType: param.CrdtType, Bucket: buckets[INDEX_BKT+j]},
+				}
+			}
+		}
+		for _, param := range partReads {
+			for j := 0; j < nRegions; j, partReadI = j+1, partReadI+1 {
+				partReadS[partReadI] = antidote.ReadObjectParams{
+					KeyParams: antidote.KeyParams{Key: param.Key, CrdtType: param.CrdtType, Bucket: buckets[INDEX_BKT+j]},
+					ReadArgs:  param.ReadArgs,
+				}
+			}
+		}
+		if len(partReads) == 0 {
+			antidote.SendProto(antidote.StaticReadObjs, antidote.CreateStaticReadObjs(nil, fullReadS), client.serverConns[client.indexServer])
+		} else {
+			antidote.SendProto(antidote.StaticRead, antidote.CreateStaticRead(nil, partReadS, fullReadS), client.serverConns[client.indexServer])
+		}
+
+		_, tmpProto, _ := antidote.ReceiveProto(client.serverConns[client.indexServer])
+		return []*proto.ApbStaticReadObjectsResp{tmpProto.(*proto.ApbStaticReadObjectsResp)}
 	}
 }
 
@@ -876,13 +1321,13 @@ func mergeIndex(protos []*proto.ApbStaticReadObjectsResp, queryN int) []*proto.A
 	}
 	switch queryN {
 	case 3:
-		return mergeQ3IndexReply(protos)
+		return mergeQ3IndexReply(getObjectsFromStaticReadResp(protos))
 	case 14:
-		return mergeQ14IndexReply(protos)
+		return mergeQ14IndexReply(getObjectsFromStaticReadResp(protos))
 	case 15:
-		return mergeQ15IndexReply(protos)
+		return mergeQ15IndexReply(getObjectsFromStaticReadResp(protos))
 	case 18:
-		return mergeQ18IndexReply(protos)
+		return mergeQ18IndexReply(getObjectsFromStaticReadResp(protos))
 	default:
 		return nil
 	}
@@ -892,17 +1337,18 @@ func mergeIndex(protos []*proto.ApbStaticReadObjectsResp, queryN int) []*proto.A
 //Q11 also doesn't need merge as it is single nation.
 //Q18 needs merge as it is the top 100 of all customers.
 
-func mergeQ3IndexReply(protos []*proto.ApbStaticReadObjectsResp) (merged []*proto.ApbReadObjectResp) {
-	return mergeTopKProtos(protos, 10)
+func mergeQ3IndexReply(protoObjs []*proto.ApbReadObjectResp) (merged []*proto.ApbReadObjectResp) {
+	return mergeTopKProtos(protoObjs, 10)
 }
 
 //Needs to merge as the info for a date is spread across the CRDTs. A partialRead for AVG is needed in this case.
-func mergeQ14IndexReply(protos []*proto.ApbStaticReadObjectsResp) (merged []*proto.ApbReadObjectResp) {
-	protoObjs := getObjectsFromStaticReadResp(protos)
+func mergeQ14IndexReply(protoObjs []*proto.ApbReadObjectResp) (merged []*proto.ApbReadObjectResp) {
+	//protoObjs := getObjectsFromStaticReadResp(protos)
 	var sum, nAdds int64
 	var currProto *proto.ApbAvgGetFullReadResp
 	for _, protos := range protoObjs {
-		currProto = protos[0].GetPartread().GetAvg().GetGetfull()
+		//currProto = protos[0].GetPartread().GetAvg().GetGetfull()
+		currProto = protos.GetPartread().GetAvg().GetGetfull()
 		sum += currProto.GetSum()
 		nAdds += currProto.GetNAdds()
 	}
@@ -911,13 +1357,14 @@ func mergeQ14IndexReply(protos []*proto.ApbStaticReadObjectsResp) (merged []*pro
 }
 
 //Q15 also needs merge.
-func mergeQ15IndexReply(protos []*proto.ApbStaticReadObjectsResp) (merged []*proto.ApbReadObjectResp) {
-	protoObjs := getObjectsFromStaticReadResp(protos)
+func mergeQ15IndexReply(protoObjs []*proto.ApbReadObjectResp) (merged []*proto.ApbReadObjectResp) {
+	//protoObjs := getObjectsFromStaticReadResp(protos)
 	max, amount := int32(-1), 0
 	var currPairs []*proto.ApbIntPair
 	//Find max and count how many
 	for _, topProtos := range protoObjs {
-		currPairs = topProtos[0].GetTopk().GetValues()
+		//currPairs = topProtos[0].GetTopk().GetValues()
+		currPairs = topProtos.GetTopk().GetValues()
 		if currPairs[0].GetScore() > max {
 			max = currPairs[0].GetScore()
 			amount = len(currPairs)
@@ -929,7 +1376,8 @@ func mergeQ15IndexReply(protos []*proto.ApbStaticReadObjectsResp) (merged []*pro
 	written := 0
 	//Add all entries that are max
 	for _, topProtos := range protoObjs {
-		currPairs = topProtos[0].GetTopk().GetValues()
+		//currPairs = topProtos[0].GetTopk().GetValues()
+		currPairs = topProtos.GetTopk().GetValues()
 		if currPairs[0].GetScore() == max {
 			for _, pair := range currPairs {
 				values[written] = pair
@@ -940,31 +1388,39 @@ func mergeQ15IndexReply(protos []*proto.ApbStaticReadObjectsResp) (merged []*pro
 	return []*proto.ApbReadObjectResp{&proto.ApbReadObjectResp{Topk: &proto.ApbGetTopkResp{Values: values}}}
 }
 
-func mergeQ18IndexReply(protos []*proto.ApbStaticReadObjectsResp) (merged []*proto.ApbReadObjectResp) {
-	return mergeTopKProtos(protos, 100)
+func mergeQ18IndexReply(protoObjs []*proto.ApbReadObjectResp) (merged []*proto.ApbReadObjectResp) {
+	return mergeTopKProtos(protoObjs, 100)
 }
 
-func mergeTopKProtos(protos []*proto.ApbStaticReadObjectsResp, target int) (merged []*proto.ApbReadObjectResp) {
-	protoObjs := getObjectsFromStaticReadResp(protos)
+//Note: requires for all topK to be ordered.
+func mergeTopKProtos(protoObjs []*proto.ApbReadObjectResp, target int) (merged []*proto.ApbReadObjectResp) {
+	//protoObjs := getObjectsFromStaticReadResp(protos)
 	values := make([]*proto.ApbIntPair, target)
-	currI := make([]int, len(protos))
-	end, max, playerId, replicaI := true, int32(-1), int32(-1), 0
+	//currI := make([]int, len(protos))
+	currI := make([]int, len(protoObjs))
+	end, max, playerId, replicaI, data := true, int32(-1), int32(-1), 0, []byte{}
 	var currPair *proto.ApbIntPair
 	written := 0
+	//Algorithm: go through all protobufs, check first position of each, pick highest. Increase index of the protobuf with highest
+	//Keep repeating the algorithm until enough elements (target) are filled.
+	//Total iterations: target * len(protoObjs)
+	//This works as all topK are ordered.
 	for written < target {
-		for i, topProtos := range protoObjs {
-			if len(topProtos[0].GetTopk().GetValues()) > currI[i] {
+		for i, topProtos := range protoObjs { //Goes through all protos
+			if len(topProtos.GetTopk().GetValues()) > currI[i] { //Checks if there's still entries left
+				//if len(topProtos[0].GetTopk().GetValues()) > currI[i] {
 				end = false
-				currPair = topProtos[0].GetTopk().GetValues()[currI[i]]
+				//currPair = topProtos[0].GetTopk().GetValues()[currI[i]]
+				currPair = topProtos.GetTopk().GetValues()[currI[i]]
 				if currPair.GetScore() > max {
-					max, playerId, replicaI = currPair.GetScore(), currPair.GetPlayerId(), i
+					max, playerId, data, replicaI = currPair.GetScore(), currPair.GetPlayerId(), currPair.Data, i
 				}
 			}
 		}
 		if end {
 			break
 		}
-		values[written] = &proto.ApbIntPair{PlayerId: pb.Int32(playerId), Score: pb.Int32(max)}
+		values[written] = &proto.ApbIntPair{PlayerId: pb.Int32(playerId), Score: pb.Int32(max), Data: data}
 		currI[replicaI]++
 		written++
 		max, end = -1, true
@@ -973,12 +1429,29 @@ func mergeTopKProtos(protos []*proto.ApbStaticReadObjectsResp, target int) (merg
 	return []*proto.ApbReadObjectResp{&proto.ApbReadObjectResp{Topk: &proto.ApbGetTopkResp{Values: values}}}
 }
 
+/*
 func getObjectsFromStaticReadResp(protos []*proto.ApbStaticReadObjectsResp) (protoObjs [][]*proto.ApbReadObjectResp) {
 	protoObjs = make([][]*proto.ApbReadObjectResp, len(protos))
 	for i, proto := range protos {
 		protoObjs[i] = proto.GetObjects().GetObjects()
 	}
 	return
+}
+*/
+func getObjectsFromStaticReadResp(protos []*proto.ApbStaticReadObjectsResp) (protoObjs []*proto.ApbReadObjectResp) {
+	protoObjs = make([]*proto.ApbReadObjectResp, 0, len(protos)) //Usually only 1 read per entry
+	for _, proto := range protos {
+		protoObjs = append(protoObjs, proto.GetObjects().GetObjects()...)
+	}
+	return
+}
+
+func readRepliesToOneSlice(protos [][]*proto.ApbReadObjectResp, indexes []int) (objs []*proto.ApbReadObjectResp) {
+	objs = make([]*proto.ApbReadObjectResp, len(protos))
+	for i, serverProtos := range protos {
+		objs[i] = serverProtos[indexes[i]]
+	}
+	return objs
 }
 
 func getIndexOffset(client QueryClient, region int) (bucketI, serverI int) {
@@ -1156,6 +1629,23 @@ func batchModeStringToInt(typeS string) int {
 		os.Exit(0)
 	}
 	return CYCLE
+}
+
+//If ONLY_LOCAL_DATA_QUERY = true, returns the region of the client's server. Otherwise, returns a random one.
+func (client QueryClient) getRngRegion() int {
+	if ONLY_LOCAL_DATA_QUERY {
+		return client.indexServer
+	}
+	return client.rng.Intn(len(procTables.Regions))
+}
+
+func (client QueryClient) getRngNation() int {
+	if ONLY_LOCAL_DATA_QUERY {
+		nationIDs := procTables.GetNationIDsOfRegion(client.indexServer)
+		return int(nationIDs[client.rng.Intn(len(nationIDs))])
+
+	}
+	return client.rng.Intn(len(procTables.Nations))
 }
 
 //OBSOLETE

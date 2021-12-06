@@ -1,10 +1,10 @@
 package tpch
 
 import (
-	"potionDB/src/antidote"
-	"potionDB/src/crdt"
 	"fmt"
 	"math"
+	"potionDB/src/antidote"
+	"potionDB/src/crdt"
 	"potionDB/src/proto"
 	"runtime"
 	"strings"
@@ -90,6 +90,7 @@ func handleTableProcessing() {
 			channels.prepSendChan <- i
 		}
 	}
+	procTables.NationsByRegion = CreateNationsByRegionTable(procTables.Nations, procTables.Regions)
 	times.clientTables = (time.Now().UnixNano() - times.startTime) / 1000000
 	fmt.Println("Finished creating all tables.")
 	//If we're only doing queries, we can clean the unprocessed tables right now, as no further processing will be done
@@ -140,7 +141,7 @@ func handlePrepareSend() {
 		}
 		//runtime.GC()
 	}
-	fmt.Println("Waiting for:", nFinished)
+	//fmt.Println("Waiting for:", nFinished)
 	for ; nFinished < len(tableNames); nFinished++ {
 		<-prepareProtoFinishChan
 		fmt.Println("Received prepareFinish, nFinished will now be:", nFinished+1)

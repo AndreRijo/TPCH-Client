@@ -80,6 +80,8 @@ func prepareIndexesToSend() {
 	times.prepareIndexProtos[5] = endTime
 	fmt.Println("Index Q18 OK")
 
+	ignore(q3Upds, q5Upds, q11Upds, q14Upds, q15Upds)
+
 	for i := len(times.prepareIndexProtos) - 1; i > 0; i-- {
 		times.prepareIndexProtos[i] -= times.prepareIndexProtos[i-1]
 	}
@@ -793,7 +795,6 @@ func (ti TableInfo) q18CalcHelper(quantityMap map[int32]map[int32]*PairInt, orde
 	for _, item := range orderItems {
 		currQuantity += int32(item.L_QUANTITY)
 	}
-	//fmt.Printf("Order ID %d has total quantity %d.\n", orderKey, currQuantity)
 	if currQuantity >= 312 {
 		currPair := &PairInt{first: order.O_CUSTKEY, second: currQuantity}
 		for minQ, orderMap := range quantityMap {
@@ -965,6 +966,7 @@ func (ti TableInfo) makeQ14IndexUpds(mapPromo map[string]*float64, mapTotal map[
 			SumValue: int64(100.0 * promo),
 			NAdds:    int64(*totalP),
 		}
+		fmt.Printf("[ClientIndex]Making Q14 update for key %s, with values %d %d (%f)\n", PROMO_PERCENTAGE+key, int64(100.0*promo), int64(*totalP), (100.0*promo) / *totalP)
 		upds[i] = antidote.UpdateObjectParams{
 			KeyParams:  antidote.KeyParams{Key: PROMO_PERCENTAGE + key, CrdtType: proto.CRDTType_AVG, Bucket: buckets[bucketI]},
 			UpdateArgs: &currUpd,
@@ -1098,6 +1100,7 @@ func (ti TableInfo) makeQ18IndexUpds(quantityMap map[int32]map[int32]*PairInt, b
 				adds := make([]crdt.TopKScore, len(orderMap))
 				j := 0
 				for orderKey, pair := range orderMap {
+					fmt.Println("Adding score", orderKey, pair.second)
 					adds[j] = crdt.TopKScore{Id: orderKey, Score: pair.second}
 					j++
 				}
@@ -1130,6 +1133,7 @@ func (ti TableInfo) makeQ18IndexUpds(quantityMap map[int32]map[int32]*PairInt, b
 				adds := make([]crdt.TopKScore, len(orderMap))
 				j := 0
 				for orderKey, pair := range orderMap {
+					fmt.Println("Adding score", *pair)
 					adds[j] = crdt.TopKScore{Id: orderKey, Score: pair.second, Data: ti.packQ18IndexExtraDataFromKey(orderKey)}
 					j++
 				}

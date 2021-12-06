@@ -1,12 +1,12 @@
 package tpch
 
 import (
-	"potionDB/src/antidote"
-	"potionDB/src/crdt"
 	"encoding/csv"
 	"fmt"
 	"math"
 	"math/rand"
+	"potionDB/src/antidote"
+	"potionDB/src/crdt"
 	"potionDB/src/proto"
 	"strconv"
 	"strings"
@@ -35,9 +35,57 @@ var (
 	updsFinishChan = make(chan bool, UPDATES_GOROUTINES)
 )
 
+//Instead of splitting per file, splits per nOrders. Works as long as routines < len(ordersUpds)
+//Note: here lineItemSizes is per order, not per file.
+func newSplitUpdatesPerRoutine(routines int, ordersUpds [][]string, lineItemUpds [][]string, deleteKeys []string, lineItemSizes []int) (
+	tableInfos []TableInfo, routineOrders, routineItems [][][]string, routineDelete [][]string, routineLineSizes [][]int) {
+	//First clients have an extra order until "remaining"
+	ordersPerRoutine, remaining := len(ordersUpds)/routines, len(ordersUpds)%routines
+	routineOrders, routineItems, routineDelete, routineLineSizes = make([][][]string, routines), make([][][]string, routines),
+		make([][]string, routines), make([][]int, routines)
+	tableInfos, currTableInfo := make([]TableInfo, routines), TableInfo{}
+	orderStart, lineStart, orderFinish, lineFinish, j := 0, 0, 0, 0, 0
+
+	for i := 0; i < routines; i++ {
+		orderFinish += ordersPerRoutine
+		if i < remaining {
+			//Extra order
+			orderFinish++
+		}
+		for j = orderStart; j < orderFinish; j++ {
+			lineFinish += lineItemSizes[j]
+		}
+		routineOrders[i], routineItems[i], routineDelete[i], routineLineSizes[i] = ordersUpds[orderStart:orderFinish], lineItemUpds[lineStart:lineFinish],
+			deleteKeys[orderStart:orderFinish], lineItemSizes[orderStart:orderFinish]
+
+		currTableInfo = TableInfo{Tables: procTables.GetShallowCopy()}
+		//Need to update last deleted index...
+		currTableInfo.LastDeletedPos, currTableInfo.orderIndexFun = orderStart, currTableInfo.getUpdateOrderIndex
+		tableInfos[i] = currTableInfo
+		orderStart, lineStart = orderFinish, lineFinish
+	}
+
+	//Fix lastDeletePos of first routine (orders start at index 1)
+	tableInfos[0].LastDeletedPos = 1
+
+	//Now that there's multiple routines doing updates, the q15Map/q15LocalMap must be filled for ALL possible combinations.
+	if UPDATE_INDEX {
+		if isIndexGlobal {
+			completeFillQ15Map(q15Map)
+		} else {
+			for _, q15SubMap := range q15LocalMap {
+				completeFillQ15Map(q15SubMap)
+			}
+		}
+	}
+
+	return
+}
+
 //TODO: removes/updates for individual objects (i.e., option in which each customer has its own CRDT)?
 
 //Pre-condition: routines >= N_UPDATE_FILES. Also, distribution isn't much fair if routines is close to N_UPDATE_FILES (ideally, should be at most 1/4)
+//Note: lineItemSizes is indexed per file, not order.
 func splitUpdatesPerRoutine(routines int, ordersUpds [][]string, lineItemUpds [][]string, deleteKeys []string, lineItemSizes []int) (filesPerRoutine int,
 	tableInfos []TableInfo, routineOrders, routineItems [][][]string, routineDelete [][]string, routineLineSizes [][]int) {
 	orderStart, lineStart, orderFinish, lineFinish := 0, 0, -1, 0

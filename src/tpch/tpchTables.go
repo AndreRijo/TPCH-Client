@@ -145,6 +145,9 @@ type Tables struct {
 	//Pos of the last order that was deleted from the original table
 	LastDeletedPos int
 
+	//For each region, stores all its nations
+	NationsByRegion [][]int8
+
 	//Variables as well since they're different depending if we're working on single-server or multi-server modes
 	NationkeyToRegionkey func(int64) int8
 	SuppkeyToRegionkey   func(int64) int8
@@ -232,23 +235,26 @@ func (tab *Tables) GetShallowCopy() (copyTables *Tables) {
 		Custkey32ToRegionkey: tab.Custkey32ToRegionkey,
 		OrderkeyToRegionkey:  tab.OrderkeyToRegionkey,
 		OrderToRegionkey:     tab.OrderToRegionkey,
+		NationsByRegion:      tab.NationsByRegion,
 	}
 }
 
 func CreateClientTables(rawData [][][]string) (tables *Tables) {
 	startTime := time.Now().UnixNano() / 1000000
 	lineItems, maxOrderLineitems := createLineitemTable(rawData[1], len(rawData[3]))
+	parts, promoParts := createPartTable(rawData[4])
 	tables = &Tables{
 		Customers:         createCustomerTable(rawData[0]),
 		LineItems:         lineItems,
 		Nations:           createNationTable(rawData[2]),
 		Orders:            createOrdersTable(rawData[3]),
-		Parts:             createPartTable(rawData[4]),
+		Parts:             parts,
 		PartSupps:         createPartsuppTable(rawData[5]),
 		Regions:           createRegionTable(rawData[6]),
 		Suppliers:         createSupplierTable(rawData[7]),
 		MaxOrderLineitems: maxOrderLineitems,
 		Segments:          createSegmentsList(),
+		PromoParts:        promoParts,
 	}
 	if isMulti {
 		tables.NationkeyToRegionkey = tables.nationkeyToRegionkey
@@ -265,12 +271,22 @@ func CreateClientTables(rawData [][][]string) (tables *Tables) {
 		tables.OrderkeyToRegionkey = tables.singleServer32ToRegionkey
 		tables.OrderToRegionkey = tables.singleServerOrderToRegionkey
 	}
-	tables.PromoParts = calculatePromoParts(tables.Parts)
+	//tables.PromoParts = calculatePromoParts(tables.Parts)
 	tables.orderToRegionFun = tables.orderkeyToRegionkeyMultiple
 	tables.orderIndexFun = tables.getFullOrderIndex
 	tables.LastDeletedPos = 1
+	tables.NationsByRegion = CreateNationsByRegionTable(tables.Nations, tables.Regions)
 	endTime := time.Now().UnixNano() / 1000000
 	fmt.Println("Time taken to process tables:", endTime-startTime, "ms")
+	return
+}
+
+func CreateNationsByRegionTable(nations []*Nation, regions []*Region) (result [][]int8) {
+	result = make([][]int8, len(regions))
+	//There's few nations so append is okay
+	for _, nation := range nations {
+		result[nation.N_REGIONKEY] = append(result[nation.N_REGIONKEY], nation.N_NATIONKEY)
+	}
 	return
 }
 
@@ -452,7 +468,7 @@ func createOrdersTable(oTable [][]string) (orders []*Orders) {
 	return
 }
 
-func createPartTable(pTable [][]string) (parts []*Part) {
+func createPartTable(pTable [][]string) (parts []*Part, promoParts map[int32]struct{}) {
 	//fmt.Println("Creating parts table")
 	parts = make([]*Part, len(pTable)+1)
 	var partKey int64
@@ -470,6 +486,7 @@ func createPartTable(pTable [][]string) (parts []*Part) {
 			P_COMMENT:     entry[8],
 		}
 	}
+	promoParts = calculatePromoParts(parts)
 	return
 }
 
@@ -682,7 +699,7 @@ func (tab *Tables) CreateOrders(table [][][]string) {
 }
 
 func (tab *Tables) CreateParts(table [][][]string) {
-	tab.Parts = createPartTable(table[PART])
+	tab.Parts, tab.PromoParts = createPartTable(table[PART])
 }
 
 func (tab *Tables) CreateRegions(table [][][]string) {
@@ -742,4 +759,8 @@ func (tab *Tables) orderkeyToRegionkeyMultiple(orderKey int32) int8 {
 //Maybe store the function to use in a variable and replace it once appropriate?
 func (tab *Tables) orderkeyToRegionkeyDirect(orderKey int32) int8 {
 	return tab.OrdersRegion[orderKey]
+}
+
+func (tab *Tables) GetNationIDsOfRegion(regionKey int) []int8 {
+	return tab.NationsByRegion[regionKey]
 }
