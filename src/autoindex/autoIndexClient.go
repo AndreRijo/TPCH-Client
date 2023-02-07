@@ -10,11 +10,11 @@ import (
 	"potionDB/src/tools"
 	"strconv"
 	"strings"
-	"tpch_client/src/tpch"
+	"tpch_client/src/client"
 )
 
 var (
-	tpchInterface = tpch.AutoIndexTPCH{}
+	tpchInterface = client.AutoIndexTPCH{}
 	db            = InitializeClientDB()
 	reader        = bufio.NewReader(os.Stdin)
 	ci            = antidote.CodingInfo{}.Initialize()
