@@ -310,17 +310,17 @@ func (ti TableInfo) sendUpdates(ordersUpds [][]string, lineItemUpds [][]string) 
 		itemsPerServer[i] = make(map[string]crdt.UpdateArguments)
 	}
 	var key string
-	var upd *crdt.EmbMapUpdateAll
+	var upd *crdt.MapAddAll
 	orderFunc, itemFunc := regionFuncs[ORDERS], multiRegionFunc[LINEITEM]
 	var itemRegions []int8
 
 	for _, order := range ordersUpds {
-		key, upd = getEntryUpd(headers[ORDERS], keys[ORDERS], order, read[ORDERS])
+		key, upd = getEntryORMapUpd(headers[ORDERS], keys[ORDERS], order, read[ORDERS])
 		key = getEntryKey(tableNames[ORDERS], key)
 		ordersPerServer[orderFunc(order)][key] = *upd
 	}
 	for _, item := range lineItemUpds {
-		key, upd = getEntryUpd(headers[LINEITEM], keys[LINEITEM], item, read[LINEITEM])
+		key, upd = getEntryORMapUpd(headers[LINEITEM], keys[LINEITEM], item, read[LINEITEM])
 		key = getEntryKey(tableNames[LINEITEM], key)
 		itemRegions = itemFunc(item)
 		for _, region := range itemRegions {
@@ -438,10 +438,10 @@ func sendUpdateData(ordersUpds [][]string, lineItemUpds [][]string, deleteKeys [
 }
 
 func getUpdWithIndex(order []string, lineItems [][]string) {
-	_, orderUpd := getEntryUpd(headers[ORDERS], keys[ORDERS], order, read[ORDERS])
-	lineUpds := make([]*crdt.EmbMapUpdateAll, len(lineItems))
+	_, orderUpd := getEntryORMapUpd(headers[ORDERS], keys[ORDERS], order, read[ORDERS])
+	lineUpds := make([]*crdt.MapAddAll, len(lineItems))
 	for i, item := range lineItems {
-		_, lineUpds[i] = getEntryUpd(headers[LINEITEM], keys[LINEITEM], order, read[LINEITEM])
+		_, lineUpds[i] = getEntryORMapUpd(headers[LINEITEM], keys[LINEITEM], order, read[LINEITEM])
 		ignore(item)
 	}
 	//orderObj, lineItemsObjs := ti.Tables.UpdateOrderLineitems(order, lineItems)

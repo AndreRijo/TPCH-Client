@@ -718,11 +718,11 @@ func (ti SingleTableInfo) getSingleUpd(orderUpd []string, lineItemUpds [][]strin
 		itemsPerServer[i] = make(map[string]crdt.UpdateArguments)
 	}
 	var key string
-	var upd *crdt.EmbMapUpdateAll
+	var upd *crdt.MapAddAll
 	var itemRegions []int8
 
 	for _, item := range lineItemUpds {
-		key, upd = getEntryUpd(headers[LINEITEM], keys[LINEITEM], item, read[LINEITEM])
+		key, upd = getEntryORMapUpd(headers[LINEITEM], keys[LINEITEM], item, read[LINEITEM])
 		key = getEntryKey(tableNames[LINEITEM], key)
 		itemRegions = itemFunc(orderUpd, item)
 		for _, region := range itemRegions {
@@ -740,7 +740,7 @@ func (ti SingleTableInfo) makeSingleUpd(orderUpd []string, lineItemUpds [][]stri
 	itemsPerServer []map[string]crdt.UpdateArguments) {
 	orderReg := regionFuncs[ORDERS](orderUpd)
 
-	orderKey, orderMapUpd := getEntryUpd(headers[ORDERS], keys[ORDERS], orderUpd, read[ORDERS])
+	orderKey, orderMapUpd := getEntryORMapUpd(headers[ORDERS], keys[ORDERS], orderUpd, read[ORDERS])
 	orderKey = getEntryKey(tableNames[ORDERS], orderKey)
 	//fmt.Println("startSingleUpd", bufI)
 	//currUpdParams := make([]antidote.UpdateObjectParams, getUpdSize(itemsPerServer[orderReg])+1)

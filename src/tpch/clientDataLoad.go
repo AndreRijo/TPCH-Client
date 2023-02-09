@@ -159,7 +159,7 @@ func getDataUpdateParams(currMap map[string]crdt.UpdateArguments, name string, b
 		i := 0
 		for key, upd := range currMap {
 			updParams[i] = antidote.UpdateObjectParams{
-				KeyParams:  antidote.KeyParams{Key: key, CrdtType: proto.CRDTType_RRMAP, Bucket: bucket},
+				KeyParams:  antidote.KeyParams{Key: key, CrdtType: proto.CRDTType_ORMAP, Bucket: bucket},
 				UpdateArgs: &upd,
 			}
 			i++
@@ -175,6 +175,8 @@ func getDataUpdateParams(currMap map[string]crdt.UpdateArguments, name string, b
 
 func queueDataProto(currMap map[string]crdt.UpdateArguments, name string, bucket string, dataChan chan QueuedMsg) {
 	updParams := getDataUpdateParams(currMap, name, bucket)
+	fmt.Println("##############")
+	fmt.Println(updParams[0].CrdtType)
 	dataChan <- QueuedMsg{code: antidote.StaticUpdateObjs, Message: antidote.CreateStaticUpdateObjs(nil, updParams)}
 }
 
@@ -231,11 +233,11 @@ func prepareSendPartitioned(tableIndex int) {
 	table, header, primKeys, read, name := tables[tableIndex], headers[tableIndex], keys[tableIndex], read[tableIndex], tableNames[tableIndex]
 
 	var key string
-	var upd *crdt.EmbMapUpdateAll
+	var upd *crdt.MapAddAll
 	var region int8
 	var currMap map[string]crdt.UpdateArguments
 	for _, obj := range table {
-		key, upd = getEntryUpd(header, primKeys, obj, read)
+		key, upd = getEntryORMapUpd(header, primKeys, obj, read)
 		key = getEntryKey(name, key)
 		region = regionFunc(obj)
 		currMap = updsPerServer[region]
@@ -292,13 +294,13 @@ func prepareSendMultiplePartitioned(tableIndex int) {
 				updsPerServer[i] = make(map[string]crdt.UpdateArguments)
 			}
 			var key string
-			var upd *crdt.EmbMapUpdateAll
+			var upd *crdt.MapAddAll
 			var regions []int8
 			var currMap map[string]crdt.UpdateArguments
 			count := 0
 			printTarget := (len(itemTable) / 2) / maxUpdSize
 			for _, obj := range itemTable {
-				key, upd = getEntryUpd(header, primKeys, obj, read)
+				key, upd = getEntryORMapUpd(header, primKeys, obj, read)
 				key = getEntryKey(name, key)
 				regions = regionFunc(obj)
 				for _, reg := range regions {
@@ -370,9 +372,9 @@ func prepareSendAny(tableIndex int, bucketIndex int) {
 	table, header, primKeys, read, name := tables[tableIndex], headers[tableIndex], keys[tableIndex], read[tableIndex], tableNames[tableIndex]
 
 	var key string
-	var upd *crdt.EmbMapUpdateAll
+	var upd *crdt.MapAddAll
 	for _, obj := range table {
-		key, upd = getEntryUpd(header, primKeys, obj, read)
+		key, upd = getEntryORMapUpd(header, primKeys, obj, read)
 		key = getEntryKey(name, key)
 		upds[key] = *upd
 		if len(upds) == maxUpdSize {
