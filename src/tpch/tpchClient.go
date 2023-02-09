@@ -135,9 +135,9 @@ const (
 	cpuProfileLoc = "../../profiles/cpu.prof"
 	memProfileLoc = "../../profiles/mem.prof"
 
-	//tableFolder = "/Users/a.rijo/Documents/University_6th_year/potionDB docs/2.18.0_rc2/tables/0.01SF/"
-	//headerLoc = "/Users/a.rijo/Documents/University_6th_year/potionDB docs/tpc_h/tpch_headers_min.txt"
-	//updFolder   = "/Users/a.rijo/Documents/University_6th_year/potionDB docs/2.18.0_rc2/upds/0.01SF/"
+	tableFolder = "/Users/joao/Documents/tese/codeAndDataStuff/tables/0.01SF/"
+	headerLoc   = "/Users/joao/Documents/tese/codeAndDataStuff/headers/tpch_headers_min.txt"
+	updFolder   = "" // TODOX
 
 	//commonFolder                                  = "/Users/a.rijo/Documents/University_6th_year/potionDB docs/"
 	tableFormat, updFormat, header                = "2.18.0_rc2/tables/%sSF/", "2.18.0_rc2/upds/%sSF/", "tpc_h/tpch_headers_min.txt"
@@ -154,8 +154,9 @@ const (
 
 var (
 	//Filled dinamically by prepareConfigs()
-	tableFolder, updFolder, commonFolder, headerLoc string
-	scaleFactor                                     float64
+	commonFolder string
+	//tableFolder, updFolder, commonFolder, headerLoc string
+	scaleFactor float64
 	//TODO: Finish useTopSum.
 	isIndexGlobal, isMulti, memDebug, profiling, splitIndexLoad, useTopKAll, useTopSum bool
 	maxUpdSize                                                                         int //Max number of entries for a single upd msg. To avoid sending the whole table in one request...
@@ -344,7 +345,7 @@ func loadConfigsFile(configs *tools.ConfigLoader) {
 	if *configFolder == "none" {
 		fmt.Println("Non-defined configFolder, using defaults")
 		isMulti, splitIndexLoad, memDebug, profiling, scaleFactor, maxUpdSize, useTopKAll, useTopSum = true, true, false, false, 0.1, 2000, false, false
-		commonFolder = "/Users/sofiabraz/5º Ano/Tese/tpc-h/TPC-H_Tools_v3.0.0/dbgen/"
+		commonFolder = "/Users/joao/Documents/tese/codeAndDataStuff/"
 		MAX_BUFF_PROTOS, QUERY_WAIT, FORCE_PROTO_CLEAN, TEST_DURATION = 200, 5000, 10000, 20000
 
 		PRINT_QUERY, QUERY_BENCH, CRDT_BENCH = true, false, false
@@ -395,20 +396,20 @@ func loadConfigsFile(configs *tools.ConfigLoader) {
 
 func prepareConfigs() {
 	fmt.Println("Servers before prepare configs:", servers)
-	scaleFactorS := strconv.FormatFloat(scaleFactor, 'f', -1, 64)
-	tableFolder, updFolder = commonFolder+fmt.Sprintf(tableFormat, scaleFactorS), commonFolder+fmt.Sprintf(updFormat, scaleFactorS)
+	//scaleFactorS := strconv.FormatFloat(scaleFactor, 'f', -1, 64)
+	//tableFolder, updFolder = commonFolder+fmt.Sprintf(tableFormat, scaleFactorS), commonFolder+fmt.Sprintf(updFormat, scaleFactorS)
 	updCompleteFilename = [3]string{updFolder + updsNames[0] + updExtension, updFolder + updsNames[1] + updExtension,
 		updFolder + updsNames[2] + deleteExtension}
-	headerLoc = commonFolder + header
+	//headerLoc = commonFolder + header
 	if isMulti {
 		//servers = []string{"127.0.0.1:8087", "127.0.0.1:8088", "127.0.0.1:8089", "127.0.0.1:8090", "127.0.0.1:8091"}
 		times.sendDataProtos = make([]int64, len(servers))
 		if !isIndexGlobal {
-			buckets = []string{"R1", "R2", "R3", "R4", "R5", "PART", "I1", "I2", "I3", "I4", "I5"}
+			buckets = []string{"R1", "R2", "R3", "R4", "R5", "PART"}
 		} else if !splitIndexLoad {
-			buckets = []string{"R1", "R2", "R3", "R4", "R5", "PART", "INDEX"}
+			buckets = []string{"R1", "R2", "R3", "R4", "R5", "PART"}
 		} else {
-			buckets = []string{"R1", "R2", "R3", "R4", "R5", "PART", "INDEX", "INDEX", "INDEX", "INDEX", "INDEX"}
+			buckets = []string{"R1", "R2", "R3", "R4", "R5", "PART"}
 		}
 		//Note: Part isn't partitioned and lineItem uses multiRegionFunc
 		regionFuncs = [8]func([]string) int8{custToRegion, nil, nationToRegion, ordersToRegion, nil, partSuppToRegion, regionToRegion, supplierToRegion}
@@ -487,27 +488,22 @@ func StartClient() {
 	times.startTime = startTime
 	handleHeaders()
 
-	go handleTableProcessing()
+	go handleTableProcessing() // inicializa a var procTables com o que está em tables
 	if DOES_DATA_LOAD {
 		//Start tcp connection to each server for data loading. Query clients create and manage their own connections.
 		//Update clients start their connections after all data is loaded.
-		go connectToServers()
+		go connectToServers() // envia mensagens do dataLoad para as réplicas
 	}
 	if DOES_DATA_LOAD {
 		//Prepare to send initial data protos
-		go handlePrepareSend()
+		go handlePrepareSend() // crIa os pedidos que são enviados para o connectToServers()
 	}
 
 	tables = make([][][]string, len(tableNames))
 	procTables = &Tables{}
 	procTables.InitConstants()
-	handleTables()
+	handleTables() // Lê tabelas e envia mensagem para o handleTableProcessing() à medida que as tabelas estao lidas
 
-	//tables = nil
-	//debug.FreeOSMemory()
-	//prepareIndexesToSend()
-
-	//collectDataStatistics()
 	select {}
 }
 

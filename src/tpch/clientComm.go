@@ -117,9 +117,9 @@ func handleServerComm(connIndex int) {
 
 	debug.FreeOSMemory()
 
-	if !isIndexGlobal || (splitIndexLoad && !SINGLE_INDEX_SERVER) || connIndex == 0 {
-		handleIndexComm(connIndex)
-	}
+	//if !isIndexGlobal || (splitIndexLoad && !SINGLE_INDEX_SERVER) || connIndex == 0 {
+	//	handleIndexComm(connIndex)
+	//}  ** COMMENTED IN ORDER NOT TO CREATE VIEWS
 }
 
 func handleIndexComm(connIndex int) {

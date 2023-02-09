@@ -93,6 +93,7 @@ func handleTableProcessing() {
 	times.clientTables = (time.Now().UnixNano() - times.startTime) / 1000000
 	fmt.Println("Finished creating all tables.")
 	//If we're only doing queries, we can clean the unprocessed tables right now, as no further processing will be done
+
 	if !DOES_DATA_LOAD && !DOES_UPDATES {
 		tables = nil
 	} else if DOES_UPDATES {
@@ -110,6 +111,7 @@ func handleTableProcessing() {
 		//If it's a mixed client, it'll be started on clientDataLoad.go
 		go startMyTest()
 	}
+	//doTest()
 }
 
 func handlePrepareSend() {
