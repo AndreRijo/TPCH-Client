@@ -13,7 +13,7 @@ import (
 	"time"
 
 	//"tpch_client/src/tpch"
-	"tpch_data/tpch"
+	"potionDB/tpch_helper"
 )
 
 var (
@@ -48,8 +48,8 @@ var (
 func splitUpdatesPerRoutineAndRegion(routines int, ordersUpds [][]string, lineItemUpds [][]string, deleteKeys []string, lineItemSizes []int) (
 	tableInfos []TableInfo, routineOrders, routineItems [][][]string, routineDelete [][]string, routineLineSizes [][]int, regionForClient []int) {
 
-	//fmt.Printf("[CU]Sizes of initial data: orders %d, items %d, deletes %d, sizes %d\n", len(ordersUpds), len(lineItemUpds), len(deleteKeys), len(lineItemSizes))
-	fmt.Println(deleteKeys)
+	fmt.Printf("[CU]Sizes of initial data: orders %d, items %d, deletes %d, sizes %d\n", len(ordersUpds), len(lineItemUpds), len(deleteKeys), len(lineItemSizes))
+	//fmt.Println(deleteKeys)
 
 	nRegions := 5
 	//First, group by regions

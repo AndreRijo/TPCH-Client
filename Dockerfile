@@ -9,7 +9,7 @@ FROM golang
 # Adding src and building
 COPY potionDB/go.mod potionDB/go.sum /go/potionDB/
 COPY tpch_client/go.mod tpch_client/go.sum /go/tpch_client/
-COPY tpch_data/go.mod /go/tpch_data/
+#COPY tpch_data/go.mod /go/tpch_data/
 RUN cd tpch_client && go mod download
 
 COPY potionDB/src/clocksi /go/potionDB/src/clocksi
@@ -18,7 +18,8 @@ COPY potionDB/src/crdt /go/potionDB/src/crdt
 COPY potionDB/src/proto /go/potionDB/src/proto
 COPY potionDB/src/antidote /go/potionDB/src/antidote
 COPY potionDB/src/shared /go/potionDB/src/shared
-COPY tpch_data/tpch /go/tpch_data/tpch
+COPY potionDB/tpch_helper /go/potionDB/tpch_helper
+#COPY tpch_data/tpch /go/tpch_data/tpch
 COPY tpch_client/src /go/tpch_client/src
 COPY tpch_client/dockerstuff /go/tpch_client/
 RUN cd tpch_client/src/main && go build
@@ -28,6 +29,7 @@ RUN cd tpch_client/src/main && go build
 #Bench args
 #Arguments
 ENV CONFIG "configs/docker/default" \
+DATA_FOLDER "none" \
 QUERY_CLIENTS "none" \
 GLOBAL_INDEX "none" \
 TEST_NAME "none" \

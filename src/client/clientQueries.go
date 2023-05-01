@@ -18,7 +18,7 @@ import (
 	"time"
 
 	//"tpch_client/src/tpch"
-	"tpch_data/tpch"
+	"potionDB/tpch_helper"
 
 	pb "github.com/golang/protobuf/proto"
 )

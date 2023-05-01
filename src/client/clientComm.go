@@ -342,16 +342,23 @@ func getStatsFileToWrite(filename string) (file *os.File) {
 		return
 	}
 	//os.Mkdir(statsSaveLocation, os.ModeDir)
-	os.MkdirAll(statsSaveLocation, 0777)
+	filenameParts := strings.Split(filename, "/") //filename may also have folders
+	fullLoc := statsSaveLocation
+	for i := 0; i < len(filenameParts)-1; i++ {
+		fullLoc += filenameParts[i] + "/"
+	}
+	filename = filenameParts[len(filenameParts)-1]
+
+	os.MkdirAll(fullLoc, 0777)
 	fileCreated := false
 	idLock.Lock()
 	defer idLock.Unlock()
 	//for i := int64(0); !fileCreated; i++ {
 	for !fileCreated {
-		_, err := os.Stat(statsSaveLocation + filename + id + ".csv")
+		_, err := os.Stat(fullLoc + filename + id + ".csv")
 		if err != nil {
 			fileCreated = true
-			file, err = os.Create(statsSaveLocation + filename + id + ".csv")
+			file, err = os.Create(fullLoc + filename + id + ".csv")
 			if err != nil {
 				fmt.Println("[DATASAVE][ERROR]Failed to create stats file with name "+filename+id+".csv. Error:", err)
 				return

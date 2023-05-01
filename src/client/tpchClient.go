@@ -10,6 +10,7 @@ import (
 	"potionDB/src/antidote"
 	"potionDB/src/proto"
 	"potionDB/src/tools"
+	tpch "potionDB/tpch_helper"
 	"runtime"
 	"runtime/pprof"
 	"sort"
@@ -18,9 +19,7 @@ import (
 	"sync"
 	"syscall"
 	"time"
-
 	//"tpch_client/src/tpch"
-	"tpch_data/tpch"
 )
 
 //TODO: Old client modes (clientQueries, clientUpdates) do not support, in the local mode, to have servers forward their requests.
@@ -145,7 +144,8 @@ const (
 	//updFolder   = "/Users/a.rijo/Documents/University_6th_year/potionDB docs/2.18.0_rc2/upds/0.01SF/"
 
 	//commonFolder                                  = "/Users/a.rijo/Documents/University_6th_year/potionDB docs/"
-	TableFormat, UpdFormat, Header                = "2.18.0_rc2/tables/%sSF/", "2.18.0_rc2/upds/%sSF/", "tpc_h/tpch_headers_min.txt"
+	//TableFormat, UpdFormat, Header                = "2.18.0_rc2/tables/%sSF/", "2.18.0_rc2/upds/%sSF/", "tpc_h/tpch_headers_min.txt"
+	TableFormat, UpdFormat, Header                = "tables/%sSF/", "upds/%sSF/", "tpch_headers/tpch_headers_min.txt"
 	TableExtension, UpdExtension, DeleteExtension = ".tbl", ".tbl.u", "."
 
 	PROMO_PERCENTAGE, IMP_SUPPLY, SUM_SUPPLY, NATION_REVENUE, TOP_SUPPLIERS, LARGE_ORDERS, SEGM_DELAY = "q14pp", "q11iss", "q11sum", "q5nr", "q15ts", "q18lo", "q3sd"
@@ -211,7 +211,7 @@ var (
 	dataloadStats                                                                                                                       = DataloadStats{}
 	configFolder, indexGlobalString, testRoutinesString, statsSaveLocationString, singleIndexString, updRateString                      *string
 	idString, updateIndexString, splitUpdatesString, splitUpdatesNoWaitString, updateBaseString, notifyAddressString                    *string
-	nReadsTxn, updateSpecificIndex, batchModeS, latencyModeS, useTopSumString, serversString, localModeString                           *string
+	nReadsTxn, updateSpecificIndex, batchModeS, latencyModeS, useTopSumString, serversString, localModeString, tpchAddRateString        *string
 	scaleString, nonRandomServersString, localRegionOnlyQueries, loadBaseString, loadIndexString, q15TopSizeString, dummyDataSizeString *string
 	//Bench
 	nKeysString, keysTypeString, addRateString, partReadRateString, queryRatesString, opsPerTxnString, nTxnsBeforeWaitString,
@@ -232,6 +232,7 @@ func loadFlags() (configs *tools.ConfigLoader) {
 	fmt.Println("[TC]All flags:", os.Args)
 	isBench := flag.String("is_bench", "none", "if this client should be a bench client.")
 	reset := flag.String("reset", "none", "set this flag to true for resetting the server status. The program will exit afterwards.")
+	dataFolder := flag.String("data_folder", "none", "folder containing the TPC-H dataset, updates and headers.")
 	configFolder = flag.String("config", "none", "sub-folder in configs folder that contains the configuration files to be used.")
 	indexGlobalString = flag.String("global_index", "none", "if indexes are global (i.e., data from all servers) or local (only data in the server)")
 	testRoutinesString = flag.String("query_clients", "none", "number of query client processes (ignored if this isn't a query client)")
@@ -258,6 +259,7 @@ func loadFlags() (configs *tools.ConfigLoader) {
 	localRegionOnlyQueries = flag.String("local_region_only", "none", "if true, for queries based on regions/nations, the client will only query the region of his server")
 	q15TopSizeString = flag.String("q15_size", "none", "number of entries to ask on top15 (max: 10k for SF=1)")
 	dummyDataSizeString = flag.String("initialMem", "none", "the size (bytes) of the initial block of data. This is used to avoid Go's GC to overcollect garbage and hinder system performance.")
+	tpchAddRateString = flag.String("tpch_add_rate", "none", "the percentage (in form of 0 to 1) of adds when executing updates. Default 0.5")
 	//Note: initialMem is only used by CRDT bench for now
 
 	//fmt.Println("On flag: ", *serversString)
@@ -282,6 +284,9 @@ func loadFlags() (configs *tools.ConfigLoader) {
 	}
 	if isFlagValid(isBench) {
 		configs.ReplaceConfig("crdtBench", *isBench)
+	}
+	if isFlagValid(dataFolder) {
+		configs.ReplaceConfig("folder", *dataFolder)
 	}
 
 	if isFlagValid(indexGlobalString) {
@@ -362,6 +367,9 @@ func loadFlags() (configs *tools.ConfigLoader) {
 	if isFlagValid(dummyDataSizeString) {
 		configs.ReplaceConfig("initialMem", *dummyDataSizeString)
 	}
+	if isFlagValid(tpchAddRateString) {
+		configs.ReplaceConfig("tpchAddRate", *tpchAddRateString)
+	}
 	loadBenchFlags(configs)
 	return
 }
@@ -393,7 +401,7 @@ func loadConfigsFile(configs *tools.ConfigLoader) {
 		withUpdates, N_UPDATE_FILES, START_UPD_FILE, FINISH_UPD_FILE, LOAD_BASE_DATA, LOAD_INDEX_DATA = false, 1000, 1, 1000, true, true
 		queryFuncs = []func(QueryClient) int{sendQ3, sendQ5, sendQ11, sendQ14, sendQ15, sendQ18}
 		statisticsInterval, q15CrdtType, q15TopSize = -1, proto.CRDTType_TOPSUM, 1
-		MAX_LINEITEM_GOROUTINES, UPDATES_GOROUTINES, READS_PER_TXN = 16, 16, 1
+		MAX_LINEITEM_GOROUTINES, UPDATES_GOROUTINES, READS_PER_TXN, LIKEHOOD_ADD = 16, 16, 1, 0.5
 		UPDATE_INDEX, UPDATE_SPECIFIC_INDEX_ONLY, BATCH_MODE, NON_RANDOM_SERVERS, ONLY_LOCAL_DATA_QUERY = true, false, CYCLE, false, false
 	} else {
 		fmt.Println("Defined config folder.")
@@ -437,6 +445,7 @@ func loadConfigsFile(configs *tools.ConfigLoader) {
 		NON_RANDOM_SERVERS, ONLY_LOCAL_DATA_QUERY = configs.GetBoolConfig("nonRandomServers", false), configs.GetBoolConfig("localRegionOnly", false)
 		queryNumbers := strings.Split(configs.GetOrDefault("queries", "3, 5, 11, 14, 15, 18"), " ")
 		q15TopSize = int32(configs.GetIntConfig("q15_size", 1))
+		LIKEHOOD_ADD = configs.GetFloatConfig("tpchAddRate", 0.5)
 
 		if isIndexGlobal {
 			setQueryList(queryNumbers)

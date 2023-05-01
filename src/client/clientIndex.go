@@ -11,7 +11,7 @@ import (
 	"time"
 
 	//"tpch_client/src/tpch"
-	"tpch_data/tpch"
+	tpch "potionDB/tpch_helper"
 )
 
 //TODO: Maybe remake clientIndex, clientUpdates and clientQueries to have a file per query?
@@ -105,7 +105,9 @@ func prepareIndexesToSend() {
 	fmt.Println("Q3, Q5, Q11, Q14, Q15, Q18:", q3N, q5N, q11N, q14N, q15N, q18N)
 
 	//Start reading updates data
-	if DOES_UPDATES {
+	if DOES_UPDATES && DOES_QUERIES {
+		go startMixBench()
+	} else if DOES_UPDATES {
 		go startUpdates()
 	}
 }
@@ -164,7 +166,9 @@ func prepareIndexesLocalToSend() {
 	fmt.Println("Q3, Q5, Q11, Q14, Q15, Q18:", q3N, q5N, q11N, q14N, q15N, q18N)
 
 	//Start reading updates data
-	if DOES_UPDATES {
+	if DOES_UPDATES && DOES_QUERIES {
+		go startMixBench()
+	} else if DOES_UPDATES {
 		go startUpdates()
 	}
 }
@@ -215,7 +219,6 @@ func (ti TableInfo) prepareQ3IndexLocal() (upds [][]antidote.UpdateObjectParams,
 		updsDone += rUpds
 	}
 
-	//TODO: Don't I need to override nProtoUpds also here?
 	//Override nUpds if useTopKAll
 	if useTopKAll {
 		for i, regionSumMap := range sumMap {
@@ -224,6 +227,10 @@ func (ti TableInfo) prepareQ3IndexLocal() (upds [][]antidote.UpdateObjectParams,
 				nUpds[i] += len(segMap)
 			}
 		}
+	}
+	for i, regionSumMap := range sumMap {
+		nUpds[i] += len(regionSumMap) * 31 //Inits. Day 1 to 31, inclusive. So 31 inits per segment.
+		updsDone += len(regionSumMap) * 31
 	}
 
 	upds = make([][]antidote.UpdateObjectParams, len(nUpds))
@@ -270,6 +277,8 @@ func (ti TableInfo) prepareQ3Index() (upds []antidote.UpdateObjectParams, updsDo
 			nProtoUpds += len(segMap)
 		}
 	}
+	nProtoUpds += len(sumMap) * 31 //Inits. Day 1 to 31, inclusive. So 31 inits per segment.
+	updsDone += len(sumMap) * 31   //Inits
 
 	return ti.makeQ3IndexUpds(sumMap, nProtoUpds, INDEX_BKT), updsDone
 }
@@ -413,7 +422,8 @@ func (ti TableInfo) prepareQ11IndexLocal() (upds [][]antidote.UpdateObjectParams
 	for _, nation := range ti.Tables.Nations {
 		nationMap[nation.N_REGIONKEY][nation.N_NATIONKEY] = make(map[int32]*float64)
 		totalSumMap[nation.N_REGIONKEY][nation.N_NATIONKEY] = new(float64)
-		updsPerRegion[nation.N_REGIONKEY]++ //Each nation has at least 1 upd (totalSum)
+		//updsPerRegion[nation.N_REGIONKEY]++ //Each nation has at least 1 upd (totalSum)
+		updsPerRegion[nation.N_REGIONKEY] += 2 //Each nation has at least 2 upds (totalSum + TopK Init)
 	}
 
 	var supplier *tpch.Supplier
@@ -468,6 +478,7 @@ func (ti TableInfo) prepareQ11Index() (upds []antidote.UpdateObjectParams, updsD
 		supplier = ti.Tables.Suppliers[partSup.PS_SUPPKEY]
 		nUpds += ti.q11CalcHelper(nationMap, totalSumMap, partSup, supplier)
 	}
+	nUpds += len(ti.Tables.Nations) //Init for each nation TopK
 
 	return ti.makeQ11IndexUpds(nationMap, totalSumMap, nUpds, INDEX_BKT), nUpds
 }
@@ -596,8 +607,9 @@ func (ti TableInfo) prepareQ15IndexLocal() (upds [][]antidote.UpdateObjectParams
 		nUpds[rKey] += ti.q15CalcHelper(orderItems, yearMap[rKey])
 	}
 
-	for _, nUpdsR := range nUpds {
-		updsDone += nUpdsR
+	for i, nUpdsR := range nUpds {
+		updsDone += nUpdsR + 20 //20 (4 quarters * 5 years) TopK inits per region
+		nUpds[i] += 20
 	}
 
 	upds = make([][]antidote.UpdateObjectParams, len(ti.Tables.Regions))
@@ -629,6 +641,7 @@ func (ti TableInfo) prepareQ15Index() (upds []antidote.UpdateObjectParams, updsD
 	for _, orderItems := range ti.Tables.LineItems {
 		nUpds += ti.q15CalcHelper(orderItems, yearMap)
 	}
+	nUpds += 20 //4 quarters, 5 years -> 20 TopK inits
 
 	if !useTopSum {
 		fmt.Println("[TPCH_INDEX]Not using topsum to prepare q15 index")
@@ -814,6 +827,20 @@ func (ti TableInfo) makeQ3IndexUpds(sumMap map[string]map[int8]map[int32]*float6
 	upds = make([]antidote.UpdateObjectParams, nUpds)
 	var keyArgs antidote.KeyParams
 	i := 0
+	//Inits
+	for mktSeg := range sumMap {
+		for day := MIN_DATE_Q3.DAY; day <= MAX_DATE_Q3.DAY; day++ { //Need to init all TopKs
+			keyArgs = antidote.KeyParams{
+				Key:      SEGM_DELAY + mktSeg + strconv.FormatInt(int64(day), 10),
+				CrdtType: proto.CRDTType_TOPK_RMV,
+				Bucket:   buckets[bucketI],
+			}
+			var currUpd crdt.UpdateArguments = crdt.TopKInit{TopSize: 10, ShadowTopSize: 5}
+			upds[i] = antidote.UpdateObjectParams{KeyParams: keyArgs, UpdateArgs: &currUpd}
+			i++
+		}
+	}
+
 	if INDEX_WITH_FULL_DATA {
 		for mktSeg, segMap := range sumMap {
 			for day, dayMap := range segMap {
@@ -842,7 +869,7 @@ func (ti TableInfo) makeQ3IndexUpds(sumMap map[string]map[int8]map[int32]*float6
 					upds[i] = antidote.UpdateObjectParams{KeyParams: keyArgs, UpdateArgs: &currUpd}
 					i++
 				}
-				//fmt.Printf("[CI]Q3 for segment %s day %d: %d\n", mktSeg, day, len(dayMap))
+				fmt.Printf("[CI]Q3 for segment %s day %d: %d\n", mktSeg, day, len(dayMap))
 			}
 		}
 	} else {
@@ -909,12 +936,23 @@ func (ti TableInfo) makeQ5IndexUpds(sumMap map[int8]map[int16]map[int8]*float64,
 func (ti TableInfo) makeQ11IndexUpds(nationMap map[int8]map[int32]*float64, totalSumMap map[int8]*float64, nUpds, bucketI int) (upds []antidote.UpdateObjectParams) {
 	//Preparing updates for the topK CRDTs
 	if useTopKAll {
-		nUpds = len(nationMap) + len(totalSumMap)
+		nUpds = len(nationMap) + len(totalSumMap) + len(nationMap) //Last sum: TopK inits
 	}
 	upds = make([]antidote.UpdateObjectParams, nUpds)
 	//var currUpd crdt.UpdateArguments
 	var keyArgs antidote.KeyParams
 	i := 0
+	//Inits
+	for natKey := range nationMap {
+		keyArgs = antidote.KeyParams{
+			Key:      IMP_SUPPLY + ti.Tables.Nations[natKey].N_NAME,
+			CrdtType: proto.CRDTType_TOPK_RMV,
+			Bucket:   buckets[bucketI],
+		}
+		var currUpd crdt.UpdateArguments = crdt.TopKInit{TopSize: 100, ShadowTopSize: 1} //This Top won't receive further updates, so no need for shadow.
+		upds[i] = antidote.UpdateObjectParams{KeyParams: keyArgs, UpdateArgs: &currUpd}
+		i++
+	}
 
 	for natKey, partMap := range nationMap {
 		keyArgs = antidote.KeyParams{
@@ -984,7 +1022,7 @@ func (ti TableInfo) makeQ14IndexUpds(mapPromo map[string]*float64, mapTotal map[
 func (ti TableInfo) makeQ15IndexUpdsTopSum(yearMap map[int16]map[int8]map[int32]*float64, nUpds int, bucketI int) (upds []antidote.UpdateObjectParams) {
 	//It's always 20 updates if using TopKAddAll (5 years * 4 months)
 	if useTopKAll {
-		nUpds = 20
+		nUpds = 40 //one update for each TopK + one init per TopK.
 	}
 	upds = make([]antidote.UpdateObjectParams, nUpds)
 	var keyArgs antidote.KeyParams
@@ -997,6 +1035,9 @@ func (ti TableInfo) makeQ15IndexUpdsTopSum(yearMap map[int16]map[int8]map[int32]
 				CrdtType: proto.CRDTType_TOPSUM,
 				Bucket:   buckets[bucketI],
 			}
+			var initUpd crdt.UpdateArguments = crdt.TopKInit{TopSize: 5, ShadowTopSize: 1} //TopSum doesn't use shadow yet.
+			upds[i] = antidote.UpdateObjectParams{KeyParams: keyArgs, UpdateArgs: &initUpd}
+			i++
 			if !useTopKAll {
 				for suppKey, value := range monthMap[month] {
 					//TODO: Not use int32 for value
@@ -1029,7 +1070,7 @@ func (ti TableInfo) makeQ15IndexUpdsTopSum(yearMap map[int16]map[int8]map[int32]
 func (ti TableInfo) makeQ15IndexUpds(yearMap map[int16]map[int8]map[int32]*float64, nUpds int, bucketI int) (upds []antidote.UpdateObjectParams) {
 	//Create the updates. Always 20 updates if doing with TopKAddAll (5 years * 4 months)
 	if useTopKAll {
-		nUpds = 20
+		nUpds = 40 //20 normal upds + 20 inits
 	}
 	upds = make([]antidote.UpdateObjectParams, nUpds)
 	var keyArgs antidote.KeyParams
@@ -1042,6 +1083,9 @@ func (ti TableInfo) makeQ15IndexUpds(yearMap map[int16]map[int8]map[int32]*float
 				CrdtType: proto.CRDTType_TOPK_RMV,
 				Bucket:   buckets[bucketI],
 			}
+			var initUpd crdt.UpdateArguments = crdt.TopKInit{TopSize: 1, ShadowTopSize: 5}
+			upds[i] = antidote.UpdateObjectParams{KeyParams: keyArgs, UpdateArgs: &initUpd}
+			i++
 			if !useTopKAll {
 				for suppKey, value := range monthMap[month] {
 					//TODO: Not use int32 for value

@@ -1,15 +1,15 @@
 package client
 
 import (
-	"fmt"
 	"potionDB/src/antidote"
 	"potionDB/src/crdt"
 	"potionDB/src/proto"
 	"strconv"
-	"tpch_data/tpch"
+	"potionDB/tpch_helper"
 )
 
 //Contains all the methods related to each query's structure (SingleQ3, etc.)
+//Methods to build only part of a query structure (i.e.., add-only or rem-only) are in queryInfosHelper.go
 
 /*
 type IndexInfo struct {
@@ -37,7 +37,7 @@ type SingleQ3 struct {
 	remMap      map[int8]struct{}
 	updMap      map[int8]*float64
 	updStartPos int8
-	totalUpds   int
+	nUpds       int
 	newSeg      string
 	oldSeg      string
 }
@@ -56,7 +56,7 @@ func (q3 SingleQ3) buildUpdInfo(tables *tpch.Tables, newOrder, remOrder *tpch.Or
 		q3.remsCalcHelper(remOrder, remItems)
 		nUpds += len(q3.remMap)
 	}
-	q3.totalUpds, q3.newSeg, q3.oldSeg = nUpds, tables.Customers[newOrder.O_CUSTKEY].C_MKTSEGMENT, tables.Customers[remOrder.O_CUSTKEY].C_MKTSEGMENT
+	q3.nUpds, q3.newSeg, q3.oldSeg = nUpds, tables.Customers[newOrder.O_CUSTKEY].C_MKTSEGMENT, tables.Customers[remOrder.O_CUSTKEY].C_MKTSEGMENT
 
 	return q3
 }
@@ -107,8 +107,8 @@ func (q3 *SingleQ3) remsCalcHelper(order *tpch.Orders, items []*tpch.LineItem) {
 }
 
 func (q3 SingleQ3) countUpds() (nUpds, nUpdsStats, nBlockUpds int) {
-	fmt.Printf("[Q3]nUpds: %d, nUpdsStats: %d, nBlockUpds: %d\n", q3.totalUpds, q3.totalUpds, getNBlockUpds(q3.totalUpds))
-	return q3.totalUpds, q3.totalUpds, getNBlockUpds(q3.totalUpds)
+	//fmt.Printf("[Q3]nUpds: %d, nUpdsStats: %d, nBlockUpds: %d\n", q3.totalUpds, q3.totalUpds, getNBlockUpds(q3.totalUpds))
+	return q3.nUpds, q3.nUpds, getNBlockUpds(q3.nUpds)
 }
 
 func (q3 SingleQ3) makeNewUpdArgs(tables *tpch.Tables, newOrder *tpch.Orders, buf []antidote.UpdateObjectParams, bufI int, bucketI int) (newBufI int) {
@@ -188,7 +188,7 @@ func (q5 SingleQ5) countUpds() (nUpds, nUpdsStats, nBlockUpds int) {
 	if *q5.remValue != 0 {
 		nUpds++
 	}
-	fmt.Printf("[Q5]nUpds: %d, nUpdsStats: %d, nBlockUpds: %d\n", nUpds, nUpds, getNBlockUpds(nUpds))
+	//fmt.Printf("[Q5]nUpds: %d, nUpdsStats: %d, nBlockUpds: %d\n", nUpds, nUpds, getNBlockUpds(nUpds))
 	return nUpds, nUpds, getNBlockUpds(nUpds)
 }
 
@@ -219,6 +219,7 @@ func (q5 SingleQ5) makeUpdsArgsHelper(value float64, signal float64, tables *tpc
 
 type SingleQ14 struct {
 	mapPromo, mapTotal map[string]*float64
+	nAdds, nRems       int
 }
 
 func (q14 SingleQ14) buildUpdInfo(tables *tpch.Tables, newOrder, remOrder *tpch.Orders, newItems, remItems []*tpch.LineItem) SingleQueryInfo {
@@ -256,7 +257,7 @@ func (q14 SingleQ14) updsCalcHelper(multiplier float64, tables *tpch.Tables, ord
 
 func (q14 SingleQ14) countUpds() (nUpds, nUpdsStats, nBlockUpds int) {
 	size := len(q14.mapTotal)
-	fmt.Printf("[Q14]nUpds: %d, nUpdsStats: %d, nBlockUpds: %d\n", size, size, getNBlockUpds(size))
+	//fmt.Printf("[Q14]nUpds: %d, nUpdsStats: %d, nBlockUpds: %d\n", size, size, getNBlockUpds(size))
 	return size, size, getNBlockUpds(size)
 }
 
@@ -341,7 +342,7 @@ func (q15 SingleQ15) countUpds() (nUpds, nUpdsStats, nBlockUpds int) {
 				nUpds += len(suppMap)
 			}
 		}
-		fmt.Printf("[Q15]nUpds: %d, nUpdsStats: %d, nBlockUpds: %d\n", nUpds, nUpds, getNBlockUpds(nUpds))
+		//fmt.Printf("[Q15]nUpds: %d, nUpdsStats: %d, nBlockUpds: %d\n", nUpds, nUpds, getNBlockUpds(nUpds))
 		return nUpds, nUpds, getNBlockUpds(nUpds)
 	} else {
 		var suppMapValues map[int32]*float64
@@ -373,7 +374,7 @@ func (q15 SingleQ15) countUpds() (nUpds, nUpdsStats, nBlockUpds int) {
 			}
 		}
 	}
-	fmt.Printf("[Q15]nUpds: %d, nUpdsStats: %d, nBlockUpds: %d\n", nUpds, nUpdsStats, getNBlockUpds(nUpds))
+	//fmt.Printf("[Q15]nUpds: %d, nUpdsStats: %d, nBlockUpds: %d\n", nUpds, nUpdsStats, getNBlockUpds(nUpds))
 	return nUpds, nUpdsStats, getNBlockUpds(nUpds)
 }
 
@@ -397,7 +398,6 @@ type SingleLocalQ15 struct {
 }*/
 
 func (q15 SingleLocalQ15) buildUpdInfo(tables *tpch.Tables, newOrder, remOrder *tpch.Orders, newItems, remItems []*tpch.LineItem) SingleQueryInfo {
-
 	updKey, remKey := tables.OrderToRegionkey(newOrder), tables.OrderToRegionkey(remOrder)
 	updEntries, remEntries := createQ15EntriesMap(), createQ15EntriesMap()
 	q15UpdsNewCalcHelper(newItems, q15LocalMap[updKey], updEntries)
@@ -430,7 +430,6 @@ type SingleQ15TopSum struct {
 }
 
 func (q15 SingleQ15TopSum) buildUpdInfo(tables *tpch.Tables, newOrder, remOrder *tpch.Orders, newItems, remItems []*tpch.LineItem) SingleQueryInfo {
-
 	diffEntries := createQ15TopSumEntriesMap()
 	q15TopSumUpdsNewCalcHelper(newItems, q15Map, diffEntries)
 	q15TopSumUpdsRemCalcHelper(remItems, q15Map, diffEntries)
@@ -445,7 +444,7 @@ func (q15 SingleQ15TopSum) countUpds() (nUpds, nUpdsStats, nBlockUpds int) {
 				nUpds += len(suppMap)
 			}
 		}
-		fmt.Printf("[Q15]nUpds: %d, nUpdsStats: %d, nBlockUpds: %d\n", nUpds, nUpds, getNBlockUpds(nUpds))
+		//fmt.Printf("[Q15]nUpds: %d, nUpdsStats: %d, nBlockUpds: %d\n", nUpds, nUpds, getNBlockUpds(nUpds))
 		return nUpds, nUpds, getNBlockUpds(nUpds)
 	} else {
 		var suppMapValues map[int32]*float64
@@ -477,7 +476,7 @@ func (q15 SingleQ15TopSum) countUpds() (nUpds, nUpdsStats, nBlockUpds int) {
 			}
 		}
 	}
-	fmt.Printf("[Q15]nUpds: %d, nUpdsStats: %d, nBlockUpds: %d\n", nUpds, nUpdsStats, getNBlockUpds(nUpds))
+	//fmt.Printf("[Q15]nUpds: %d, nUpdsStats: %d, nBlockUpds: %d\n", nUpds, nUpdsStats, getNBlockUpds(nUpds))
 	return nUpds, nUpdsStats, getNBlockUpds(nUpds)
 }
 
@@ -547,7 +546,7 @@ func (q18 SingleQ18) buildUpdInfo(tables *tpch.Tables, newOrder, remOrder *tpch.
 func (q18 SingleQ18) countUpds() (nUpds, nUpdsStats, nBlockUpds int) {
 	nUpds += q18.countUpdsHelper(q18.updQuantity)
 	nUpds += q18.countUpdsHelper(q18.remQuantity)
-	fmt.Printf("[Q18]nUpds: %d, nUpdsStats: %d, nBlockUpds: %d\n", nUpds, nUpds, getNBlockUpds(nUpds))
+	//fmt.Printf("[Q18]nUpds: %d, nUpdsStats: %d, nBlockUpds: %d\n", nUpds, nUpds, getNBlockUpds(nUpds))
 	return nUpds, nUpds, getNBlockUpds(nUpds)
 }
 
@@ -621,4 +620,80 @@ func getNBlockUpds(nUpds int) int {
 		return 1
 	}
 	return 0
+}
+
+//*****Making lists of index infos*****
+
+func makeIndexInfos(tables *tpch.Tables, newOrder, remOrder *tpch.Orders, newItems, remItems []*tpch.LineItem) (infos []SingleQueryInfo) {
+	if !UPDATE_SPECIFIC_INDEX_ONLY {
+		return makeIndexInfosFull(tables, newOrder, remOrder, newItems, remItems)
+	}
+	return makeIndexInfosFromList(tables, indexesToUpd, newOrder, remOrder, newItems, remItems)
+}
+
+func makeIndexInfosFull(tables *tpch.Tables, newOrder, remOrder *tpch.Orders, newItems, remItems []*tpch.LineItem) (infos []SingleQueryInfo) {
+	infos = make([]SingleQueryInfo, 5)
+	infos[0] = SingleQ3{}.buildUpdInfo(tables, newOrder, remOrder, newItems, remItems)
+	infos[1] = SingleQ5{}.buildUpdInfo(tables, newOrder, remOrder, newItems, remItems)
+	infos[4] = SingleQ18{}.buildUpdInfo(tables, newOrder, remOrder, newItems, remItems)
+	if isIndexGlobal {
+		infos[2] = SingleQ14{}.buildUpdInfo(tables, newOrder, remOrder, newItems, remItems)
+		if !useTopSum {
+			infos[3] = SingleQ15{}.buildUpdInfo(tables, newOrder, remOrder, newItems, remItems)
+		} else {
+			infos[3] = SingleQ15TopSum{}.buildUpdInfo(tables, newOrder, remOrder, newItems, remItems)
+		}
+	} else {
+		infos[2] = SingleLocalQ14{}.buildUpdInfo(tables, newOrder, remOrder, newItems, remItems)
+		if !useTopSum {
+			infos[3] = SingleLocalQ15{}.buildUpdInfo(tables, newOrder, remOrder, newItems, remItems)
+		} else {
+			infos[3] = SingleLocalQ15TopSum{}.buildUpdInfo(tables, newOrder, remOrder, newItems, remItems)
+		}
+	}
+	return
+}
+
+func makeIndexInfosFromList(tables *tpch.Tables, indexes []int, newOrder, remOrder *tpch.Orders, newItems, remItems []*tpch.LineItem) (infos []SingleQueryInfo) {
+	infos = make([]SingleQueryInfo, len(indexes))
+	for i, queryN := range indexes {
+		switch queryN {
+		case 3:
+			infos[i] = SingleQ3{}.buildUpdInfo(tables, newOrder, remOrder, newItems, remItems)
+		case 5:
+			infos[i] = SingleQ5{}.buildUpdInfo(tables, newOrder, remOrder, newItems, remItems)
+		case 14:
+			if isIndexGlobal {
+				infos[i] = SingleQ14{}.buildUpdInfo(tables, newOrder, remOrder, newItems, remItems)
+			} else {
+				infos[i] = SingleLocalQ14{}.buildUpdInfo(tables, newOrder, remOrder, newItems, remItems)
+			}
+		case 15:
+			if isIndexGlobal {
+				if !useTopSum {
+					infos[i] = SingleQ15{}.buildUpdInfo(tables, newOrder, remOrder, newItems, remItems)
+				} else {
+					infos[i] = SingleQ15TopSum{}.buildUpdInfo(tables, newOrder, remOrder, newItems, remItems)
+				}
+			} else {
+				if !useTopSum {
+					infos[i] = SingleLocalQ15{}.buildUpdInfo(tables, newOrder, remOrder, newItems, remItems)
+				} else {
+					infos[i] = SingleLocalQ15TopSum{}.buildUpdInfo(tables, newOrder, remOrder, newItems, remItems)
+				}
+			}
+		case 18:
+			infos[i] = SingleQ18{}.buildUpdInfo(tables, newOrder, remOrder, newItems, remItems)
+		}
+	}
+	return
+}
+
+func countUpdsIndexInfo(infos []SingleQueryInfo) (nUpds, nUpdsStats, nBlockUpds int) {
+	currNUpds, currNUpdsStats, currNBlockUpds := 0, 0, 0
+	for _, info := range infos {
+		currNUpds, currNUpdsStats, currNBlockUpds = info.countUpds()
+		nUpds, nUpdsStats, nBlockUpds = nUpds+currNUpds, nUpdsStats+currNUpdsStats, nBlockUpds+currNBlockUpds
+	}
+	return
 }

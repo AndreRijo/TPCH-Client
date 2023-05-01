@@ -11,7 +11,7 @@ import (
 	"time"
 
 	//"tpch_client/src/tpch"
-	"tpch_data/tpch"
+	tpch "potionDB/tpch_helper"
 )
 
 //Deals with loading the initial data (along with headers) from the files, creating the initial client tables

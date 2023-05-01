@@ -10,11 +10,12 @@ import (
 	"potionDB/src/antidote"
 	"potionDB/src/crdt"
 	"potionDB/src/proto"
+	"sort"
 	"strconv"
 	"time"
 
 	//"tpch_client/src/tpch"
-	"tpch_data/tpch"
+	tpch "potionDB/tpch_helper"
 )
 
 //TODO: On queries, all requests can go to the "partial" slot. That should make things easier to manage/maintain
@@ -71,13 +72,26 @@ var (
 	SPLIT_UPDATES, SPLIT_UPDATES_NO_WAIT bool    //Whenever each update should be its own transaction or not.
 	RECORD_LATENCY                       bool    //Filled automatically in startMixBench. When true, latency is measured every transaction.
 	//MAX_CONNECTIONS                      int     = 64 //After this limit, clients start sharing connections.
-	NON_RANDOM_SERVERS bool //If true, servers are associated to clients by order instead of randomly. id is used to select the first server
+	NON_RANDOM_SERVERS bool    //If true, servers are associated to clients by order instead of randomly. id is used to select the first server
+	LIKEHOOD_ADD       float64 //Percentage of adds vs removes when doing non-standard TPC-H
+	ADD_ONLY           bool    //Filled automatically in startMixBench. Is true when likehood_add == 1
+)
+
+const (
+	STAT_TOTAL            = 0
+	STAT_MIN              = 1
+	STAT_MAX              = 2
+	STAT_AVG              = 3
+	STAT_MEAN             = 4
+	ONE_CLIENT_STATISTICS = true
 )
 
 func startMixBench() {
+	ADD_ONLY = (LIKEHOOD_ADD == 1)
 	maxServers := len(servers)
 	RECORD_LATENCY = (LATENCY_MODE == PER_BATCH)
-
+	fmt.Println("TPC-H add rate:", LIKEHOOD_ADD)
+	//fmt.Println("Is it add-only?", ADD_ONLY)
 	fmt.Println("Reading updates...")
 	readStart := time.Now().UnixNano()
 	//ordersUpds, lineItemUpds, deleteKeys, lineItemSizes, itemSizesPerOrder := readUpdsByOrder()
@@ -593,7 +607,7 @@ func (ti SingleTableInfo) sendDataIndividually(order []string, lineItems [][]str
 	nIndexUpds, nBlockIndexUpds /*, indexInfo*/ := 0, 0 /*, IndexInfo{}*/
 
 	if UPDATE_INDEX {
-		indexInfos := ti.makeIndexInfos(newOrder, deletedOrder, newItems, deletedItems)
+		indexInfos := makeIndexInfos(ti.Tables, newOrder, deletedOrder, newItems, deletedItems)
 		updS := updParams[0] //Doesn't matter which buffer is used
 		if isIndexGlobal {
 			for _, indexInfo := range indexInfos {
@@ -698,80 +712,6 @@ func (ti SingleTableInfo) sendDataIndividually(order []string, lineItems [][]str
 	return nDels + nAdds + nIndexUpds
 }
 
-func (ti SingleTableInfo) makeIndexInfos(newOrder, remOrder *tpch.Orders, newItems, remItems []*tpch.LineItem) (infos []SingleQueryInfo) {
-	if !UPDATE_SPECIFIC_INDEX_ONLY {
-		return ti.makeIndexInfosFull(newOrder, remOrder, newItems, remItems)
-	}
-	return ti.makeIndexInfosFromList(indexesToUpd, newOrder, remOrder, newItems, remItems)
-}
-
-func (ti SingleTableInfo) makeIndexInfosFull(newOrder, remOrder *tpch.Orders, newItems, remItems []*tpch.LineItem) (infos []SingleQueryInfo) {
-	infos = make([]SingleQueryInfo, 5)
-	infos[0] = SingleQ3{}.buildUpdInfo(ti.Tables, newOrder, remOrder, newItems, remItems)
-	infos[1] = SingleQ5{}.buildUpdInfo(ti.Tables, newOrder, remOrder, newItems, remItems)
-	infos[4] = SingleQ18{}.buildUpdInfo(ti.Tables, newOrder, remOrder, newItems, remItems)
-	if isIndexGlobal {
-		infos[2] = SingleQ14{}.buildUpdInfo(ti.Tables, newOrder, remOrder, newItems, remItems)
-		if !useTopSum {
-			infos[3] = SingleQ15{}.buildUpdInfo(ti.Tables, newOrder, remOrder, newItems, remItems)
-		} else {
-			infos[3] = SingleQ15TopSum{}.buildUpdInfo(ti.Tables, newOrder, remOrder, newItems, remItems)
-		}
-	} else {
-		infos[2] = SingleLocalQ14{}.buildUpdInfo(ti.Tables, newOrder, remOrder, newItems, remItems)
-		if !useTopSum {
-			infos[3] = SingleLocalQ15{}.buildUpdInfo(ti.Tables, newOrder, remOrder, newItems, remItems)
-		} else {
-			infos[3] = SingleLocalQ15TopSum{}.buildUpdInfo(ti.Tables, newOrder, remOrder, newItems, remItems)
-		}
-	}
-	return
-}
-
-func (ti SingleTableInfo) makeIndexInfosFromList(indexes []int, newOrder, remOrder *tpch.Orders, newItems, remItems []*tpch.LineItem) (infos []SingleQueryInfo) {
-	infos = make([]SingleQueryInfo, len(indexes))
-	for i, queryN := range indexes {
-		switch queryN {
-		case 3:
-			infos[i] = SingleQ3{}.buildUpdInfo(ti.Tables, newOrder, remOrder, newItems, remItems)
-		case 5:
-			infos[i] = SingleQ5{}.buildUpdInfo(ti.Tables, newOrder, remOrder, newItems, remItems)
-		case 14:
-			if isIndexGlobal {
-				infos[i] = SingleQ14{}.buildUpdInfo(ti.Tables, newOrder, remOrder, newItems, remItems)
-			} else {
-				infos[i] = SingleLocalQ14{}.buildUpdInfo(ti.Tables, newOrder, remOrder, newItems, remItems)
-			}
-		case 15:
-			if isIndexGlobal {
-				if !useTopSum {
-					infos[i] = SingleQ15{}.buildUpdInfo(ti.Tables, newOrder, remOrder, newItems, remItems)
-				} else {
-					infos[i] = SingleQ15TopSum{}.buildUpdInfo(ti.Tables, newOrder, remOrder, newItems, remItems)
-				}
-			} else {
-				if !useTopSum {
-					infos[i] = SingleLocalQ15{}.buildUpdInfo(ti.Tables, newOrder, remOrder, newItems, remItems)
-				} else {
-					infos[i] = SingleLocalQ15TopSum{}.buildUpdInfo(ti.Tables, newOrder, remOrder, newItems, remItems)
-				}
-			}
-		case 18:
-			infos[i] = SingleQ18{}.buildUpdInfo(ti.Tables, newOrder, remOrder, newItems, remItems)
-		}
-	}
-	return
-}
-
-func countUpdsIndexInfo(infos []SingleQueryInfo) (nUpds, nUpdsStats, nBlockUpds int) {
-	currNUpds, currNUpdsStats, currNBlockUpds := 0, 0, 0
-	for _, info := range infos {
-		currNUpds, currNUpdsStats, currNBlockUpds = info.countUpds()
-		nUpds, nUpdsStats, nBlockUpds = nUpds+currNUpds, nUpdsStats+currNUpdsStats, nBlockUpds+currNBlockUpds
-	}
-	return
-}
-
 func (ti SingleTableInfo) sendIndividualUpdates(upds [][]antidote.UpdateObjectParams, bufI []int) {
 	for i, serverUpds := range upds {
 		for j := 0; j < bufI[i]; j++ {
@@ -795,7 +735,116 @@ func (ti SingleTableInfo) sendIndividualIndex(upds []antidote.UpdateObjectParams
 	ti.waitFor[server] += buf
 }
 
+//This one only does either add or delete, but not both: it picks which one to do depending on odds
+func (ti SingleTableInfo) getSingleOddsDataChange(updParams [][]antidote.UpdateObjectParams, bufI []int, order []string, lineItems [][]string, deleteKey string) (updsDone int) {
+	if ADD_ONLY || ti.rng.Float64() <= LIKEHOOD_ADD { //Add
+		return ti.addAndIndexOnly(updParams, bufI, order, lineItems)
+	}
+	return ti.deleteAndIndexOnly(updParams, bufI, deleteKey)
+}
+
+func (ti SingleTableInfo) addAndIndexOnly(updParams [][]antidote.UpdateObjectParams, bufI []int, order []string, lineItems [][]string) (updsDone int) {
+	newOrder, newItems := ti.CreateOrder(order), ti.CreateLineitemsOfOrder(lineItems)
+	nAdds, itemsNewPerServer := ti.getSingleUpd(order, lineItems)
+	nIndexUpds, nBlockIndexUpds := 0, 0
+	regN := ti.OrderToRegionkey(newOrder)
+
+	if UPDATE_BASE_DATA {
+		ti.makeSingleUpd(order, lineItems, updParams, bufI, itemsNewPerServer)
+	}
+
+	if UPDATE_INDEX {
+		indexInfos := makeAddIndexInfos(ti.Tables, newOrder, newItems)
+		nIndexUpds, _, nBlockIndexUpds = countAddsIndexInfo(indexInfos)
+		if isIndexGlobal {
+			updS, bufS := updParams[ti.indexServer], bufI[ti.indexServer]
+			for _, indexInfo := range indexInfos {
+				bufS = indexInfo.makeNewUpdArgs(ti.Tables, newOrder, updS, bufS, INDEX_BKT)
+			}
+			bufI[ti.indexServer] = bufS
+		} else {
+			newI, updN, bufN := int(regN)+INDEX_BKT, updParams[regN], bufI[regN]
+			if localMode == LOCAL_SERVER {
+				updN, bufN = updParams[ti.indexServer], bufI[ti.indexServer]
+			}
+			for _, indexInfo := range indexInfos {
+				bufN = indexInfo.makeNewUpdArgs(ti.Tables, newOrder, updN, bufN, newI)
+			}
+			if localMode == LOCAL_SERVER {
+				bufI[ti.indexServer] = bufN
+			} else {
+				bufI[regN] = bufN
+			}
+		}
+	}
+
+	if UPDATE_BASE_DATA {
+		ti.currUpdStat.nNews += nAdds
+		ti.currUpdStat.nUpdBlocks += nAdds
+	}
+	ti.currUpdStat.nIndex += nIndexUpds
+	ti.currUpdStat.nUpdBlocks += nBlockIndexUpds
+
+	if UPDATE_BASE_DATA {
+		return nAdds + nIndexUpds
+	} else {
+		return nIndexUpds
+	}
+}
+
+func (ti SingleTableInfo) deleteAndIndexOnly(updParams [][]antidote.UpdateObjectParams, bufI []int, deleteKey string) (updsDone int) {
+	deletedOrder, deletedItems := ti.getNextDelete(deleteKey)
+	nDels, itemsDelPerServer, itemsIndex := ti.getSingleDelete(deletedOrder, deletedItems)
+	nIndexUpds, nBlockIndexUpds := 0, 0
+	regR := ti.OrderToRegionkey(deletedOrder)
+
+	if UPDATE_BASE_DATA {
+		ti.makeSingleDelete(deletedOrder, updParams, bufI, itemsDelPerServer, itemsIndex)
+	}
+
+	if UPDATE_INDEX {
+		indexInfos := makeRemIndexInfos(ti.Tables, deletedOrder, deletedItems)
+		nIndexUpds, _, nBlockIndexUpds = countRemsIndexInfo(indexInfos)
+		if isIndexGlobal {
+			updS, bufS := updParams[ti.indexServer], bufI[ti.indexServer]
+			for _, indexInfo := range indexInfos {
+				bufS = indexInfo.makeRemUpdArgs(ti.Tables, deletedOrder, updS, bufS, INDEX_BKT)
+			}
+			bufI[ti.indexServer] = bufS
+		} else {
+			remI, updR, bufR := int(regR)+INDEX_BKT, updParams[regR], bufI[regR]
+			if localMode == LOCAL_SERVER {
+				updR, bufR = updParams[ti.indexServer], bufI[ti.indexServer]
+			}
+			for _, indexInfo := range indexInfos {
+				bufR = indexInfo.makeRemUpdArgs(ti.Tables, deletedOrder, updR, bufR, remI)
+			}
+			if localMode == LOCAL_SERVER {
+				bufI[ti.indexServer] = bufR
+			} else {
+				bufI[regR] = bufR
+			}
+		}
+	}
+
+	if UPDATE_BASE_DATA {
+		ti.currUpdStat.nDels += nDels
+		ti.currUpdStat.nUpdBlocks += nDels
+	}
+	ti.currUpdStat.nIndex += nIndexUpds
+	ti.currUpdStat.nUpdBlocks += nBlockIndexUpds
+
+	if UPDATE_BASE_DATA {
+		return nDels + nIndexUpds
+	} else {
+		return nIndexUpds
+	}
+}
+
 func (ti SingleTableInfo) getSingleDataChange(updParams [][]antidote.UpdateObjectParams, bufI []int, order []string, lineItems [][]string, deleteKey string) (updsDone int) {
+	if LIKEHOOD_ADD != 0.5 {
+		return ti.getSingleOddsDataChange(updParams, bufI, order, lineItems, deleteKey)
+	}
 	deletedOrder, deletedItems := ti.getNextDelete(deleteKey)
 	newOrder, newItems := ti.CreateOrder(order), ti.CreateLineitemsOfOrder(lineItems)
 	nDels, itemsDelPerServer, itemsIndex := ti.getSingleDelete(deletedOrder, deletedItems)
@@ -812,21 +861,15 @@ func (ti SingleTableInfo) getSingleDataChange(updParams [][]antidote.UpdateObjec
 	}
 
 	if UPDATE_INDEX {
-		indexInfos := ti.makeIndexInfos(newOrder, deletedOrder, newItems, deletedItems)
-		test := 0
+		indexInfos := makeIndexInfos(ti.Tables, newOrder, deletedOrder, newItems, deletedItems)
 		nIndexUpds, _, nBlockIndexUpds = countUpdsIndexInfo(indexInfos)
 		if isIndexGlobal {
 			updS, bufS := updParams[ti.indexServer], bufI[ti.indexServer]
-			fmt.Println(bufS)
 			for _, indexInfo := range indexInfos {
 				bufS = indexInfo.makeNewUpdArgs(ti.Tables, newOrder, updS, bufS, INDEX_BKT)
-				fmt.Println("*new ", bufS)
 				bufS = indexInfo.makeRemUpdArgs(ti.Tables, deletedOrder, updS, bufS, INDEX_BKT)
-				fmt.Println("*rem ", bufS)
 			}
-			fmt.Println(bufS)
 			bufI[ti.indexServer] = bufS
-			fmt.Println("bufI[index]: ", bufS)
 		} else {
 			newI, remI := int(regN)+INDEX_BKT, int(regR)+INDEX_BKT
 			updN, bufN := updParams[regN], bufI[regN]
@@ -853,7 +896,7 @@ func (ti SingleTableInfo) getSingleDataChange(updParams [][]antidote.UpdateObjec
 				bufI[regN], bufI[regR] = bufN, bufR
 			}
 		}
-		fmt.Printf("Making index updates. NIndexUpds: %d, nBlockIndexUpds: %d, test: %d, bufI[index]: %d, indexServer: %d\n", nIndexUpds, nBlockIndexUpds, test, bufI[ti.indexServer], ti.indexServer)
+		//fmt.Printf("Making index updates. NIndexUpds: %d, nBlockIndexUpds: %d, test: %d, bufI[index]: %d, indexServer: %d\n", nIndexUpds, nBlockIndexUpds, test, bufI[ti.indexServer], ti.indexServer)
 	}
 	/*
 		if UPDATE_INDEX && !UPDATE_SPECIFIC_INDEX_ONLY {
@@ -2245,38 +2288,116 @@ func doMixedStatsInterval() {
 	}
 }
 
-//TODO: Need to update the conversions most likely
-func writeMixStatsFile(stats []MixClientResult) {
-	//I should write the total, avg, best and worse for each part.
-	//Also write the total, avg, best and worse for the "final"
-
-	//TODO: Latency
-
-	qStatsPerPart, uStatsPerPart := convertMixStats(stats)
-	nFuncs := len(queryFuncs)
+//Returns the stats in format [time][nclients] and prepares headers.
+func mixStatsFileHelper(stats []MixClientResult) (qStatsPerPart [][]QueryStats, uStatsPerPart [][]UpdateStats, header []string) {
+	qStatsPerPart, uStatsPerPart = convertMixStats(stats)
 
 	//Cutting out first entry as "warmup"
 	qStatsPerPart, uStatsPerPart = qStatsPerPart[1:len(qStatsPerPart)], uStatsPerPart[1:len(uStatsPerPart)]
 
-	totalData := make([][]string, len(qStatsPerPart)+1) //space for final data as well
 	var latencyString []string
 
 	if LATENCY_MODE == AVG_OP {
-		latencyString = []string{"Average latency (ms)(AO)"}
+		latencyString = []string{"Average latency (ms)(AO)", "Average latency (ms)(AOw/I)"}
 	} else if LATENCY_MODE == AVG_BATCH {
-		latencyString = []string{"Average latency (ms)(AB)", "Average latency (ms)(AO)"}
+		latencyString = []string{"Average latency (ms)(AB)", "Average latency (ms)(AO)", "Average latency (ms)(AOw/I)"}
 	} else { //PER_OP
-		latencyString = []string{"AvgQ latency", "AvgU latency", "AvgAll latency (ms)", "Avg latency (ms)(AO)"}
+		latencyString = []string{"AvgQ latency", "AvgU latency", "AvgAll latency (ms)", "Avg latency (ms)(AO)", "Average latency (ms)(AOw/I)"}
 	}
 
-	header := append([]string{"Total time", "Section time", "Queries cycles", "Queries", "Reads", "Query cycles/s", "Query/s", "Read/s",
+	header = append([]string{"Total time", "Section time", "Queries cycles", "Queries", "Reads", "Query cycles/s", "Query/s", "Read/s",
 		"Query txns", "Query txns/s", "Updates", "Updates/s", "New upds", "Del upds", "Index upds", "Update blocks", "Update blocks/s",
-		"Update txns", "Update txns/s", "Ops", "Ops/s", "Txns", "Txn/s"}, latencyString...)
+		"New+del upds", "New+del upd/s", "Update txns", "Update txns/s", "Ops_all", "Ops_all/s", "Ops", "Ops/s", "Txns", "Txn/s"}, latencyString...)
 
-	partQueries, partReads, partTime, partQueryCycles, partUpds, partNews, partDels, partIndexes, partQTime, partUTime := 0, 0, int64(0), 0, 0, 0, 0, 0, int64(0), int64(0)
+	return
+}
+
+//TODO: One day improve the statistics. Namely I need an auxiliary method on creating the slices of data/finalData.
+//And also for the intermediate calculations.
+func writeMixStatsFile(stats []MixClientResult) {
+	//I should write the total, avg, best and worse for each part.
+	//Also write the total, avg, best and worse for the "final"
+	//TODO: I think I need to prepare the final part before sorting.
+	//TODO: Maybe I should write all clients' statistics too. In case later I need to access something.
+	qStatsPerPart, uStatsPerPart, header := mixStatsFileHelper(stats)
+	totalQClientStats, totalUClientStats := sumAndSortPartStats(qStatsPerPart, uStatsPerPart)
+	for i := range qStatsPerPart {
+		qStatsPerPart[i], uStatsPerPart[i] = sortByOpsSecond(qStatsPerPart[i], uStatsPerPart[i])
+	}
+
+	writeMixTotalStatsFile(stats, qStatsPerPart, uStatsPerPart, header) //This one already calls the avg one
+	writeMixExtraStatsFile(stats, qStatsPerPart, uStatsPerPart, totalQClientStats, totalUClientStats, header, STAT_MIN)
+	writeMixExtraStatsFile(stats, qStatsPerPart, uStatsPerPart, totalQClientStats, totalUClientStats, header, STAT_MAX)
+	writeMixExtraStatsFile(stats, qStatsPerPart, uStatsPerPart, totalQClientStats, totalUClientStats, header, STAT_MEAN)
+	writeMixRawStatsFile(totalQClientStats, totalUClientStats, header)
+}
+
+//This is only used to help sort the query and update results by order of ops/s.
+type OpClientIdPair struct {
+	opsPerSecond float64
+	clientID     int
+}
+
+//Returns an entry per client, with clients sorted by increasing ops/s
+func sumAndSortPartStats(qStatsPerPart [][]QueryStats, uStatsPerPart [][]UpdateStats) (sumQ []QueryStats, sumU []UpdateStats) {
+	sumQ, sumU = make([]QueryStats, TEST_ROUTINES), make([]UpdateStats, TEST_ROUTINES)
+
+	for i, partStats := range qStatsPerPart {
+		for j, clientQStat := range partStats {
+			sumQ[j].nQueries += clientQStat.nQueries
+			sumQ[j].nReads += clientQStat.nReads
+			sumQ[j].timeSpent += clientQStat.timeSpent
+			sumQ[j].latency += clientQStat.latency
+			sumQ[j].nTxns += clientQStat.nTxns
+		}
+		for j, clientUStat := range uStatsPerPart[i] {
+			sumU[j].nNews += clientUStat.nNews
+			sumU[j].nDels += clientUStat.nDels
+			sumU[j].nIndex += clientUStat.nIndex
+			sumU[j].nTxns += clientUStat.nTxns
+			sumU[j].nUpdBlocks += clientUStat.nUpdBlocks
+		}
+	}
+
+	return sortByOpsSecond(sumQ, sumU)
+}
+
+func sortByOpsSecond(qStats []QueryStats, uStats []UpdateStats) (sortedQStats []QueryStats, sortedUStats []UpdateStats) {
+	opSlice := make([]OpClientIdPair, TEST_ROUTINES)
+	for j := range opSlice {
+		opSlice[j].clientID, opSlice[j].opsPerSecond = j, float64(qStats[j].nQueries+uStats[j].nNews+uStats[j].nDels+uStats[j].nIndex)/float64(qStats[j].timeSpent)
+	}
+	sort.Slice(opSlice, func(a, b int) bool { return opSlice[a].opsPerSecond < opSlice[b].opsPerSecond })
+	/*fmt.Println("[CQU]SortByOpsS")
+	fmt.Print("[")
+	for _, op := range opSlice {
+		fmt.Printf("(%d, %.5f), ", op.clientID, op.opsPerSecond)
+	}
+	fmt.Println("]")*/
+	sortedQStats, sortedUStats = make([]QueryStats, len(qStats)), make([]UpdateStats, len(uStats))
+	for i, opIdPair := range opSlice {
+		sortedQStats[i], sortedUStats[i] = qStats[opIdPair.clientID], uStats[opIdPair.clientID]
+	}
+	/*
+		fmt.Println("Sorted qStats (sorted by opsS, showcasing nQueries):")
+		fmt.Print("[")
+		for _, qStat := range sortedQStats {
+			fmt.Printf("%d, ", qStat.nQueries)
+		}
+		fmt.Println("]")
+	*/
+	return sortedQStats, sortedUStats
+}
+
+func writeMixTotalStatsFile(stats []MixClientResult, qStatsPerPart [][]QueryStats, uStatsPerPart [][]UpdateStats, header []string) {
+	totalData := make([][]string, len(qStatsPerPart)+1) //space for final data as well
+
+	partQueries, partReads, partTime, partNews, partDels, partIndexes, partQTime, partUTime := 0, 0, int64(0), 0, 0, 0, int64(0), int64(0)
 	partQTxns, partUTxns, partUBlocks, totalUBlocks := 0, 0, 0, 0
 	totalQueries, totalReads, totalTime, totalNews, totalDels, totalIndexes, totalQTime, totalUTime, totalQTxns, totalUTxns := 0, 0, int64(0), 0, 0, 0, int64(0), int64(0), 0, 0
-	queryCycleS, queryS, readS, updS, latency, latencyPerOp, qTxnsS, uTxnsS, uBlocksS := 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
+
+	//Use these later for average. These ones are by part (i.e., sum of all clients)
+	sumQStats, sumUStats := make([]QueryStats, len(qStatsPerPart)+1), make([]UpdateStats, len(qStatsPerPart)+1)
 
 	for i, partStats := range qStatsPerPart {
 		for _, clientQStat := range partStats {
@@ -2294,14 +2415,11 @@ func writeMixStatsFile(stats []MixClientResult) {
 			partUTxns += clientUStat.nTxns
 			partUBlocks += clientUStat.nUpdBlocks
 		}
-		partQueryCycles, partUpds = partQueries/nFuncs, partNews+partDels+partIndexes
+		sumQStats[i] = QueryStats{nQueries: partQueries, nReads: partReads, timeSpent: partTime, latency: partQTime, nTxns: partQTxns}
+		sumUStats[i] = UpdateStats{nNews: partNews, nDels: partDels, nIndex: partIndexes, latency: partUTime, nTxns: partUTxns, nUpdBlocks: partUBlocks}
+
 		partTime /= int64(TEST_ROUTINES)
-		queryCycleS, queryS = (float64(partQueryCycles)/float64(partTime))*1000, (float64(partQueries)/float64(partTime))*1000
-		updS, readS = (float64(partUpds)/float64(partTime))*1000, (float64(partReads)/float64(partTime))*1000
-		qTxnsS, uTxnsS = (float64(partQTxns)/float64(partTime))*1000, (float64(partUTxns)/float64(partTime))*1000
-		uBlocksS = (float64(partUBlocks) / float64(partTime)) * 1000
-		latencyPerOp = float64(partTime*int64(TEST_ROUTINES)) / float64(partQueries+partUpds)
-		latency = getStatsLatency(partTime, partQTime, partUTime, partQueries, partUpds, partQTxns, partUTxns)
+
 		totalQueries += partQueries
 		totalReads += partReads
 		totalTime += partTime
@@ -2314,86 +2432,155 @@ func writeMixStatsFile(stats []MixClientResult) {
 		totalUTxns += partUTxns
 		totalUBlocks += partUBlocks
 
-		//header := append([]string{"Total time", "Section time", "Queries cycles", "Queries", "Reads", "Query cycles/s", "Query/s", "Read/s",
-		//"Query txns", "Query txns/s", "Updates", "Updates/s", "New upds", "Del upds", "Index upds", "Update txns", "Update txns/s", "Ops", "Ops/s",
-		//"Txns", "Txn/s"}, latencyString...)
+		totalData[i] = calculateMixStats(partQueries, partReads, partQTxns, partNews, partDels, partIndexes, partUTxns, partUBlocks,
+			totalTime, partTime, partQTime, partUTime, !ONE_CLIENT_STATISTICS)
 
-		totalData[i] = []string{strconv.FormatInt(totalTime, 10), strconv.FormatInt(partTime, 10),
-			strconv.FormatInt(int64(partQueryCycles), 10), strconv.FormatInt(int64(partQueries), 10), strconv.FormatInt(int64(partReads), 10),
-			strconv.FormatFloat(queryCycleS, 'f', 10, 64), strconv.FormatFloat(queryS, 'f', 10, 64),
-			strconv.FormatFloat(readS, 'f', 10, 64), strconv.FormatInt(int64(partQTxns), 10), strconv.FormatFloat(qTxnsS, 'f', 10, 64),
-			strconv.FormatInt(int64(partUpds), 10), strconv.FormatFloat(updS, 'f', 10, 64),
-			strconv.FormatInt(int64(partNews), 10), strconv.FormatInt(int64(partDels), 10), strconv.FormatInt(int64(partIndexes), 10),
-			strconv.FormatInt(int64(partUBlocks), 10), strconv.FormatFloat(uBlocksS, 'f', 10, 64),
-			strconv.FormatInt(int64(partUTxns), 10), strconv.FormatFloat(uTxnsS, 'f', 10, 64),
-			strconv.FormatInt(int64(partQueries+partUpds), 10), strconv.FormatFloat(queryS+updS, 'f', 10, 64),
-			strconv.FormatInt(int64(partQTxns+partUTxns), 10), strconv.FormatFloat(qTxnsS+uTxnsS, 'f', 10, 64)}
-
-		if LATENCY_MODE == PER_BATCH {
-			qLatency, uLatency := float64(partQTime)/float64(partQTxns), float64(partUTime)/float64(partUTxns)
-			totalData[i] = append(totalData[i], strconv.FormatFloat(qLatency, 'f', 10, 64), strconv.FormatFloat(uLatency, 'f', 10, 64), strconv.FormatFloat(latency, 'f', 10, 64))
-			//fmt.Printf("Time, qTime, uTime, qTxns, uTxns, qLatency, uLatency: %d %d %d %d %d %f %f\n", totalTime, totalQTime, totalUTime, totalQTxns, totalUTxns, qLatency, uLatency)
-		} else if LATENCY_MODE == AVG_BATCH {
-			totalData[i] = append(totalData[i], strconv.FormatFloat(latency, 'f', 10, 64))
-		}
-		//All modes use AVG_OP
-		totalData[i] = append(totalData[i], strconv.FormatFloat(latencyPerOp, 'f', 10, 64))
-		//qLatency, uLatency = float64(partQTxns)/float64(partQTime), float64(partUTxns)/float64(partUTime)
-
-		partQueryCycles, partQueries, partReads, partTime, partUpds, partNews, partDels, partIndexes, partQTime, partQTxns, partUTime, partUTxns, partUBlocks = 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0
+		partQueries, partReads, partTime, partNews, partDels, partIndexes, partQTime, partQTxns, partUTime, partUTxns, partUBlocks = 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0
 	}
 
-	totalQueryTxns, totalUpds := totalQueries/nFuncs, totalNews+totalDels+totalIndexes
-	queryCycleS, queryS, updS = (float64(totalQueryTxns)/float64(totalTime))*1000, (float64(totalQueries)/float64(totalTime))*1000, (float64(totalUpds)/float64(totalTime))*1000
-	readS = (float64(totalReads) / float64(totalTime)) * 1000
-	qTxnsS, uTxnsS = (float64(totalQTxns)/float64(totalTime))*1000, (float64(totalUTxns)/float64(totalTime))*1000
-	uBlocksS = (float64(totalUBlocks) / float64(totalTime)) * 1000
-	latencyPerOp = float64(totalTime*int64(TEST_ROUTINES)) / float64(totalQueries+totalUpds)
-	latency = getStatsLatency(totalTime, totalQTime, totalUTime, totalQueries, totalUpds, totalQTxns, totalUTxns)
+	totalData[len(totalData)-1] = calculateMixStats(totalQueries, totalReads, totalQTxns, totalNews, totalDels, totalIndexes, totalUTxns, totalUBlocks,
+		totalTime, totalTime, totalQTime, totalUTime, !ONE_CLIENT_STATISTICS)
 
-	finalData := []string{strconv.FormatInt(totalTime, 10), strconv.FormatInt(totalTime, 10),
-		strconv.FormatInt(int64(totalQueryTxns), 10), strconv.FormatInt(int64(totalQueries), 10), strconv.FormatInt(int64(totalReads), 10),
-		strconv.FormatFloat(queryCycleS, 'f', 10, 64), strconv.FormatFloat(queryS, 'f', 10, 64),
-		strconv.FormatFloat(readS, 'f', 10, 64), strconv.FormatInt(int64(totalQTxns), 10), strconv.FormatFloat(qTxnsS, 'f', 10, 64),
-		strconv.FormatInt(int64(totalUpds), 10), strconv.FormatFloat(updS, 'f', 10, 64),
-		strconv.FormatInt(int64(totalNews), 10), strconv.FormatInt(int64(totalDels), 10), strconv.FormatInt(int64(totalIndexes), 10),
-		strconv.FormatInt(int64(totalUBlocks), 10), strconv.FormatFloat(uBlocksS, 'f', 10, 64),
-		strconv.FormatInt(int64(totalUTxns), 10), strconv.FormatFloat(uTxnsS, 'f', 10, 64),
-		strconv.FormatInt(int64(totalQueries+totalUpds), 10), strconv.FormatFloat(queryS+updS, 'f', 10, 64),
-		strconv.FormatInt(int64(totalQTxns+totalUTxns), 10), strconv.FormatFloat(qTxnsS+uTxnsS, 'f', 10, 64)}
-
-	if LATENCY_MODE == PER_BATCH {
-		qLatency, uLatency := float64(totalQTime)/float64(totalQTxns), float64(totalUTime)/float64(totalUTxns)
-		finalData = append(finalData, strconv.FormatFloat(qLatency, 'f', 10, 64), strconv.FormatFloat(uLatency, 'f', 10, 64), strconv.FormatFloat(latency, 'f', 10, 64))
-	} else if LATENCY_MODE == AVG_BATCH {
-		finalData = append(finalData, strconv.FormatFloat(latency, 'f', 10, 64))
-	}
-	//All modes use AVG_OP
-	finalData = append(finalData, strconv.FormatFloat(latencyPerOp, 'f', 10, 64))
-
-	totalData[len(totalData)-1] = finalData
-
-	file := getStatsFileToWrite("mixStats")
-	if file == nil {
-		return
-	}
-	defer file.Close()
-	writer := csv.NewWriter(file)
-	writer.Comma = ';'
-	defer writer.Flush()
-
-	writer.Write(header)
-	for _, line := range totalData {
-		writer.Write(line)
-	}
-	fmt.Println("Mix statistics saved successfully to " + file.Name())
+	writeDataToFile("mixStats", header, totalData)
+	sumQStats[len(sumQStats)-1] = QueryStats{nQueries: totalQueries, nReads: totalReads, timeSpent: totalTime, latency: totalQTime, nTxns: totalQTxns}
+	sumUStats[len(sumUStats)-1] = UpdateStats{nNews: totalNews, nDels: totalDels, nIndex: totalIndexes, latency: partUTime, nTxns: totalUTxns, nUpdBlocks: totalUBlocks}
+	writeMixAvgStatsFile(sumQStats, sumUStats, header)
 }
 
-func getStatsLatency(partTime, qTime, uTime int64, nQueries, nUpds, nQueryTxns, nUpdTxns int) float64 {
-	if LATENCY_MODE == AVG_OP {
-		return float64(partTime*int64(TEST_ROUTINES)) / float64(nQueries+nUpds)
+func writeMixRawStatsFile(totalQStats []QueryStats, totalUStats []UpdateStats, header []string) {
+	//Only writes the total of each client.
+	totalData := make([][]string, TEST_ROUTINES)
+
+	for i, qStat := range totalQStats {
+		uStat := totalUStats[i]
+		totalData[i] = calculateMixStats(qStat.nQueries, qStat.nReads, qStat.nTxns, uStat.nNews, uStat.nDels, uStat.nIndex,
+			uStat.nTxns, uStat.nUpdBlocks, qStat.timeSpent, qStat.timeSpent, qStat.latency, uStat.latency, ONE_CLIENT_STATISTICS)
+	}
+
+	writeDataToFile("raw/rawStats", header, totalData)
+}
+
+//The stats are an array of parts (i.e., each position is the sum of all clients)
+//Thus, we need to divide many totals by the number of clients
+func writeMixAvgStatsFile(sumQStats []QueryStats, sumUStats []UpdateStats, header []string) {
+	data := make([][]string, len(sumQStats)+1)
+
+	//Calculating the averages
+	for i, qStat := range sumQStats {
+		uStat := sumUStats[i]
+		qStat.nQueries /= TEST_ROUTINES
+		qStat.nReads /= TEST_ROUTINES
+		qStat.latency /= int64(TEST_ROUTINES)
+		qStat.nTxns /= TEST_ROUTINES
+		uStat.nNews /= TEST_ROUTINES
+		uStat.nDels /= TEST_ROUTINES
+		uStat.nIndex /= TEST_ROUTINES
+		uStat.latency /= int64(TEST_ROUTINES)
+		uStat.nTxns /= TEST_ROUTINES
+		uStat.nUpdBlocks /= TEST_ROUTINES
+		if i < len(sumQStats)-1 { //On the total (last one), we do not have to divide by TEST_ROUTINES on timeSpent.
+			qStat.timeSpent /= int64(TEST_ROUTINES)
+		}
+		sumQStats[i], sumUStats[i] = qStat, uStat
+	}
+
+	totalTime, pTime := int64(0), int64(0)
+
+	for i, qStat := range sumQStats {
+		uStat := sumUStats[i]
+		pTime = qStat.timeSpent
+		if i < len(sumQStats)-1 { //On the total (last one), no need to sum pTime
+			totalTime += pTime
+		}
+
+		data[i] = calculateMixStats(qStat.nQueries, qStat.nReads, qStat.nTxns, uStat.nNews, uStat.nDels, uStat.nIndex, uStat.nTxns, uStat.nUpdBlocks,
+			totalTime, pTime, qStat.latency, uStat.latency, ONE_CLIENT_STATISTICS)
+	}
+
+	//Note: the last position of sumQStats and sumUStats is already the total (thus it is already done in the cycle above)
+	writeDataToFile("avgStats", header, data)
+}
+
+//Writes min, max and mean.
+func writeMixExtraStatsFile(stats []MixClientResult, qStatsPerPart [][]QueryStats, uStatsPerPart [][]UpdateStats,
+	totalQClientStats []QueryStats, totalUClientStats []UpdateStats, header []string, statsType int) {
+	data := make([][]string, len(qStatsPerPart)+1) //space for final data as well
+
+	totalTime := int64(0)
+	for i, qPartStats := range qStatsPerPart {
+		uPartStats := uStatsPerPart[i]
+		posQ, posU := getPosOfStat(qPartStats, uPartStats, statsType)
+		qStat, uStat := qPartStats[posQ], uPartStats[posU]
+		totalTime += qStat.timeSpent
+
+		data[i] = calculateMixStats(qStat.nQueries, qStat.nReads, qStat.nTxns, uStat.nNews, uStat.nDels, uStat.nIndex, uStat.nTxns, uStat.nUpdBlocks,
+			totalTime, qStat.timeSpent, qStat.latency, uStat.latency, ONE_CLIENT_STATISTICS)
+	}
+
+	posQ, posU := getPosOfStat(totalQClientStats, totalUClientStats, statsType)
+	tQStats, tUStats := totalQClientStats[posQ], totalUClientStats[posU]
+
+	data[len(data)-1] = calculateMixStats(tQStats.nQueries, tQStats.nReads, tQStats.nTxns, tUStats.nNews, tUStats.nDels, tUStats.nIndex, tUStats.nTxns, tUStats.nUpdBlocks,
+		tQStats.timeSpent, tQStats.timeSpent, tQStats.latency, tUStats.latency, ONE_CLIENT_STATISTICS)
+
+	switch statsType {
+	case STAT_MIN:
+		writeDataToFile("minStats", header, data)
+	case STAT_MAX:
+		writeDataToFile("maxStats", header, data)
+	case STAT_MEAN:
+		writeDataToFile("meanStats", header, data)
+	}
+}
+
+func calculateMixStats(nQueries, nReads, nQTxns, nNews, nDels, nIndex, nUTxns, nUpdBlocks int, totalTime, partTime, qLatency, uLatency int64, isSingleClient bool) (data []string) {
+	queryCycles, nUpds := nQueries/len(queryFuncs), nNews+nDels+nIndex
+	nClients := int64(1)
+	if !isSingleClient {
+		nClients = int64(TEST_ROUTINES)
+	}
+
+	queryCycleS, queryS := (float64(queryCycles)/float64(partTime))*1000, (float64(nQueries)/float64(partTime))*1000
+	updS, readS := (float64(nUpds)/float64(partTime))*1000, (float64(nReads)/float64(partTime))*1000
+	qTxnsS, uTxnsS := (float64(nQTxns)/float64(partTime))*1000, (float64(nUTxns)/float64(partTime))*1000
+	uBlocksS := (float64(nUpdBlocks) / float64(partTime)) * 1000
+	latencyPerOp := float64(partTime*nClients) / float64(nQueries+nUpds)
+	latencyPerOpNoIndex := float64(partTime*nClients) / float64(nQueries+nNews+nDels)
+	latency := getStatsLatency(partTime, qLatency, uLatency, nClients, nQueries, nUpds, nQTxns, nUTxns)
+	updSNoIndex := (float64(nNews+nDels) / float64(partTime)) * 1000
+
+	data = []string{strconv.FormatInt(totalTime, 10), strconv.FormatInt(partTime, 10),
+		strconv.FormatInt(int64(queryCycles), 10), strconv.FormatInt(int64(nQueries), 10), strconv.FormatInt(int64(nReads), 10),
+		strconv.FormatFloat(queryCycleS, 'f', 10, 64), strconv.FormatFloat(queryS, 'f', 10, 64),
+		strconv.FormatFloat(readS, 'f', 10, 64), strconv.FormatInt(int64(nQTxns), 10), strconv.FormatFloat(qTxnsS, 'f', 10, 64),
+		strconv.FormatInt(int64(nUpds), 10), strconv.FormatFloat(updS, 'f', 10, 64),
+		strconv.FormatInt(int64(nNews), 10), strconv.FormatInt(int64(nDels), 10), strconv.FormatInt(int64(nIndex), 10),
+		strconv.FormatInt(int64(nUpdBlocks), 10), strconv.FormatFloat(uBlocksS, 'f', 10, 64),
+		strconv.FormatInt(int64(nNews+nDels), 10), strconv.FormatFloat(updSNoIndex, 'f', 10, 64),
+		strconv.FormatInt(int64(nUTxns), 10), strconv.FormatFloat(uTxnsS, 'f', 10, 64),
+		strconv.FormatInt(int64(nQueries+nUpds), 10), strconv.FormatFloat(queryS+updS, 'f', 10, 64),
+		strconv.FormatInt(int64(nQueries+nNews+nDels), 10), strconv.FormatFloat(queryS+updSNoIndex, 'f', 10, 64),
+		strconv.FormatInt(int64(nQTxns+nUTxns), 10), strconv.FormatFloat(qTxnsS+uTxnsS, 'f', 10, 64)}
+
+	if LATENCY_MODE == PER_BATCH {
+		qLatency, uLatency := float64(qLatency)/float64(nQTxns), float64(uLatency)/float64(nUTxns)
+		data = append(data, strconv.FormatFloat(qLatency, 'f', 10, 64), strconv.FormatFloat(uLatency, 'f', 10, 64), strconv.FormatFloat(latency, 'f', 10, 64))
+		//fmt.Printf("Time, qTime, uTime, qTxns, uTxns, qLatency, uLatency: %d %d %d %d %d %f %f\n", totalTime, totalQTime, totalUTime, totalQTxns, totalUTxns, qLatency, uLatency)
 	} else if LATENCY_MODE == AVG_BATCH {
-		return float64(partTime*int64(TEST_ROUTINES)) / float64(nQueryTxns+nUpdTxns)
+		data = append(data, strconv.FormatFloat(latency, 'f', 10, 64))
+	}
+	//All modes use AVG_OP
+	data = append(data, strconv.FormatFloat(latencyPerOp, 'f', 10, 64), strconv.FormatFloat(latencyPerOpNoIndex, 'f', 10, 64))
+
+	return
+}
+
+//For min/max/mean/avg situations, nClient must be 1.
+func getStatsLatency(partTime, qTime, uTime, nClients int64, nQueries, nUpds, nQueryTxns, nUpdTxns int) float64 {
+	if LATENCY_MODE == AVG_OP {
+		return float64(partTime*nClients) / float64(nQueries+nUpds)
+	} else if LATENCY_MODE == AVG_BATCH {
+		return float64(partTime*nClients) / float64(nQueryTxns+nUpdTxns)
 	}
 	return float64(qTime+uTime) / float64(nQueryTxns+nUpdTxns)
 }
@@ -2419,6 +2606,37 @@ func convertMixStats(stats []MixClientResult) (qStats [][]QueryStats, uStats [][
 	}
 
 	return
+}
+
+//Stats of a time for all clients, sorted from the client with minimum latency to the maximum latency (increasing order)
+func getPosOfStat(qStats []QueryStats, uStats []UpdateStats, statsType int) (qPos, uPos int) {
+	qPos, uPos = 0, 0
+	switch statsType {
+	case STAT_MIN:
+		return 0, 0
+	case STAT_MAX:
+		return len(qStats) - 1, len(qStats) - 1
+	case STAT_MEAN:
+		return len(qStats) / 2, len(qStats) / 2
+	}
+	return
+}
+
+func writeDataToFile(filename string, header []string, data [][]string) {
+	file := getStatsFileToWrite(filename)
+	if file == nil {
+		return
+	}
+	defer file.Close()
+	writer := csv.NewWriter(file)
+	writer.Comma = ';'
+	defer writer.Flush()
+
+	writer.Write(header)
+	for _, line := range data {
+		writer.Write(line)
+	}
+	fmt.Println("Mix statistics saved successfully to " + file.Name())
 }
 
 //TODO: If everything works fine, delete this code
