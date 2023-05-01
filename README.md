@@ -3,8 +3,8 @@
 A client for PotionDB that implements [TPC-H's](https://www.tpc.org/tpch/) benchmark.
 It is assumed the reader is somewhat familiar with [TPC-H's specification](https://www.tpc.org/tpc_documents_current_versions/current_specifications5.asp).
 
-For VLDB reviewers, please use the Docker image provided at andrerj/tpchclient:vldb.
-If building from source is a must, please stick to the main branch, which will remain stable (code-wise) for the time being.
+For VLDB reviewers, please use the Docker image provided at `andrerj/tpchclient:vldb`.
+If building from source is a must, consider changing to the *vldb* branch: the main branch will remain stable (code-wise) during the review process, but may be updated later on.
 
 ## Features
 
