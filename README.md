@@ -3,7 +3,7 @@
 A client for PotionDB that implements [TPC-H's](https://www.tpc.org/tpch/) benchmark.
 It is assumed the reader is somewhat familiar with [TPC-H's specification](https://www.tpc.org/tpc_documents_current_versions/current_specifications5.asp).
 
-For VLDB reviewers, please use the Docker image provided at `andrerj/tpchclient:vldb`.
+For Eurosys reviewers, please use the Docker image provided at `andrerj/tpchclient:vldb`.
 If building from source is a must, consider changing to the *vldb* branch: the main branch will remain stable (code-wise) during the review process, but may be updated later on.
 
 ## Features
@@ -25,7 +25,7 @@ This can be summarized into the following tasks:
 2. (Optionally) Modify the dataset to give locality to the data (For the motivation and explanation on this, please check [here])(https://github.com/AndreRijo/TPCH-LocalityTool).
 3. Preparing PotionDB's setup: executing 5 instances of PotionDB (one for each inhabited continent in the world) and configuring partial replication.
 
-Note: For VLDB reviewers, step 2 is obligatory in order to reproduce the results reported in the paper.
+Note: For Eurosys reviewers, step 2 is obligatory in order to reproduce the results reported in the paper.
 
 ### TPC-H tool and dataset generation
 
@@ -93,7 +93,7 @@ Make sure to start those 5 instances before attempting to start the client and w
 PotionDB started at port 8087 with ReplicaID 23781
 ```
 
-Make sure to use the Docker image provided at andrerj/potiondb (for VLDB reviewers, andrerj/potiondb:vldb).
+Make sure to use the Docker image provided at andrerj/potiondb (for Eurosys reviewers, andrerj/potiondb:vldb).
 If for some reason you do not want to do so, please check on [PotionDB's github page](https://github.com/AndreRijo/potionDB/tree/remoteOp) for other options which may fit you.
 
 ## PotionDB's TPC-H Client setup
