@@ -2,8 +2,9 @@ package client
 
 import (
 	"fmt"
-	"potionDB/src/antidote"
-	"potionDB/src/proto"
+	"potionDB/crdt/crdt"
+	"potionDB/crdt/proto"
+	antidote "potionDB/potionDB/components"
 )
 
 //The purpose of this file is to expose the internals of the tpch package to autoindex.
@@ -29,7 +30,7 @@ func (tpch AutoIndexTPCH) PrepareCommunications() {
 	}
 }
 
-func (tpch AutoIndexTPCH) DoGet(readParams []antidote.ReadObjectParams) *proto.ApbReadObjectResp {
+func (tpch AutoIndexTPCH) DoGet(readParams []crdt.ReadObjectParams) *proto.ApbReadObjectResp {
 	if !CONNECTIONLESS {
 		antidote.SendProto(antidote.StaticReadObjs, antidote.CreateStaticReadObjs(nil, readParams), conns[0])
 		_, tmpProto, _ := antidote.ReceiveProto(conns[0])
@@ -38,7 +39,7 @@ func (tpch AutoIndexTPCH) DoGet(readParams []antidote.ReadObjectParams) *proto.A
 	return nil
 }
 
-func (tpch AutoIndexTPCH) DoUpdate(updParams []antidote.UpdateObjectParams) {
+func (tpch AutoIndexTPCH) DoUpdate(updParams []crdt.UpdateObjectParams) {
 	if !CONNECTIONLESS {
 		antidote.SendProto(antidote.StaticUpdateObjs, antidote.CreateStaticUpdateObjs(nil, updParams), conns[0])
 		antidote.ReceiveProto(conns[0])

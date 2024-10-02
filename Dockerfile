@@ -1,5 +1,5 @@
 # Debian image with go installed and configured at /go
-FROM golang
+FROM golang:1.20.4 as base
 
 # Dependencies
 #RUN go get github.com/golang/protobuf/proto; \
@@ -7,24 +7,34 @@ FROM golang
 	#go get github.com/streadway/amqp
 
 # Adding src and building
-COPY potionDB/go.mod potionDB/go.sum /go/potionDB/
+COPY potionDB/potionDB/go.mod potionDB/potionDB/go.sum /go/potionDB/potionDB/
+COPY potionDB/crdt/go.mod potionDB/crdt/go.sum /go/potionDB/crdt/
+COPY potionDB/shared/go.mod /go/potionDB/shared/
+COPY tpch_data_processor/go.mod tpch_data_processor/go.sum /go/tpch_data_processor/
+COPY sqlToKeyValue/go.mod sqlToKeyValue/go.sum /go/sqlToKeyValue/
+COPY goTools/go.mod goTools/go.sum /go/goTools/
 COPY tpch_client/go.mod tpch_client/go.sum /go/tpch_client/
-#COPY tpch_data/go.mod /go/tpch_data/
 RUN cd tpch_client && go mod download
 
-COPY potionDB/src/clocksi /go/potionDB/src/clocksi
-COPY potionDB/src/tools /go/potionDB/src/tools
-COPY potionDB/src/crdt /go/potionDB/src/crdt
-COPY potionDB/src/proto /go/potionDB/src/proto
-COPY potionDB/src/antidote /go/potionDB/src/antidote
-COPY potionDB/src/shared /go/potionDB/src/shared
-COPY potionDB/tpch_helper /go/potionDB/tpch_helper
-#COPY tpch_data/tpch /go/tpch_data/tpch
-COPY tpch_client/src /go/tpch_client/src
-COPY tpch_client/dockerstuff /go/tpch_client/
-RUN cd tpch_client/src/main && go build
+COPY potionDB/potionDB /go/potionDB/potionDB
+COPY potionDB/crdt /go/potionDB/crdt
+COPY potionDB/shared /go/potionDB/shared
+
+COPY tpch_data_processor/ /go/tpch_data_processor/
+COPY sqlToKeyValue/ /go/sqlToKeyValue/
+COPY goTools/ /go/goTools/
+
+COPY tpch_client/dockerstuff tpch_client/
+COPY tpch_client/src tpch_client/src
+
+RUN cd tpch_client/src/main && go build && cd /go && rm -r bin goTools pkg potionDB tpch_data_processor sqlToKeyValue tpch_client/src/autoindex tpch_client/src/client
 #RUN go install main
 
+#Final image
+FROM golang:1.20.4
+
+#Copy needed files from base image
+COPY --from=base /go/tpch_client /go/tpch_client
 
 #Bench args
 #Arguments

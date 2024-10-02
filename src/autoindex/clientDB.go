@@ -7,9 +7,9 @@ package autoindex
 
 import (
 	"fmt"
-	"potionDB/src/antidote"
-	"potionDB/src/crdt"
-	"potionDB/src/proto"
+	"potionDB/crdt/crdt"
+	"potionDB/crdt/proto"
+	antidote "potionDB/potionDB/components"
 	"strings"
 )
 
@@ -19,18 +19,18 @@ func InitializeClientDB() ClientDB {
 	return ClientDB{TriggerDB: antidote.InitializeTriggerDB()}
 }
 
-func (db ClientDB) getKeyParams(key, bucket, crdtType string) antidote.KeyParams {
-	return antidote.KeyParams{Key: key, Bucket: bucket, CrdtType: db.stringTypeToCrdtType(crdtType)}
+func (db ClientDB) getKeyParams(key, bucket, crdtType string) crdt.KeyParams {
+	return crdt.KeyParams{Key: key, Bucket: bucket, CrdtType: db.stringTypeToCrdtType(crdtType)}
 }
 
 func (db ClientDB) stringTypeToCrdtType(crdtType string) proto.CRDTType {
 	return proto.CRDTType(proto.CRDTType_value[strings.ToUpper(crdtType)])
 }
 
-//For each link, prepares the respective update
-func (db ClientDB) prepareLinks(params antidote.UpdateObjectParams) []antidote.UpdateObjectParams {
+// For each link, prepares the respective update
+func (db ClientDB) prepareLinks(params crdt.UpdateObjectParams) []crdt.UpdateObjectParams {
 	keyParams := params.KeyParams
-	genericUpds := make([]antidote.UpdateObjectParams, antidote.DEFAULT_GENERIC_SIZE)
+	genericUpds := make([]crdt.UpdateObjectParams, antidote.DEFAULT_GENERIC_SIZE)
 	i := 0
 	//Checks generic first
 	for matchKeyP, links := range db.GenericMapping {
@@ -48,14 +48,14 @@ func (db ClientDB) prepareLinks(params antidote.UpdateObjectParams) []antidote.U
 	genericUpds = genericUpds[:i]
 
 	links := db.Mapping[keyParams]
-	upds := make([]antidote.UpdateObjectParams, len(links)+1+i) //space for params as well
+	upds := make([]crdt.UpdateObjectParams, len(links)+1+i) //space for params as well
 
 	for _, link := range links {
 		fmt.Println("[PREPARE_LINKS]Processing link: ", link)
 		if db.opTypeMatches(link.Trigger.OpType, params.UpdateArgs) {
 			fmt.Println("[PREPARE_LINKS]Match.")
 			fmt.Printf("[PREPARE_LINKS]Trigger opType %d, Op %v, Target opType %d.\n", link.Trigger.OpType,
-				*params.UpdateArgs, link.Target.OpType)
+				params.UpdateArgs, link.Target.OpType)
 			upds[i] = db.generateUpdate(link, params)
 			i++
 		}
@@ -66,8 +66,8 @@ func (db ClientDB) prepareLinks(params antidote.UpdateObjectParams) []antidote.U
 	return upds[:i]
 }
 
-func (db ClientDB) opTypeMatches(triggerType antidote.OpType, updArgs *crdt.UpdateArguments) (matches bool) {
-	switch (*updArgs).(type) {
+func (db ClientDB) opTypeMatches(triggerType antidote.OpType, updArgs crdt.UpdateArguments) (matches bool) {
+	switch (updArgs).(type) {
 	case crdt.Increment:
 		return triggerType == antidote.INC
 	case crdt.Decrement:
@@ -99,8 +99,8 @@ func (db ClientDB) opTypeMatches(triggerType antidote.OpType, updArgs *crdt.Upda
 	return false
 }
 
-func (db ClientDB) generateUpdate(updInfo antidote.AutoUpdate, params antidote.UpdateObjectParams) antidote.UpdateObjectParams {
-	updArgs := *params.UpdateArgs
+func (db ClientDB) generateUpdate(updInfo antidote.AutoUpdate, params crdt.UpdateObjectParams) crdt.UpdateObjectParams {
+	updArgs := params.UpdateArgs
 	varsNames := updInfo.Trigger.Arguments
 
 	varsValues := make(map[string]interface{}, len(updInfo.Target.Arguments))
@@ -195,7 +195,7 @@ func (db ClientDB) generateUpdate(updInfo antidote.AutoUpdate, params antidote.U
 	}
 
 	fmt.Println("Generated op:", generatedUpd)
-	return antidote.UpdateObjectParams{KeyParams: updInfo.Target.KeyParams, UpdateArgs: &generatedUpd}
+	return crdt.UpdateObjectParams{KeyParams: updInfo.Target.KeyParams, UpdateArgs: generatedUpd}
 }
 
 func (db ClientDB) getInt32ForArg(toReplace interface{}, varsValues map[string]interface{}) int32 {

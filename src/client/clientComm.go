@@ -5,15 +5,16 @@ import (
 	"fmt"
 	"net"
 	"os"
-	"potionDB/src/antidote"
-	"potionDB/src/proto"
+	"potionDB/crdt/proto"
+	antidote "potionDB/potionDB/components"
 	"runtime"
 	"strconv"
 	"strings"
 	"sync/atomic"
 	"time"
 
-	pb "github.com/golang/protobuf/proto"
+	//pb "github.com/golang/protobuf/proto"
+	pb "google.golang.org/protobuf/proto"
 )
 
 //Handles client communication for initial data loading and updates.
@@ -61,7 +62,7 @@ var (
 	NOTIFY_ADDRESS                     string
 )
 
-//Keeps trying to estabilish a connection until it succeeds.
+// Keeps trying to estabilish a connection until it succeeds.
 func ConnectAndRetry(ip string) (conn net.Conn) {
 	var err error
 	for {
@@ -234,8 +235,8 @@ func handleIndexComm(connIndex int) {
 	//printExecutionTimes()
 }
 
-//Note: Assumes updatesComm and serverComm aren't running at the same time!
-//It's safe to run updates after data ends though.
+// Note: Assumes updatesComm and serverComm aren't running at the same time!
+// It's safe to run updates after data ends though.
 func handleUpdatesComm(connIndex int) {
 	fmt.Println("Started updates comm for", connIndex)
 	conn := conns[connIndex]

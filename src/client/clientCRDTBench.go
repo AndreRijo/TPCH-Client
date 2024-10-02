@@ -3,20 +3,22 @@ package client
 import (
 	"encoding/csv"
 	"fmt"
+	"gotools/src/tools"
 	"math"
 	"math/rand"
 	"net"
 	"os"
-	"potionDB/src/antidote"
-	"potionDB/src/crdt"
-	"potionDB/src/proto"
-	"potionDB/src/tools"
+	"potionDB/crdt/crdt"
+	"potionDB/crdt/proto"
+	antidote "potionDB/potionDB/components"
+	"potionDB/potionDB/utilities"
 	"runtime"
 	"strconv"
 	"strings"
 	"time"
 
-	pb "github.com/golang/protobuf/proto"
+	//pb "github.com/golang/protobuf/proto"
+	pb "google.golang.org/protobuf/proto"
 )
 
 /*
@@ -261,10 +263,10 @@ func printConfigs(bc BenchClient) {
 	fmt.Printf("COUNTER INFO: {minChange: %d, maxChange: %d, diff: %d}\n", baseCounterInfo.minChange, baseCounterInfo.maxChange, baseCounterInfo.diff)
 	fmt.Printf("AVG INFO: {maxSum: %d, maxNAdds: %d}\n", baseAvgInfo.maxSum, baseAvgInfo.maxNAdds)
 	fmt.Printf("REGISTER INFO: {diffEntries: %d}\n", baseRegisterInfo.nDiffEntries)
-	fmt.Printf("Query fun name: %s, Update fun name: %s\n", tools.GetFunctionName(bc.queryFun), tools.GetFunctionName(bc.updateFun))
+	fmt.Printf("Query fun name: %s, Update fun name: %s\n", utilities.GetFunctionName(bc.queryFun), utilities.GetFunctionName(bc.updateFun))
 	fmt.Print("Query funs names: [")
 	for _, fun := range bc.queryFuns {
-		fmt.Print(tools.GetFunctionName(fun) + ", ")
+		fmt.Print(utilities.GetFunctionName(fun) + ", ")
 	}
 	fmt.Println("]")
 	fmt.Printf("Query odds: %v\n", bc.queryOdds)
@@ -361,10 +363,10 @@ type AvgInfo struct {
 }
 */
 
-//TODO: Could still use a copyClient function that avoids having to resort the query and update functions.
+// TODO: Could still use a copyClient function that avoids having to resort the query and update functions.
 func makeClient(server string, seed int64, nClient int) (baseClient BenchClient) {
 	//conn, err := net.Dial("tcp", server)
-	//tools.CheckErr("Network connection establishment err", err)
+	//utilities.CheckErr("Network connection establishment err", err)
 	conn := ConnectAndRetry(server)
 
 	baseClient = BenchClient{
@@ -505,11 +507,11 @@ func (bc BenchClient) benchMix() {
 
 func (bc BenchClient) testCounter() {
 	nReads, lastStatReads, lastStatTime, allStats := 0, 0, time.Now().UnixNano()/1000000, make([]BenchStats, 0, TEST_DURATION/int64(statisticsInterval)+1)
-	readsPerTxn, toSend := OPS_PER_TXN, make([]antidote.ReadObjectParams, OPS_PER_TXN)
+	readsPerTxn, toSend := OPS_PER_TXN, make([]crdt.ReadObjectParams, OPS_PER_TXN)
 	keysUsed := ""
 	for i := range toSend {
-		//toSend[i] = antidote.ReadObjectParams{KeyParams: getKeyParams(strconv.Itoa(bc.clientID), proto.CRDTType_COUNTER), ReadArgs: crdt.StateReadArguments{}}
-		toSend[i] = antidote.ReadObjectParams{KeyParams: getKeyParams(strconv.Itoa(bc.rng.Intn(BENCH_N_KEYS)), proto.CRDTType_COUNTER), ReadArgs: crdt.StateReadArguments{}}
+		//toSend[i] = crdt.ReadObjectParams{KeyParams: getKeyParams(strconv.Itoa(bc.clientID), proto.CRDTType_COUNTER), ReadArgs: crdt.StateReadArguments{}}
+		toSend[i] = crdt.ReadObjectParams{KeyParams: getKeyParams(strconv.Itoa(bc.rng.Intn(BENCH_N_KEYS)), proto.CRDTType_COUNTER), ReadArgs: crdt.StateReadArguments{}}
 		keysUsed += toSend[i].KeyParams.Key + ";"
 	}
 	fmt.Printf("[CCB]Client %d using keys %s. Number of operations per txn: %d\n", bc.clientID, keysUsed, len(toSend))
@@ -527,10 +529,10 @@ func (bc BenchClient) testCounter() {
 
 func (bc BenchClient) testTopK() {
 	nReads, lastStatReads, lastStatTime, allStats := 0, 0, time.Now().UnixNano()/1000000, make([]BenchStats, 0, TEST_DURATION/int64(statisticsInterval)+1)
-	readsPerTxn, toSend := OPS_PER_TXN, make([]antidote.ReadObjectParams, OPS_PER_TXN)
+	readsPerTxn, toSend := OPS_PER_TXN, make([]crdt.ReadObjectParams, OPS_PER_TXN)
 	keysUsed := ""
 	for i := range toSend {
-		toSend[i] = antidote.ReadObjectParams{KeyParams: getKeyParams(bc.keys[bc.rng.Intn(BENCH_N_KEYS)], proto.CRDTType_TOPK_RMV), ReadArgs: crdt.GetTopNArguments{NumberEntries: 1}}
+		toSend[i] = crdt.ReadObjectParams{KeyParams: getKeyParams(bc.keys[bc.rng.Intn(BENCH_N_KEYS)], proto.CRDTType_TOPK_RMV), ReadArgs: crdt.GetTopNArguments{NumberEntries: 1}}
 		keysUsed += toSend[i].KeyParams.Key + ";"
 	}
 	fmt.Printf("[CCB]Client %d using keys %s. Number of operations per txn: %d\n", bc.clientID, keysUsed, len(toSend))
@@ -676,7 +678,7 @@ func (bc BenchClient) updateMixStats(stats []BenchStats, nReads, nUpds, lastStat
 
 ///////////queryFun()////////////////
 
-//Generalist query method.
+// Generalist query method.
 func (bc BenchClient) customQuery() (readArgs crdt.ReadArguments) {
 	rnd := bc.rng.Float64()
 	for i, odd := range bc.queryOdds {
@@ -867,7 +869,7 @@ func topSumQueryNameToFun(queryName string, client *BenchClient) func() crdt.Rea
 ///////////preloader funcs//////////////
 
 func preload(bc BenchClient, keys []string) {
-	var upds []antidote.UpdateObjectParams
+	var upds []crdt.UpdateObjectParams
 	switch bc.crdtType {
 	case proto.CRDTType_ORSET:
 		upds = preloadSet(keys, bc.SetInfo)
@@ -891,41 +893,41 @@ func preload(bc BenchClient, keys []string) {
 	upds = nil
 }
 
-func preloadCounter(keys []string, counterInfo CounterInfo) (updParams []antidote.UpdateObjectParams) {
-	updParams = make([]antidote.UpdateObjectParams, len(keys))
+func preloadCounter(keys []string, counterInfo CounterInfo) (updParams []crdt.UpdateObjectParams) {
+	updParams = make([]crdt.UpdateObjectParams, len(keys))
 	for i, key := range keys {
 		var upd crdt.UpdateArguments = crdt.Increment{Change: 5}
-		updParams[i] = antidote.UpdateObjectParams{KeyParams: getKeyParams(key, proto.CRDTType_COUNTER), UpdateArgs: &upd}
+		updParams[i] = crdt.UpdateObjectParams{KeyParams: getKeyParams(key, proto.CRDTType_COUNTER), UpdateArgs: upd}
 	}
 	return
 }
 
-func preloadAvg(keys []string, counterInfo AvgInfo) (updParams []antidote.UpdateObjectParams) {
-	updParams = make([]antidote.UpdateObjectParams, len(keys))
+func preloadAvg(keys []string, counterInfo AvgInfo) (updParams []crdt.UpdateObjectParams) {
+	updParams = make([]crdt.UpdateObjectParams, len(keys))
 	for i, key := range keys {
 		var upd crdt.UpdateArguments = crdt.AddValue{Value: 5}
-		updParams[i] = antidote.UpdateObjectParams{KeyParams: getKeyParams(key, proto.CRDTType_AVG), UpdateArgs: &upd}
+		updParams[i] = crdt.UpdateObjectParams{KeyParams: getKeyParams(key, proto.CRDTType_AVG), UpdateArgs: upd}
 	}
 	return
 }
 
-func preloadSet(keys []string, setInfo SetInfo) (updParams []antidote.UpdateObjectParams) {
+func preloadSet(keys []string, setInfo SetInfo) (updParams []crdt.UpdateObjectParams) {
 	setElems := make([]crdt.Element, len(setInfo.elems)/2)
 	//Fill with every position that is not odd
 	for i, j := 0, 0; i < len(setInfo.elems) && j < len(setElems); i, j = i+2, j+1 {
 		setElems[j] = crdt.Element(setInfo.elems[i])
 	}
 	var upd crdt.UpdateArguments = crdt.AddAll{Elems: setElems}
-	updParams = make([]antidote.UpdateObjectParams, len(keys))
+	updParams = make([]crdt.UpdateObjectParams, len(keys))
 	for i, key := range keys {
-		updParams[i] = antidote.UpdateObjectParams{KeyParams: getKeyParams(key, proto.CRDTType_ORSET), UpdateArgs: &upd}
+		updParams[i] = crdt.UpdateObjectParams{KeyParams: getKeyParams(key, proto.CRDTType_ORSET), UpdateArgs: upd}
 	}
 	return
 }
 
-func preloadTopK(keys []string, topKInfo TopKInfo) (updParams []antidote.UpdateObjectParams) {
+func preloadTopK(keys []string, topKInfo TopKInfo) (updParams []crdt.UpdateObjectParams) {
 	rng := rand.New(rand.NewSource(time.Now().UnixNano()))
-	updParams = make([]antidote.UpdateObjectParams, len(keys))
+	updParams = make([]crdt.UpdateObjectParams, len(keys))
 	i := 0
 	for _, key := range keys {
 		keyParam := getKeyParams(key, proto.CRDTType_TOPK_RMV)
@@ -934,18 +936,18 @@ func preloadTopK(keys []string, topKInfo TopKInfo) (updParams []antidote.UpdateO
 			adds[j] = crdt.TopKScore{Id: k, Score: rng.Int31n(topKInfo.maxScore)}
 		}
 		var currUpd crdt.UpdateArguments = crdt.TopKAddAll{Scores: adds}
-		updParams[i] = antidote.UpdateObjectParams{KeyParams: keyParam, UpdateArgs: &currUpd}
+		updParams[i] = crdt.UpdateObjectParams{KeyParams: keyParam, UpdateArgs: currUpd}
 		i++
 	}
 	for _, updP := range updParams {
-		fmt.Printf("[CCB]UpdParam: %+v %+v\n", updP.KeyParams, *updP.UpdateArgs)
+		fmt.Printf("[CCB]UpdParam: %+v %+v\n", updP.KeyParams, updP.UpdateArgs)
 	}
 	return
 }
 
-func preloadTopSum(keys []string, topSumInfo TopSInfo) (updParams []antidote.UpdateObjectParams) {
+func preloadTopSum(keys []string, topSumInfo TopSInfo) (updParams []crdt.UpdateObjectParams) {
 	rng := rand.New(rand.NewSource(time.Now().UnixNano()))
-	updParams = make([]antidote.UpdateObjectParams, len(keys))
+	updParams = make([]crdt.UpdateObjectParams, len(keys))
 	i := 0
 	for _, key := range keys {
 		keyParam := getKeyParams(key, proto.CRDTType_TOPSUM)
@@ -954,11 +956,11 @@ func preloadTopSum(keys []string, topSumInfo TopSInfo) (updParams []antidote.Upd
 			adds[j] = crdt.TopKScore{Id: k, Score: rng.Int31n(topSumInfo.maxScoreS)}
 		}
 		var currUpd crdt.UpdateArguments = crdt.TopSAddAll{Scores: adds}
-		updParams[i] = antidote.UpdateObjectParams{KeyParams: keyParam, UpdateArgs: &currUpd}
+		updParams[i] = crdt.UpdateObjectParams{KeyParams: keyParam, UpdateArgs: currUpd}
 		i++
 	}
 	for _, updP := range updParams {
-		fmt.Printf("[CCB]UpdParam: %+v %+v\n", updP.KeyParams, *updP.UpdateArgs)
+		fmt.Printf("[CCB]UpdParam: %+v %+v\n", updP.KeyParams, updP.UpdateArgs)
 	}
 	return
 }
@@ -1197,16 +1199,16 @@ func (bc BenchClient) getKey() string {
 	return bc.key
 }
 
-func getKeyParams(key string, crdtType proto.CRDTType) antidote.KeyParams {
-	return antidote.KeyParams{Key: key, Bucket: BUCKET, CrdtType: crdtType}
+func getKeyParams(key string, crdtType proto.CRDTType) crdt.KeyParams {
+	return crdt.KeyParams{Key: key, Bucket: BUCKET, CrdtType: crdtType}
 }
 
 func (bc BenchClient) sendQuery(read crdt.ReadArguments) {
 	if read == FULL_READ_ARGS {
-		toSend := []antidote.ReadObjectParams{antidote.ReadObjectParams{KeyParams: getKeyParams(bc.getKey(), bc.crdtType)}}
+		toSend := []crdt.ReadObjectParams{{KeyParams: getKeyParams(bc.getKey(), bc.crdtType)}}
 		antidote.SendProto(antidote.StaticReadObjs, antidote.CreateStaticReadObjs(nil, toSend), bc.conn)
 	} else {
-		toSend := []antidote.ReadObjectParams{antidote.ReadObjectParams{KeyParams: getKeyParams(bc.getKey(), bc.crdtType), ReadArgs: read}}
+		toSend := []crdt.ReadObjectParams{{KeyParams: getKeyParams(bc.getKey(), bc.crdtType), ReadArgs: read}}
 		antidote.SendProto(antidote.StaticRead, antidote.CreateStaticRead(nil, nil, toSend), bc.conn)
 	}
 	*bc.waitFor++
@@ -1216,14 +1218,14 @@ func (bc BenchClient) sendQuery(read crdt.ReadArguments) {
 }
 
 func (bc BenchClient) sendQueries(reads []crdt.ReadArguments) {
-	toSend := make([]antidote.ReadObjectParams, len(reads))
+	toSend := make([]crdt.ReadObjectParams, len(reads))
 	//keyParams := getKeyParams(bc.getKey(), bc.crdtType)
 	for i, read := range reads {
 		keyParams := getKeyParams(bc.getKey(), bc.crdtType)
 		if read == FULL_READ_ARGS {
-			toSend[i] = antidote.ReadObjectParams{KeyParams: keyParams, ReadArgs: crdt.StateReadArguments{}}
+			toSend[i] = crdt.ReadObjectParams{KeyParams: keyParams, ReadArgs: crdt.StateReadArguments{}}
 		} else {
-			toSend[i] = antidote.ReadObjectParams{KeyParams: keyParams, ReadArgs: read}
+			toSend[i] = crdt.ReadObjectParams{KeyParams: keyParams, ReadArgs: read}
 		}
 	}
 	antidote.SendProto(antidote.StaticRead, antidote.CreateStaticRead(nil, nil, toSend), bc.conn)
@@ -1234,7 +1236,7 @@ func (bc BenchClient) sendQueries(reads []crdt.ReadArguments) {
 }
 
 func (bc BenchClient) sendUpdate(upd crdt.UpdateArguments) {
-	toSend := []antidote.UpdateObjectParams{antidote.UpdateObjectParams{KeyParams: getKeyParams(bc.getKey(), bc.crdtType), UpdateArgs: &upd}}
+	toSend := []crdt.UpdateObjectParams{{KeyParams: getKeyParams(bc.getKey(), bc.crdtType), UpdateArgs: upd}}
 	antidote.SendProto(antidote.StaticUpdateObjs, antidote.CreateStaticUpdateObjs(nil, toSend), bc.conn)
 	*bc.waitFor++
 	if *bc.waitFor >= bc.maxWaitFor {
@@ -1243,9 +1245,9 @@ func (bc BenchClient) sendUpdate(upd crdt.UpdateArguments) {
 }
 
 func (bc BenchClient) sendUpdates(upds []crdt.UpdateArguments) {
-	toSend, keyParams := make([]antidote.UpdateObjectParams, len(upds)), getKeyParams(bc.getKey(), bc.crdtType)
+	toSend, keyParams := make([]crdt.UpdateObjectParams, len(upds)), getKeyParams(bc.getKey(), bc.crdtType)
 	for i, upd := range upds {
-		toSend[i] = antidote.UpdateObjectParams{KeyParams: keyParams, UpdateArgs: &upd}
+		toSend[i] = crdt.UpdateObjectParams{KeyParams: keyParams, UpdateArgs: upd}
 	}
 	antidote.SendProto(antidote.StaticUpdateObjs, antidote.CreateStaticUpdateObjs(nil, toSend), bc.conn)
 	*bc.waitFor++
@@ -1360,7 +1362,7 @@ func writeBenchStatsFile(stats [][]BenchStats, crdtType proto.CRDTType) {
 	defer writer.Flush()
 
 	writer.Write(header)
-	for _, line := range totalData[:len(totalData)] {
+	for _, line := range totalData {
 		writer.Write(line)
 	}
 

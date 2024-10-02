@@ -1,14 +1,14 @@
 package main
 
 import (
-	"potionDB/src/antidote"
-	"potionDB/src/crdt"
+	"potionDB/potionDB/components"
+	"potionDB/crdt/crdt"
 	"fmt"
 	rand "math/rand"
 	"net"
 	"os"
 	"os/signal"
-	"potionDB/src/proto"
+	"potionDB/crdt/proto"
 	"runtime"
 	"runtime/debug"
 	"runtime/pprof"
@@ -17,7 +17,7 @@ import (
 	"strings"
 	"syscall"
 	"time"
-	"potionDB/src/tools"
+	"potionDB/potionDB/tools"
 	"tpchTools"
 
 	pb "github.com/golang/protobuf/proto"

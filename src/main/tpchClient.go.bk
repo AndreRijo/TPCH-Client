@@ -1,8 +1,8 @@
 package main
 
 import (
-	"potionDB/src/antidote"
-	"potionDB/src/crdt"
+	"potionDB/potionDB/components"
+	"potionDB/crdt/crdt"
 	"fmt"
 	rand "math/rand"
 	"net"
@@ -10,7 +10,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
-	"potionDB/src/tools"
+	"potionDB/potionDB/tools"
 	"tpchTools"
 
 	"github.com/golang/protobuf/proto"

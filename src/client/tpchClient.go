@@ -3,14 +3,15 @@ package client
 import (
 	"flag"
 	"fmt"
+	"gotools/src/tools"
 	"math/rand"
 	"net"
 	"os"
 	"os/signal"
-	"potionDB/src/antidote"
-	"potionDB/src/proto"
-	"potionDB/src/tools"
-	tpch "potionDB/tpch_helper"
+	"potionDB/crdt/crdt"
+	"potionDB/crdt/proto"
+	antidote "potionDB/potionDB/components"
+	"potionDB/potionDB/utilities"
 	"runtime"
 	"runtime/pprof"
 	"sort"
@@ -19,6 +20,7 @@ import (
 	"sync"
 	"syscall"
 	"time"
+	tpch "tpch_data_processor/tpch"
 	//"tpch_client/src/tpch"
 )
 
@@ -106,7 +108,7 @@ type ExecutionTimes struct {
 	nLineItemsSent     int
 }
 
-//Only one
+// Only one
 type DataloadStats struct {
 	nDataUpds      int
 	nIndexUpds     int
@@ -116,7 +118,7 @@ type DataloadStats struct {
 	sync.Mutex     //Used for dataTimeSpent, indexTimeSpent and nServersDone, as there's one goroutine per server.
 }
 
-//One every x seconds.
+// One every x seconds.
 type UpdatesStats struct {
 	newDataUpds         int
 	removeDataUpds      int
@@ -126,7 +128,7 @@ type UpdatesStats struct {
 	indexTimeSpent      int64
 }
 
-//One every x seconds.
+// One every x seconds.
 type QueryStats struct {
 	nQueries  int
 	nReads    int
@@ -148,7 +150,9 @@ const (
 	TableFormat, UpdFormat, Header                = "tables/%sSF/", "upds/%sSF/", "tpch_headers/tpch_headers_min.txt"
 	TableExtension, UpdExtension, DeleteExtension = ".tbl", ".tbl.u", "."
 
-	PROMO_PERCENTAGE, IMP_SUPPLY, SUM_SUPPLY, NATION_REVENUE, TOP_SUPPLIERS, LARGE_ORDERS, SEGM_DELAY = "q14pp", "q11iss", "q11sum", "q5nr", "q15ts", "q18lo", "q3sd"
+	PROMO_PERCENTAGE, IMP_SUPPLY, SUM_SUPPLY, NATION_REVENUE, TOP_SUPPLIERS, LARGE_ORDERS, SEGM_DELAY                                                = "q14pp", "q11iss", "q11sum", "q5nr", "q15ts", "q18lo", "q3sd"
+	Q1_KEY, Q2_KEY, Q4_KEY, Q6_KEY, Q7_KEY, Q8_KEY, Q9_KEY, Q10_KEY, Q11_KEY, Q12_KEY, Q13_KEY, Q16_KEY, Q17_KEY, Q19_KEY, Q20_KEY, Q21_KEY, Q22_KEY = "q1", "q2", "q4", "q6",
+		"q7", "q8", "q9", "q10", "q11", "q12", "q13", "q16", "q17", "q19", "q20", "q21", "q22"
 
 	C_NATIONKEY, L_SUPPKEY, L_ORDERKEY, N_REGIONKEY, O_CUSTKEY, PS_SUPPKEY, S_NATIONKEY, R_REGIONKEY = 3, 2, 0, 2, 1, 1, 3, 0
 	PART_BKT, INDEX_BKT                                                                              = 5, 6
@@ -173,22 +177,25 @@ var (
 	statisticsInterval                                                                            time.Duration //Milliseconds. A negative number means that no statistics need to be collected.
 	statsSaveLocation                                                                             string
 	LATENCY_MODE                                                                                  int //OP_AVG, BATCH_AVG, PER_BATCH
+	queryNumbers                                                                                  []string
 
 	//Constants...
-	TableNames   = [...]string{"customer", "lineitem", "nation", "orders", "part", "partsupp", "region", "supplier"}
-	TableEntries = [...]int{150000, 60175, 25, 1500000, 200000, 800000, 5, 10000}
-	TableParts   = [...]int{8, 16, 4, 9, 9, 5, 3, 7}
-	TableUsesSF  = [...]bool{true, false, false, true, true, true, false, true}
+	//TableNames   = [...]string{"customer", "lineitem", "nation", "orders", "part", "partsupp", "region", "supplier"}
+	//TableEntries = [...]int{150000, 60175, 25, 1500000, 200000, 800000, 5, 10000}
+	//TableParts   = [...]int{8, 16, 4, 9, 9, 5, 3, 7}
+	//TableUsesSF  = [...]bool{true, false, false, true, true, true, false, true}
 
 	//Just for debugging
 	nProtosSent = 0
 
 	//Table data
-	headers    [][]string
+	/*headers    [][]string
 	tables     [][][]string
 	keys       [][]int
 	read       [][]int8 //Positions in tables that actually have values
 	procTables *tpch.Tables
+	*/
+	tpchData *tpch.TpchData
 
 	//Note: Part isn't partitioned and lineItem uses multiRegionFunc
 	//regionFuncs = [...]func([]string) int8{custToRegion, nil, nationToRegion, ordersToRegion,
@@ -202,17 +209,14 @@ var (
 	conns   []net.Conn
 	buckets []string
 
-	times = ExecutionTimes{
-		sendDataProtos:     make([]int64, len(servers)),
-		prepareIndexProtos: make([]int64, 6),
-		queries:            make([]int64, 6),
-	}
+	times = ExecutionTimes{sendDataProtos: make([]int64, len(servers))}
 
-	dataloadStats                                                                                                                       = DataloadStats{}
-	configFolder, indexGlobalString, testRoutinesString, statsSaveLocationString, singleIndexString, updRateString                      *string
-	idString, updateIndexString, splitUpdatesString, splitUpdatesNoWaitString, updateBaseString, notifyAddressString                    *string
-	nReadsTxn, updateSpecificIndex, batchModeS, latencyModeS, useTopSumString, serversString, localModeString, tpchAddRateString        *string
-	scaleString, nonRandomServersString, localRegionOnlyQueries, loadBaseString, loadIndexString, q15TopSizeString, dummyDataSizeString *string
+	dataloadStats                                                                                                                        = DataloadStats{}
+	configFolder, indexGlobalString, testRoutinesString, statsSaveLocationString, singleIndexString, updRateString, queryPrintString     *string
+	idString, updateIndexString, splitUpdatesString, splitUpdatesNoWaitString, updateBaseString, notifyAddressString, queryNumbersString *string
+	nReadsTxn, updateSpecificIndex, batchModeS, latencyModeS, useTopSumString, serversString, localModeString, tpchAddRateString         *string
+	scaleString, nonRandomServersString, localRegionOnlyQueries, loadBaseString, loadIndexString, q15TopSizeString, dummyDataSizeString  *string
+	queryDurationS, queryWaitS, nUpdClientsS                                                                                             *string
 	//Bench
 	nKeysString, keysTypeString, addRateString, partReadRateString, queryRatesString, opsPerTxnString, nTxnsBeforeWaitString,
 	nElemsString, maxIDString, maxScoreString, topNString, topAboveString, rndDataSizeString, maxChangeTopString, minChangeString,
@@ -260,6 +264,11 @@ func loadFlags() (configs *tools.ConfigLoader) {
 	q15TopSizeString = flag.String("q15_size", "none", "number of entries to ask on top15 (max: 10k for SF=1)")
 	dummyDataSizeString = flag.String("initialMem", "none", "the size (bytes) of the initial block of data. This is used to avoid Go's GC to overcollect garbage and hinder system performance.")
 	tpchAddRateString = flag.String("tpch_add_rate", "none", "the percentage (in form of 0 to 1) of adds when executing updates. Default 0.5")
+	queryPrintString = flag.String("queryPrint", "none", "if query results and information should be printed or not (true/false). Default: false")
+	queryNumbersString = flag.String("queryNumbers", "none", "list of TPC-H queries to create views for. By default only views for queries Q3, Q5, Q11, Q14, Q15 and Q18 are loaded.")
+	queryDurationS = flag.String("queryDuration", "none", "how long (ms) should the experiment run for.")
+	queryWaitS = flag.String("queryWait", "none", "how long (ms) should the client wait for before starting the experiment. Useful to let the servers finish setting up.")
+	nUpdClientsS = flag.String("n_upd_clients", "none", "specifies how many clients should do updates. If <= 0 and DOES_UPDATES=true, all clients can do updates.")
 	//Note: initialMem is only used by CRDT bench for now
 
 	//fmt.Println("On flag: ", *serversString)
@@ -370,6 +379,22 @@ func loadFlags() (configs *tools.ConfigLoader) {
 	if isFlagValid(tpchAddRateString) {
 		configs.ReplaceConfig("tpchAddRate", *tpchAddRateString)
 	}
+	if isFlagValid(queryPrintString) {
+		configs.ReplaceConfig("queryPrint", *queryPrintString)
+	}
+	if isFlagValid(queryNumbersString) {
+		*queryNumbersString = strings.Replace(*queryNumbersString, ",", " ", -1)
+		configs.ReplaceConfig("queries", *queryNumbersString)
+	}
+	if isFlagValid(queryDurationS) {
+		configs.ReplaceConfig("queryDuration", *queryDurationS)
+	}
+	if isFlagValid(queryWaitS) {
+		configs.ReplaceConfig("queryWait", *queryWaitS)
+	}
+	if isFlagValid(nUpdClientsS) {
+		configs.ReplaceConfig("nUpdClients", *nUpdClientsS)
+	}
 	loadBenchFlags(configs)
 	return
 }
@@ -388,11 +413,12 @@ func loadConfigsFile(configs *tools.ConfigLoader) {
 	SINGLE_INDEX_SERVER = configs.GetBoolConfig("singleIndexServer", false)
 	UPD_RATE = configs.GetFloatConfig("updRate", 0.1)
 	id = configs.GetOrDefault("id", "0")
+	ti = &TableInfo{}
 
 	//All remaining are non-flag configs
 	if *configFolder == "none" {
 		fmt.Println("Non-defined configFolder, using defaults")
-		isMulti, splitIndexLoad, memDebug, profiling, scaleFactor, maxUpdSize, useTopKAll, useTopSum, localMode = true, true, false, false, 0.1, 2000, false, false, LOCAL_DIRECT
+		isMulti, splitIndexLoad, memDebug, profiling, scaleFactor, maxUpdSize, useTopKAll, useTopSum, localMode = true, true, false, false, 0.1, 2000, false, true, LOCAL_DIRECT
 		commonFolder = "/Users/a.rijo/Documents/University_6th_year/potionDB docs/"
 		MAX_BUFF_PROTOS, QUERY_WAIT, FORCE_PROTO_CLEAN, TEST_DURATION = 200, 5000, 10000, 20000
 
@@ -401,13 +427,13 @@ func loadConfigsFile(configs *tools.ConfigLoader) {
 		withUpdates, N_UPDATE_FILES, START_UPD_FILE, FINISH_UPD_FILE, LOAD_BASE_DATA, LOAD_INDEX_DATA = false, 1000, 1, 1000, true, true
 		queryFuncs = []func(QueryClient) int{sendQ3, sendQ5, sendQ11, sendQ14, sendQ15, sendQ18}
 		statisticsInterval, q15CrdtType, q15TopSize = -1, proto.CRDTType_TOPSUM, 1
-		MAX_LINEITEM_GOROUTINES, UPDATES_GOROUTINES, READS_PER_TXN, LIKEHOOD_ADD = 16, 16, 1, 0.5
+		MAX_LINEITEM_GOROUTINES, UPDATES_GOROUTINES, READS_PER_TXN, LIKEHOOD_ADD, N_UPD_CLIENTS = 16, 16, 1, 0.5, 0
 		UPDATE_INDEX, UPDATE_SPECIFIC_INDEX_ONLY, BATCH_MODE, NON_RANDOM_SERVERS, ONLY_LOCAL_DATA_QUERY = true, false, CYCLE, false, false
 	} else {
 		fmt.Println("Defined config folder.")
 		isMulti, splitIndexLoad, useTopKAll, useTopSum, *localModeString = configs.GetBoolConfig("multiServer", true),
 			configs.GetBoolConfig("splitIndexLoad", true), configs.GetBoolConfig("useTopKAll", false),
-			configs.GetBoolConfig("useTopSum", false), configs.GetOrDefault("localMode", "direct")
+			configs.GetBoolConfig("useTopSum", true), configs.GetOrDefault("localMode", "direct")
 		if useTopSum {
 			q15CrdtType = proto.CRDTType_TOPSUM
 		} else {
@@ -440,12 +466,15 @@ func loadConfigsFile(configs *tools.ConfigLoader) {
 		UPDATE_INDEX, SPLIT_UPDATES, SPLIT_UPDATES_NO_WAIT, UPDATE_BASE_DATA, NOTIFY_ADDRESS = configs.GetBoolConfig("updateIndex", true), configs.GetBoolConfig("splitUpdates", false),
 			configs.GetBoolConfig("splitUpdatesNoWait", true), configs.GetBoolConfig("updateBase", true), configs.GetOrDefault("notifyAddress", "")
 		LOAD_BASE_DATA, LOAD_INDEX_DATA = configs.GetBoolConfig("loadBase", true), configs.GetBoolConfig("loadIndex", true)
-		READS_PER_TXN, UPDATE_SPECIFIC_INDEX_ONLY = configs.GetIntConfig("nReadsTxn", 1), configs.GetBoolConfig("updateSpecificIndex", false)
+		READS_PER_TXN, UPDATE_SPECIFIC_INDEX_ONLY = configs.GetIntConfig("nReadsTxn", 1), configs.GetBoolConfig("updateSpecificIndex", true)
 		BATCH_MODE, LATENCY_MODE = batchModeStringToInt(configs.GetOrDefault("batchMode", "CYCLE")), latencyModeStringToInt(configs.GetOrDefault("latencyMode", "AVG_OP"))
 		NON_RANDOM_SERVERS, ONLY_LOCAL_DATA_QUERY = configs.GetBoolConfig("nonRandomServers", false), configs.GetBoolConfig("localRegionOnly", false)
-		queryNumbers := strings.Split(configs.GetOrDefault("queries", "3, 5, 11, 14, 15, 18"), " ")
+		queryNumbers = strings.Split(configs.GetOrDefault("queries", "3 5 11 14 15 18"), " ")
 		q15TopSize = int32(configs.GetIntConfig("q15_size", 1))
-		LIKEHOOD_ADD = configs.GetFloatConfig("tpchAddRate", 0.5)
+		LIKEHOOD_ADD, N_UPD_CLIENTS = configs.GetFloatConfig("tpchAddRate", 0.5), configs.GetIntConfig("nUpdClients", 0)
+		if N_UPD_CLIENTS < 0 || UPD_RATE == 0 {
+			N_UPD_CLIENTS = 0
+		}
 
 		if isIndexGlobal {
 			setQueryList(queryNumbers)
@@ -467,8 +496,8 @@ func loadConfigsFile(configs *tools.ConfigLoader) {
 func prepareConfigs() {
 	scaleFactorS := strconv.FormatFloat(scaleFactor, 'f', -1, 64)
 	tableFolder, updFolder = commonFolder+fmt.Sprintf(TableFormat, scaleFactorS), commonFolder+fmt.Sprintf(UpdFormat, scaleFactorS)
-	updCompleteFilename = [3]string{updFolder + UpdsNames[0] + UpdExtension, updFolder + UpdsNames[1] + UpdExtension,
-		updFolder + UpdsNames[2] + DeleteExtension}
+	updCompleteFilename = [3]string{updFolder + tpch.UpdsNames[0] + UpdExtension, updFolder + tpch.UpdsNames[1] + UpdExtension,
+		updFolder + tpch.UpdsNames[2] + DeleteExtension}
 	headerLoc = commonFolder + Header
 	if isMulti {
 		//servers = []string{"127.0.0.1:8087", "127.0.0.1:8088", "127.0.0.1:8089", "127.0.0.1:8090", "127.0.0.1:8091"}
@@ -508,29 +537,29 @@ func prepareConfigs() {
 	conns = make([]net.Conn, len(servers))
 
 	//Note: All lineitems apart from 0.1SF need to be updated
-	switch scaleFactor {
+	/*switch scaleFactor {
 	case 0.01:
-		TableEntries[tpch.LINEITEM] = 60175
-		updEntries = []int{10, 41, 10}
+		tpch.TableEntries[tpch.LINEITEM] = 60175
+		tpch.UpdEntries = [...]int{10, 41, 10}
 		//updEntries = []int{15, 41, 15}
 	case 0.1:
-		TableEntries[tpch.LINEITEM] = 600572
+		tpch.TableEntries[tpch.LINEITEM] = 600572
 		//updEntries = []int{150, 592, 150}
 		//updEntries = []int{150, 601, 150}
-		updEntries = []int{150, 601, 150}
+		tpch.UpdEntries = [...]int{150, 601, 150}
 	case 0.2:
-		TableEntries[tpch.LINEITEM] = 1800093
-		updEntries = []int{300, 1164, 300} //NOTE: FAKE VALUES!
+		tpch.TableEntries[tpch.LINEITEM] = 1800093
+		tpch.UpdEntries = [...]int{300, 1164, 300} //NOTE: FAKE VALUES!
 	case 0.3:
-		TableEntries[tpch.LINEITEM] = 2999668
-		updEntries = []int{450, 1747, 450} //NOTE: FAKE VALUES!
+		tpch.TableEntries[tpch.LINEITEM] = 2999668
+		tpch.UpdEntries = [...]int{450, 1747, 450} //NOTE: FAKE VALUES!
 	case 1:
-		TableEntries[tpch.LINEITEM] = 6001215
+		tpch.TableEntries[tpch.LINEITEM] = 6001215
 		//updEntries = []int{1500, 5822, 1500}
 		//updEntries = []int{1500, 6001, 1500}
-		updEntries = []int{1500, 6010, 1500}
+		tpch.UpdEntries = [...]int{1500, 6010, 1500}
 	}
-
+	*/
 }
 
 func StartClient() {
@@ -563,10 +592,10 @@ func StartClient() {
 
 	startTime := time.Now().UnixNano()
 	rand.Seed(startTime)
-	times.startTime = startTime
-	handleHeaders()
+	//times.startTime = startTime
+	//handleHeaders()
 
-	go handleTableProcessing()
+	//go handleTableProcessing()
 	if DOES_DATA_LOAD {
 		//Start tcp connection to each server for data loading. Query clients create and manage their own connections.
 		//Update clients start their connections after all data is loaded.
@@ -574,13 +603,15 @@ func StartClient() {
 	}
 	if DOES_DATA_LOAD && LOAD_BASE_DATA {
 		//Prepare to send initial data protos
-		go handlePrepareSend()
+		//go handlePrepareSend()
+		go createAndSendDataProtos()
 	}
 
-	tables = make([][][]string, len(TableNames))
-	procTables = &tpch.Tables{}
-	procTables.InitConstants(!isMulti)
-	handleTables()
+	loadData()
+	//tpchData.RawTables = make([][][]string, len(tpch.TableNames))
+	//tpchData.Tables = &tpch.Tables{}
+	//tpchData.Tables.InitConstants(!isMulti)
+	//handleTables()
 
 	//tables = nil
 	//debug.FreeOSMemory()
@@ -606,7 +637,7 @@ func printExecutionTimes() {
 
 func collectDataStatistics() {
 	nationsToRegion := make(map[int8]int8)
-	for _, nation := range procTables.Nations {
+	for _, nation := range tpchData.Tables.Nations {
 		nationsToRegion[nation.N_NATIONKEY] = nation.N_REGIONKEY
 	}
 
@@ -622,27 +653,27 @@ func collectDataStatistics() {
 		custKeyPerNation[nation], orderKeyPerNation[nation], lineItemPerNation[nation] = &cust, &order, &line
 	}
 
-	for _, customer := range procTables.Customers[1:] {
+	for _, customer := range tpchData.Tables.Customers[1:] {
 		//custKeyPerNation[customer.C_NATIONKEY] = append(custKeyPerNation[customer.C_NATIONKEY], customer.C_CUSTKEY)
 		*custKeyPerNation[customer.C_NATIONKEY]++
 	}
 	orders, lineItems := 0, 0
-	for _, order := range procTables.Orders[1:] {
-		nationKey := procTables.Customers[order.O_CUSTKEY].C_NATIONKEY
+	for _, order := range tpchData.Tables.Orders[1:] {
+		nationKey := tpchData.Tables.Customers[order.O_CUSTKEY].C_NATIONKEY
 		//orderKeyPerNation[nationKey] = append(orderKeyPerNation[nationKey], order.O_ORDERKEY)
 		*orderKeyPerNation[nationKey]++
 		orders++
 	}
 	/*
-		for _, lineItem := range procTables.LineItems {
+		for _, lineItem := range tpchData.Tables.LineItems {
 			if lineItem != nil {
-				nationKey := procTables.Customers[procTables.Orders[GetOrderIndex(lineItem.L_ORDERKEY)].O_CUSTKEY].C_NATIONKEY
+				nationKey := tpchData.Tables.Customers[tpchData.Tables.Orders[GetOrderIndex(lineItem.L_ORDERKEY)].O_CUSTKEY].C_NATIONKEY
 				//lineItemPerNation[nationKey] = append(lineItemPerNation[nationKey], lineItem.L_ORDERKEY*8+int32(lineItem.L_LINENUMBER))
 				tpch.LineItemPerNation[nationKey]++
 				lineItems++
 			}
 		}
-		for _, lineItem := range procTables.LineItems {
+		for _, lineItem := range tpchData.Tables.LineItems {
 			if lineItem != nil {
 				if lineItem.L_LINENUMBER != 1 {
 					fmt.Println(lineItem.L_LINENUMBER)
@@ -650,15 +681,15 @@ func collectDataStatistics() {
 			}
 		}
 	*/
-	for i, orderItems := range procTables.LineItems[1:] {
-		nationKey := procTables.Customers[procTables.Orders[i].O_CUSTKEY].C_NATIONKEY
+	for i, orderItems := range tpchData.Tables.LineItems[1:] {
+		nationKey := tpchData.Tables.Customers[tpchData.Tables.Orders[i].O_CUSTKEY].C_NATIONKEY
 		*lineItemPerNation[nationKey] += len(orderItems)
 		lineItems += len(orderItems)
 		//Might be a good idea to also collect statistics on the supplier side...
 	}
 
 	custPerRegion, orderPerRegion, linePerRegion := make(map[int8]*int32), make(map[int8]*int32), make(map[int8]*int32)
-	for _, region := range procTables.Regions {
+	for _, region := range tpchData.Tables.Regions {
 		var cust, order, line int32 = 0, 0, 0
 		custPerRegion[region.R_REGIONKEY], orderPerRegion[region.R_REGIONKEY], linePerRegion[region.R_REGIONKEY] = &cust, &order, &line
 	}
@@ -669,7 +700,7 @@ func collectDataStatistics() {
 	}
 
 	fmt.Println("PER REGION STATISTICS")
-	for _, region := range procTables.Regions {
+	for _, region := range tpchData.Tables.Regions {
 		fmt.Printf("[%s] - CUST: %d, ORDER: %d, LINE: %d\n", region.R_NAME, *custPerRegion[region.R_REGIONKEY],
 			*orderPerRegion[region.R_REGIONKEY], *linePerRegion[region.R_REGIONKEY])
 	}
@@ -689,7 +720,7 @@ func ignore(any ...interface{}) {
 
 func startProfiling() {
 	file, err := os.Create(cpuProfileLoc)
-	tools.CheckErr("Failed to create CPU profile file: ", err)
+	utilities.CheckErr("Failed to create CPU profile file: ", err)
 	pprof.StartCPUProfile(file)
 	fmt.Println("Started CPU profiling")
 	fmt.Println("Started mem profiling")
@@ -704,7 +735,7 @@ func stopProfiling() {
 		pprof.StopCPUProfile()
 		file, err := os.Create(memProfileLoc)
 		defer file.Close()
-		tools.CheckErr("Failed to create Memory profile file: ", err)
+		utilities.CheckErr("Failed to create Memory profile file: ", err)
 		pprof.WriteHeapProfile(file)
 		fmt.Println("Profiles saved, closing...")
 		os.Exit(0)
@@ -758,13 +789,13 @@ func debugMemory() {
 
 func custToRegion(obj []string) int8 {
 	nationKey, _ := strconv.ParseInt(obj[C_NATIONKEY], 10, 8)
-	return procTables.NationkeyToRegionkey(nationKey)
+	return tpchData.Tables.NationkeyToRegionkey(nationKey)
 }
 
 func lineitemToRegion(obj []string) []int8 {
 	suppKey, _ := strconv.ParseInt(obj[L_SUPPKEY], 10, 32)
 	orderKey, _ := strconv.ParseInt(obj[L_ORDERKEY], 10, 32)
-	r1, r2 := procTables.SuppkeyToRegionkey(suppKey), procTables.OrderkeyToRegionkey(int32(orderKey))
+	r1, r2 := tpchData.Tables.SuppkeyToRegionkey(suppKey), tpchData.Tables.OrderkeyToRegionkey(int32(orderKey))
 	if r1 == r2 {
 		return []int8{r1}
 	}
@@ -774,7 +805,7 @@ func lineitemToRegion(obj []string) []int8 {
 func specialLineitemToRegion(order []string, item []string) []int8 {
 	suppKey, _ := strconv.ParseInt(item[L_SUPPKEY], 10, 32)
 	custKey, _ := strconv.ParseInt(order[O_CUSTKEY], 10, 32)
-	r1, r2 := procTables.SuppkeyToRegionkey(suppKey), procTables.CustkeyToRegionkey(custKey)
+	r1, r2 := tpchData.Tables.SuppkeyToRegionkey(suppKey), tpchData.Tables.CustkeyToRegionkey(custKey)
 	if r1 == r2 {
 		return []int8{r1}
 	}
@@ -792,12 +823,12 @@ func nationToRegion(obj []string) int8 {
 
 func ordersToRegion(obj []string) int8 {
 	custKey, _ := strconv.ParseInt(obj[O_CUSTKEY], 10, 32)
-	return procTables.CustkeyToRegionkey(custKey)
+	return tpchData.Tables.CustkeyToRegionkey(custKey)
 }
 
 func partSuppToRegion(obj []string) int8 {
 	suppKey, _ := strconv.ParseInt(obj[PS_SUPPKEY], 10, 32)
-	return procTables.SuppkeyToRegionkey(suppKey)
+	return tpchData.Tables.SuppkeyToRegionkey(suppKey)
 }
 
 func regionToRegion(obj []string) int8 {
@@ -807,7 +838,7 @@ func regionToRegion(obj []string) int8 {
 
 func supplierToRegion(obj []string) int8 {
 	nationKey, _ := strconv.ParseInt(obj[S_NATIONKEY], 10, 8)
-	return procTables.NationkeyToRegionkey(nationKey)
+	return tpchData.Tables.NationkeyToRegionkey(nationKey)
 }
 
 func singleRegion(obj []string) int8 {
@@ -815,59 +846,134 @@ func singleRegion(obj []string) int8 {
 }
 
 func setQueryList(queryStrings []string) {
-	fmt.Println("Setting global/single query list")
-	queryFuncs, getReadsFuncs = make([]func(QueryClient) int, len(queryStrings)),
-		make([]func(QueryClient, []antidote.ReadObjectParams, []antidote.ReadObjectParams, []int, int) int, len(queryStrings))
-	processReadReplies = make([]func(QueryClient, []*proto.ApbReadObjectResp, []int, int) int, len(queryStrings))
-	indexesToUpd = make([]int, len(queryStrings))
-	i := 0
+	fmt.Println("Setting global/single query list. Queries:", queryStrings)
+	nQueries := len(queryStrings)
+	queryFuncs, getReadsFuncs = make([]func(QueryClient) int, nQueries),
+		make([]func(QueryClient, []crdt.ReadObjectParams, []crdt.ReadObjectParams, []int, int) int, nQueries)
+	processReadReplies = make([]func(QueryClient, []*proto.ApbReadObjectResp, []int, int) int, nQueries)
+	indexesToUpd, prepIndexFuncs = make([]int, nQueries), make([]func() ([]crdt.UpdateObjectParams, int), nQueries)
+	i, j := 0, 0
 	for _, queryN := range queryStrings {
 		switch queryN {
+		case "1":
+			queryFuncs[i], getReadsFuncs[i], processReadReplies[i], indexesToUpd[j] = sendQ1, getQ1Reads, processQ1Reply, 1
+		case "2": //No updates
+			queryFuncs[i], getReadsFuncs[i], processReadReplies[i] = sendQ2, getQ2Reads, processQ2Reply
+			j-- //We do not want to increment j if the query is not updateable
 		case "3":
-			queryFuncs[i], getReadsFuncs[i], processReadReplies[i], indexesToUpd[i] = sendQ3, getQ3Reads, processQ3Reply, 3
+			queryFuncs[i], getReadsFuncs[i], processReadReplies[i], indexesToUpd[j] = sendQ3, getQ3Reads, processQ3Reply, 3
+		case "4":
+			queryFuncs[i], getReadsFuncs[i], processReadReplies[i], indexesToUpd[j] = sendQ4, getQ4Reads, processQ4Reply, 4
 		case "5":
-			queryFuncs[i], getReadsFuncs[i], processReadReplies[i], indexesToUpd[i] = sendQ5, getQ5Reads, processQ5Reply, 5
-		case "11":
-			//Q11 doens't have updates
+			queryFuncs[i], getReadsFuncs[i], processReadReplies[i], indexesToUpd[j] = sendQ5, getQ5Reads, processQ5Reply, 5
+		case "6":
+			queryFuncs[i], getReadsFuncs[i], processReadReplies[i], indexesToUpd[j] = sendQ6, getQ6Reads, processQ6Reply, 6
+		case "7":
+			queryFuncs[i], getReadsFuncs[i], processReadReplies[i], indexesToUpd[j] = sendQ7, getQ7Reads, processQ7Reply, 7
+		case "8":
+			queryFuncs[i], getReadsFuncs[i], processReadReplies[i], indexesToUpd[j] = sendQ8, getQ8Reads, processQ8Reply, 8
+		case "9":
+			queryFuncs[i], getReadsFuncs[i], processReadReplies[i], indexesToUpd[j] = sendQ9, getQ9Reads, processQ9Reply, 9
+		case "10":
+			queryFuncs[i], getReadsFuncs[i], processReadReplies[i], indexesToUpd[j] = sendQ10, getQ10Reads, processQ10Reply, 10
+		case "11": //No updates
 			queryFuncs[i], getReadsFuncs[i], processReadReplies[i] = sendQ11, getQ11Reads, processQ11Reply
+			j-- //We do not want to increment j if the query is not updateable
+		case "12":
+			queryFuncs[i], getReadsFuncs[i], processReadReplies[i], indexesToUpd[j] = sendQ12, getQ12Reads, processQ12Reply, 12
+		case "13":
+			queryFuncs[i], getReadsFuncs[i], processReadReplies[i], indexesToUpd[j] = sendQ13, getQ13Reads, processQ13Reply, 13
 		case "14":
-			queryFuncs[i], getReadsFuncs[i], processReadReplies[i], indexesToUpd[i] = sendQ14, getQ14Reads, processQ14Reply, 14
+			queryFuncs[i], getReadsFuncs[i], processReadReplies[i], indexesToUpd[j] = sendQ14, getQ14Reads, processQ14Reply, 14
 		case "15":
-			queryFuncs[i], getReadsFuncs[i], processReadReplies[i], indexesToUpd[i] = sendQ15, getQ15Reads, processQ15Reply, 15
+			queryFuncs[i], getReadsFuncs[i], processReadReplies[i], indexesToUpd[j] = sendQ15, getQ15Reads, processQ15Reply, 15
+		case "16": //No updates
+			queryFuncs[i], getReadsFuncs[i], processReadReplies[i] = sendQ16, getQ16Reads, processQ16Reply
+			j-- //We do not want to increment j if the query is not updateable
+		case "17":
+			queryFuncs[i], getReadsFuncs[i], processReadReplies[i], indexesToUpd[j] = sendQ17, getQ17Reads, processQ17Reply, 17
 		case "18":
-			queryFuncs[i], getReadsFuncs[i], processReadReplies[i], indexesToUpd[i] = sendQ18, getQ18Reads, processQ18Reply, 18
+			queryFuncs[i], getReadsFuncs[i], processReadReplies[i], indexesToUpd[j] = sendQ18, getQ18Reads, processQ18Reply, 18
+		case "19":
+			queryFuncs[i], getReadsFuncs[i], processReadReplies[i], indexesToUpd[j] = sendQ19, getQ19Reads, processQ19Reply, 19
+		case "20":
+			queryFuncs[i], getReadsFuncs[i], processReadReplies[i], indexesToUpd[j] = sendQ20, getQ20Reads, processQ20Reply, 20
+		case "21":
+			queryFuncs[i], getReadsFuncs[i], processReadReplies[i], indexesToUpd[j] = sendQ21, getQ21Reads, processQ21Reply, 21
+		case "22":
+			queryFuncs[i], getReadsFuncs[i], processReadReplies[i], indexesToUpd[j] = sendQ22, getQ22Reads, processQ22Reply, 22
 		}
 		i++
+		j++
 	}
+	indexesToUpd = indexesToUpd[:j]
 	sort.Ints(indexesToUpd)
 	return
 }
 
 func setLocalDirectQueryList(queryStrings []string) {
 	fmt.Println("Setting local (direct) query list")
-	queryFuncs, getReadsLocalDirectFuncs = make([]func(QueryClient) int, len(queryStrings)),
-		make([]func(QueryClient, [][]antidote.ReadObjectParams, [][]antidote.ReadObjectParams, [][]int, []int, int, int) (int, int), len(queryStrings))
-	processLocalDirectReadReplies = make([]func(QueryClient, [][]*proto.ApbReadObjectResp, [][]int, []int, int, int) int, len(queryStrings))
-	indexesToUpd = make([]int, len(queryStrings))
-	i := 0
+	nQueries := len(queryStrings)
+	queryFuncs, getReadsLocalDirectFuncs = make([]func(QueryClient) int, nQueries),
+		make([]func(QueryClient, [][]crdt.ReadObjectParams, [][]crdt.ReadObjectParams, [][]int, []int, int, int) (int, int), nQueries)
+	processLocalDirectReadReplies = make([]func(QueryClient, [][]*proto.ApbReadObjectResp, [][]int, []int, int, int) int, nQueries)
+	indexesToUpd, prepIndexLocalFuncs = make([]int, len(queryStrings)), make([]func() ([][]crdt.UpdateObjectParams, int), nQueries)
+	i, j := 0, 0
 	for _, queryN := range queryStrings {
 		switch queryN {
+		case "1":
+			queryFuncs[i], getReadsLocalDirectFuncs[i], processLocalDirectReadReplies[i], indexesToUpd[j], prepIndexLocalFuncs[i] = sendQ1, getQ1LocalDirectReads, processQ1LocalDirectReply, 1, ti.prepareQ1IndexLocal
+		case "2": //No updates
+			queryFuncs[i], getReadsLocalDirectFuncs[i], processLocalDirectReadReplies[i], prepIndexLocalFuncs[i] = sendQ2, getQ2LocalDirectReads, processQ2LocalDirectReply, ti.prepareQ2IndexLocal
+			j-- //We do not want to increment j if the query is not updateable
 		case "3":
-			queryFuncs[i], getReadsLocalDirectFuncs[i], processLocalDirectReadReplies[i], indexesToUpd[i] = sendQ3, getQ3LocalDirectReads, processQ3LocalDirectReply, 3
+			queryFuncs[i], getReadsLocalDirectFuncs[i], processLocalDirectReadReplies[i], indexesToUpd[j], prepIndexLocalFuncs[i] = sendQ3, getQ3LocalDirectReads, processQ3LocalDirectReply, 3, ti.prepareQ3IndexLocal
+		case "4":
+			queryFuncs[i], getReadsLocalDirectFuncs[i], processLocalDirectReadReplies[i], indexesToUpd[j], prepIndexLocalFuncs[i] = sendQ4, getQ4LocalDirectReads, processQ4LocalDirectReply, 4, ti.prepareQ4IndexLocal
 		case "5":
-			queryFuncs[i], getReadsLocalDirectFuncs[i], processLocalDirectReadReplies[i], indexesToUpd[i] = sendQ5, getQ5LocalDirectReads, processQ5LocalDirectReply, 5
-		case "11":
-			//Q11 doens't have updates
-			queryFuncs[i], getReadsLocalDirectFuncs[i], processLocalDirectReadReplies[i] = sendQ11, getQ11LocalDirectReads, processQ11LocalDirectReply
+			queryFuncs[i], getReadsLocalDirectFuncs[i], processLocalDirectReadReplies[i], indexesToUpd[j], prepIndexLocalFuncs[i] = sendQ5, getQ5LocalDirectReads, processQ5LocalDirectReply, 5, ti.prepareQ5IndexLocal
+		case "6":
+			queryFuncs[i], getReadsLocalDirectFuncs[i], processLocalDirectReadReplies[i], indexesToUpd[j], prepIndexLocalFuncs[i] = sendQ6, getQ6LocalDirectReads, processQ6LocalDirectReply, 6, ti.prepareQ6IndexLocal
+		case "7":
+			queryFuncs[i], getReadsLocalDirectFuncs[i], processLocalDirectReadReplies[i], indexesToUpd[j], prepIndexLocalFuncs[i] = sendQ7, getQ7LocalDirectReads, processQ7LocalDirectReply, 7, ti.prepareQ7IndexLocal
+		case "8":
+			queryFuncs[i], getReadsLocalDirectFuncs[i], processLocalDirectReadReplies[i], indexesToUpd[j], prepIndexLocalFuncs[i] = sendQ8, getQ8LocalDirectReads, processQ8LocalDirectReply, 8, ti.prepareQ8IndexLocal
+		case "9":
+			queryFuncs[i], getReadsLocalDirectFuncs[i], processLocalDirectReadReplies[i], indexesToUpd[j], prepIndexLocalFuncs[i] = sendQ9, getQ9LocalDirectReads, processQ9LocalDirectReply, 9, ti.prepareQ9IndexLocal
+		case "10":
+			queryFuncs[i], getReadsLocalDirectFuncs[i], processLocalDirectReadReplies[i], indexesToUpd[j], prepIndexLocalFuncs[i] = sendQ10, getQ10LocalDirectReads, processQ10LocalDirectReply, 10, ti.prepareQ10IndexLocal
+		case "11": //No updates
+			queryFuncs[i], getReadsLocalDirectFuncs[i], processLocalDirectReadReplies[i], prepIndexLocalFuncs[i] = sendQ11, getQ11LocalDirectReads, processQ11LocalDirectReply, ti.prepareQ11IndexLocal
+			j-- //We do not want to increment j if the query is not updateable
+		case "12":
+			queryFuncs[i], getReadsLocalDirectFuncs[i], processLocalDirectReadReplies[i], indexesToUpd[j], prepIndexLocalFuncs[i] = sendQ12, getQ12LocalDirectReads, processQ12LocalDirectReply, 12, ti.prepareQ12IndexLocal
+		case "13":
+			queryFuncs[i], getReadsLocalDirectFuncs[i], processLocalDirectReadReplies[i], indexesToUpd[j], prepIndexLocalFuncs[i] = sendQ13, getQ13LocalDirectReads, processQ13LocalDirectReply, 13, ti.prepareQ13IndexLocal
 		case "14":
-			queryFuncs[i], getReadsLocalDirectFuncs[i], processLocalDirectReadReplies[i], indexesToUpd[i] = sendQ14, getQ14LocalDirectReads, processQ14LocalDirectReply, 14
+			queryFuncs[i], getReadsLocalDirectFuncs[i], processLocalDirectReadReplies[i], indexesToUpd[j], prepIndexLocalFuncs[i] = sendQ14, getQ14LocalDirectReads, processQ14LocalDirectReply, 14, ti.prepareQ14IndexLocal
 		case "15":
-			queryFuncs[i], getReadsLocalDirectFuncs[i], processLocalDirectReadReplies[i], indexesToUpd[i] = sendQ15, getQ15LocalDirectReads, processQ15LocalDirectReply, 15
+			queryFuncs[i], getReadsLocalDirectFuncs[i], processLocalDirectReadReplies[i], indexesToUpd[j], prepIndexLocalFuncs[i] = sendQ15, getQ15LocalDirectReads, processQ15LocalDirectReply, 15, ti.prepareQ15IndexLocal
+		case "16": //No updates
+			queryFuncs[i], getReadsLocalDirectFuncs[i], processLocalDirectReadReplies[i], prepIndexLocalFuncs[i] = sendQ16, getQ16LocalDirectReads, processQ16LocalDirectReply, ti.prepareQ16IndexLocal
+			j-- //We do not want to increment j if the query is not updateable
+		case "17":
+			queryFuncs[i], getReadsLocalDirectFuncs[i], processLocalDirectReadReplies[i], indexesToUpd[j], prepIndexLocalFuncs[i] = sendQ17, getQ17LocalDirectReads, processQ17LocalDirectReply, 17, ti.prepareQ17IndexLocal
 		case "18":
-			queryFuncs[i], getReadsLocalDirectFuncs[i], processLocalDirectReadReplies[i], indexesToUpd[i] = sendQ18, getQ18LocalDirectReads, processQ18LocalDirectReply, 18
+			queryFuncs[i], getReadsLocalDirectFuncs[i], processLocalDirectReadReplies[i], indexesToUpd[j], prepIndexLocalFuncs[i] = sendQ18, getQ18LocalDirectReads, processQ18LocalDirectReply, 18, ti.prepareQ18IndexLocal
+		case "19":
+			queryFuncs[i], getReadsLocalDirectFuncs[i], processLocalDirectReadReplies[i], indexesToUpd[j], prepIndexLocalFuncs[i] = sendQ19, getQ19LocalDirectReads, processQ19LocalDirectReply, 19, ti.prepareQ19IndexLocal
+		case "20":
+			queryFuncs[i], getReadsLocalDirectFuncs[i], processLocalDirectReadReplies[i], indexesToUpd[j], prepIndexLocalFuncs[i] = sendQ20, getQ20LocalDirectReads, processQ20LocalDirectReply, 20, ti.prepareQ20IndexLocal
+		case "21":
+			queryFuncs[i], getReadsLocalDirectFuncs[i], processLocalDirectReadReplies[i], indexesToUpd[j], prepIndexLocalFuncs[i] = sendQ21, getQ21LocalDirectReads, processQ21LocalDirectReply, 21, ti.prepareQ21IndexLocal
+		case "22":
+			queryFuncs[i], getReadsLocalDirectFuncs[i], processLocalDirectReadReplies[i], indexesToUpd[j], prepIndexLocalFuncs[i] = sendQ22, getQ22LocalDirectReads, processQ22LocalDirectReply, 22, ti.prepareQ22IndexLocal
 		}
+		//Q2, Q11, Q16 have no updates
 		i++
+		j++
 	}
+	indexesToUpd = indexesToUpd[:j]
 	sort.Ints(indexesToUpd)
 	return
 }
@@ -875,28 +981,64 @@ func setLocalDirectQueryList(queryStrings []string) {
 func setLocalServerQueryList(queryStrings []string) {
 	fmt.Println("Setting local (server) query list")
 	queryFuncs, getReadsFuncs = make([]func(QueryClient) int, len(queryStrings)),
-		make([]func(QueryClient, []antidote.ReadObjectParams, []antidote.ReadObjectParams, []int, int) int, len(queryStrings))
+		make([]func(QueryClient, []crdt.ReadObjectParams, []crdt.ReadObjectParams, []int, int) int, len(queryStrings))
 	processReadReplies = make([]func(QueryClient, []*proto.ApbReadObjectResp, []int, int) int, len(queryStrings))
 	indexesToUpd = make([]int, len(queryStrings))
-	i := 0
+	i, j := 0, 0
 	for _, queryN := range queryStrings {
 		switch queryN {
+		case "1":
+			queryFuncs[i], getReadsFuncs[i], processReadReplies[i], indexesToUpd[j] = sendQ1, getQ1LocalServerReads, processQ1LocalServerReply, 1
+		case "2":
+			queryFuncs[i], getReadsFuncs[i], processReadReplies[i] = sendQ2, getQ2LocalServerReads, processQ2Reply
+			j-- //We do not want to increment j if the query is not updateable
 		case "3":
-			queryFuncs[i], getReadsFuncs[i], processReadReplies[i], indexesToUpd[i] = sendQ3, getQ3LocalServerReads, processQ3LocalServerReply, 3
+			queryFuncs[i], getReadsFuncs[i], processReadReplies[i], indexesToUpd[j] = sendQ3, getQ3LocalServerReads, processQ3LocalServerReply, 3
+		case "4":
+			queryFuncs[i], getReadsFuncs[i], processReadReplies[i], indexesToUpd[j] = sendQ4, getQ4LocalServerReads, processQ4LocalServerReply, 4
 		case "5":
-			queryFuncs[i], getReadsFuncs[i], processReadReplies[i], indexesToUpd[i] = sendQ5, getQ5LocalServerReads, processQ5Reply, 5
-		case "11":
-			//Q11 doens't have updates
+			queryFuncs[i], getReadsFuncs[i], processReadReplies[i], indexesToUpd[j] = sendQ5, getQ5LocalServerReads, processQ5Reply, 5
+		case "6":
+			queryFuncs[i], getReadsFuncs[i], processReadReplies[i], indexesToUpd[j] = sendQ6, getQ6LocalServerReads, processQ6LocalServerReply, 6
+		case "7":
+			queryFuncs[i], getReadsFuncs[i], processReadReplies[i], indexesToUpd[j] = sendQ7, getQ7LocalServerReads, processQ7Reply, 7
+		case "8":
+			queryFuncs[i], getReadsFuncs[i], processReadReplies[i], indexesToUpd[j] = sendQ8, getQ8LocalServerReads, processQ8Reply, 8
+		case "9":
+			queryFuncs[i], getReadsFuncs[i], processReadReplies[i], indexesToUpd[j] = sendQ9, getQ9LocalServerReads, processQ9LocalServerReply, 9
+		case "10":
+			queryFuncs[i], getReadsFuncs[i], processReadReplies[i], indexesToUpd[j] = sendQ10, getQ10LocalServerReads, processQ10LocalServerReply, 10
+		case "11": //No updates
 			queryFuncs[i], getReadsFuncs[i], processReadReplies[i] = sendQ11, getQ11LocalServerReads, processQ11Reply
+			j-- //We do not want to increment j if the query is not updateable
+		case "12":
+			queryFuncs[i], getReadsFuncs[i], processReadReplies[i], indexesToUpd[j] = sendQ12, getQ12LocalServerReads, processQ12LocalServerReply, 12
+		case "13":
+			queryFuncs[i], getReadsFuncs[i], processReadReplies[i], indexesToUpd[j] = sendQ13, getQ13LocalServerReads, processQ13LocalServerReply, 13
 		case "14":
-			queryFuncs[i], getReadsFuncs[i], processReadReplies[i], indexesToUpd[i] = sendQ14, getQ14LocalServerReads, processQ14LocalServerReply, 14
+			queryFuncs[i], getReadsFuncs[i], processReadReplies[i], indexesToUpd[j] = sendQ14, getQ14LocalServerReads, processQ14LocalServerReply, 14
 		case "15":
-			queryFuncs[i], getReadsFuncs[i], processReadReplies[i], indexesToUpd[i] = sendQ15, getQ15LocalServerReads, processQ15LocalServerReply, 15
+			queryFuncs[i], getReadsFuncs[i], processReadReplies[i], indexesToUpd[j] = sendQ15, getQ15LocalServerReads, processQ15LocalServerReply, 15
+		case "16":
+			queryFuncs[i], getReadsFuncs[i], processReadReplies[i] = sendQ16, getQ16LocalServerReads, processQ16LocalServerReply
+			j-- //We do not want to increment j if the query is not updateablej-- //We do not want to increment j if the query is not updateable
+		case "17":
+			queryFuncs[i], getReadsFuncs[i], processReadReplies[i], indexesToUpd[j] = sendQ17, getQ17LocalServerReads, processQ17LocalServerReply, 17
 		case "18":
-			queryFuncs[i], getReadsFuncs[i], processReadReplies[i], indexesToUpd[i] = sendQ18, getQ18LocalServerReads, processQ18LocalServerReply, 18
+			queryFuncs[i], getReadsFuncs[i], processReadReplies[i], indexesToUpd[j] = sendQ18, getQ18LocalServerReads, processQ18LocalServerReply, 18
+		case "19":
+			queryFuncs[i], getReadsFuncs[i], processReadReplies[i], indexesToUpd[j] = sendQ19, getQ19LocalServerReads, processQ19LocalServerReply, 19
+		case "20":
+			queryFuncs[i], getReadsFuncs[i], processReadReplies[i], indexesToUpd[j] = sendQ20, getQ20LocalServerReads, processQ20Reply, 20
+		case "21":
+			queryFuncs[i], getReadsFuncs[i], processReadReplies[i], indexesToUpd[j] = sendQ21, getQ21LocalServerReads, processQ21Reply, 21
+		case "22":
+			queryFuncs[i], getReadsFuncs[i], processReadReplies[i], indexesToUpd[j] = sendQ22, getQ22LocalServerReads, processQ22Reply, 22
 		}
 		i++
+		j++
 	}
+	indexesToUpd = indexesToUpd[:j]
 	sort.Ints(indexesToUpd)
 	return
 }
@@ -922,7 +1064,7 @@ func resetServers(configs *tools.ConfigLoader) {
 	conns := make([]net.Conn, len(servers))
 	for i, server := range servers {
 		conn, err := net.Dial("tcp", server)
-		tools.CheckErr("Network connection establishment err", err)
+		utilities.CheckErr("Network connection establishment err", err)
 		conns[i] = conn
 	}
 	for i, conn := range conns {
@@ -937,7 +1079,7 @@ func resetServers(configs *tools.ConfigLoader) {
 	fmt.Println("Time taken for the reset process: ", (end-start)/1000000, "ms")
 }
 
-//Bench
+// Bench
 func registerBenchFlags() {
 	nKeysString = flag.String("b_nkeys", "none", "number of keys for bench clients.")
 	keysTypeString = flag.String("b_keys_type", "none", "type of key splitting for bench clients.")

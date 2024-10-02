@@ -7,15 +7,16 @@ import (
 	"math/rand"
 	"net"
 	"os"
-	"potionDB/src/antidote"
-	"potionDB/src/clocksi"
-	"potionDB/src/crdt"
-	"potionDB/src/proto"
+	"potionDB/crdt/clocksi"
+	"potionDB/crdt/crdt"
+	"potionDB/crdt/proto"
+	antidote "potionDB/potionDB/components"
 	"strconv"
 	"strings"
 	"time"
 
-	pb "github.com/golang/protobuf/proto"
+	//pb "github.com/golang/protobuf/proto"
+	pb "google.golang.org/protobuf/proto"
 )
 
 const (
@@ -508,7 +509,6 @@ func calculateReplySize() int {
 }
 
 func makeReplyProto() *proto.ApbStaticReadObjects {
-	readParams := []antidote.ReadObjectParams{antidote.ReadObjectParams{KeyParams: antidote.KeyParams{Key: "test",
-		CrdtType: proto.CRDTType_RWSET, Bucket: "test"}, ReadArgs: crdt.StateReadArguments{}}}
+	readParams := []crdt.ReadObjectParams{{KeyParams: crdt.MakeKeyParams("test", proto.CRDTType_RWSET, "test"), ReadArgs: crdt.StateReadArguments{}}}
 	return antidote.CreateStaticReadObjs(nil, readParams)
 }

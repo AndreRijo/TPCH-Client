@@ -4,10 +4,10 @@ import (
 	"bufio"
 	"fmt"
 	"os"
-	"potionDB/src/antidote"
-	"potionDB/src/crdt"
-	"potionDB/src/proto"
-	"potionDB/src/tools"
+	"potionDB/crdt/crdt"
+	"potionDB/crdt/proto"
+	antidote "potionDB/potionDB/components"
+	"potionDB/potionDB/utilities"
 	"strconv"
 	"strings"
 	"tpch_client/src/client"
@@ -51,7 +51,7 @@ func StartAutoIndexClient() {
 	}
 }
 
-//GET key bucket type PART_READ?
+// GET key bucket type PART_READ?
 func doGet(args []string) {
 	key, bucket, crdtType := args[1], args[2], args[3]
 	fmt.Printf("[READ]Key %s, Bucket %s, CRDTType %s\n", key, bucket, crdtType)
@@ -61,24 +61,24 @@ func doGet(args []string) {
 	if len(args) > 4 {
 		fmt.Println("[WARNING]Partial reading not yet supported. Doing full read instead")
 	}
-	param := []antidote.ReadObjectParams{antidote.ReadObjectParams{KeyParams: keyParams}}
+	param := []crdt.ReadObjectParams{{KeyParams: keyParams}}
 	reply := tpchInterface.DoGet(param)
 	fmt.Println("[READ]Reply: " + getReadString(keyParams.CrdtType, reply))
 }
 
-//UPDATE key bucket type UPDATE_ARGS
+// UPDATE key bucket type UPDATE_ARGS
 func doUpdate(args []string) {
 	key, bucket, crdtType := args[1], args[2], args[3]
 	fmt.Printf("[UPDATE]Key %s, Bucket %s, CRDTType %s\n", key, bucket, crdtType)
 	keyParams := db.getKeyParams(key, bucket, crdtType)
 	db.AddObject(keyParams)
 	updArgs := processUpdArgs(keyParams.CrdtType, args[4:])
-	objUpd := antidote.UpdateObjectParams{KeyParams: keyParams, UpdateArgs: &updArgs}
+	objUpd := crdt.UpdateObjectParams{KeyParams: keyParams, UpdateArgs: updArgs}
 	fmt.Println("[UPDATE]Preparing links...")
 	allUpds := db.prepareLinks(objUpd)
 	fmt.Print("[UPDATE]Updates gerated: ")
 	for _, upd := range allUpds {
-		fmt.Printf("%v: %v; ", upd.KeyParams, *upd.UpdateArgs)
+		fmt.Printf("%v: %v; ", upd.KeyParams, upd.UpdateArgs)
 	}
 	fmt.Println()
 	tpchInterface.DoUpdate(allUpds)
@@ -86,12 +86,12 @@ func doUpdate(args []string) {
 }
 
 /*
-	Args:
-	(key, bucket, type)
-	(operation name, arguments)
-	(key, bucket, type)
-	(operation name, arguments)
-	For now, assuming all arguments on the left side are variables.
+Args:
+(key, bucket, type)
+(operation name, arguments)
+(key, bucket, type)
+(operation name, arguments)
+For now, assuming all arguments on the left side are variables.
 */
 func doLink(args []string, origArgs string) {
 	key, bucket, crdtType := args[1], args[2], args[3]
@@ -150,15 +150,14 @@ func doGenericTrigger(args []string, origArgs string) {
 }
 
 /*
-	User interface:
-	CREATE TRIGGER name
-	ON keyParams
-	WITH op
-	DOW
-	UPDATE keyParams
-	WITH op
-	At the moment parsing supports either one line or multi-line EXACTLY split as with the scheme above
-
+User interface:
+CREATE TRIGGER name
+ON keyParams
+WITH op
+DOW
+UPDATE keyParams
+WITH op
+At the moment parsing supports either one line or multi-line EXACTLY split as with the scheme above
 */
 func doTrigger(args []string, origArgs string) {
 	//TODO: Make a couple of methods that handle the similar parts of LINK, TRIGGER and GENERIC TRIGGER.
@@ -215,7 +214,7 @@ func readTriggerArgs() (args []string, origArgs string) {
 	return strings.Split(result, " "), result
 }
 
-func processLinkOp(keyParams antidote.KeyParams, opName string, args []string) antidote.Link {
+func processLinkOp(keyParams crdt.KeyParams, opName string, args []string) antidote.Link {
 	opType := getOpTypeFromName(opName, keyParams.CrdtType)
 	typifiedArgs := typifyArgs(args)
 	return antidote.Link{KeyParams: keyParams, OpType: opType, Arguments: typifiedArgs}
@@ -271,10 +270,10 @@ func getArguments(opArgs string) []string {
 }
 
 func getReadString(crdtType proto.CRDTType, protobuf *proto.ApbReadObjectResp) string {
-	return tools.StateToString(crdt.ReadRespProtoToAntidoteState(protobuf, crdtType, proto.READType_FULL))
+	return utilities.StateToString(crdt.ReadRespProtoToAntidoteState(protobuf, crdtType, proto.READType_FULL))
 }
 
-//Note: These args don't include key, bucket or crdtType. args[0] contains the operation name.
+// Note: These args don't include key, bucket or crdtType. args[0] contains the operation name.
 func processUpdArgs(crdtType proto.CRDTType, args []string) crdt.UpdateArguments {
 	opType := getOpTypeFromName(args[0], crdtType)
 	switch crdtType {
