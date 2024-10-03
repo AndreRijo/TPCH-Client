@@ -18,4 +18,6 @@ replace potionDB/crdt => ../potionDB/crdt
 
 replace tpch_data_processor v0.0.0 => ../tpch_data_processor
 
-replace gotools v0.0.0 => ../goTools
+replace sqlToKeyValue v0.0.0 => ../sqlToKeyValue
+
+

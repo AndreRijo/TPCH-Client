@@ -119,6 +119,7 @@ Afterwards, go inside the `baseFolder` and clone the following repositories:
 ```
 git clone https://github.com/AndreRijo/potionDB.git potionDB
 git clone https://github.com/AndreRijo/tpch-data-processor.git tpch_data_processor
+git clone https://github.com/AndreRijo/potiondbSQL sqlToKeyValue
 git clone https://github.com/AndreRijo/TPCH-Client.git tpch_client
 ```
 

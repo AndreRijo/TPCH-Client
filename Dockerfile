@@ -12,7 +12,7 @@ COPY potionDB/crdt/go.mod potionDB/crdt/go.sum /go/potionDB/crdt/
 COPY potionDB/shared/go.mod /go/potionDB/shared/
 COPY tpch_data_processor/go.mod tpch_data_processor/go.sum /go/tpch_data_processor/
 COPY sqlToKeyValue/go.mod sqlToKeyValue/go.sum /go/sqlToKeyValue/
-COPY goTools/go.mod goTools/go.sum /go/goTools/
+#COPY goTools/go.mod goTools/go.sum /go/goTools/
 COPY tpch_client/go.mod tpch_client/go.sum /go/tpch_client/
 RUN cd tpch_client && go mod download
 
@@ -22,7 +22,7 @@ COPY potionDB/shared /go/potionDB/shared
 
 COPY tpch_data_processor/ /go/tpch_data_processor/
 COPY sqlToKeyValue/ /go/sqlToKeyValue/
-COPY goTools/ /go/goTools/
+#COPY goTools/ /go/goTools/
 
 COPY tpch_client/dockerstuff tpch_client/
 COPY tpch_client/src tpch_client/src
