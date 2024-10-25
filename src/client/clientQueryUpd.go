@@ -10,6 +10,7 @@ import (
 	"potionDB/crdt/crdt"
 	"potionDB/crdt/proto"
 	antidote "potionDB/potionDB/components"
+	"runtime"
 	"sort"
 	"strconv"
 	"time"
@@ -40,6 +41,7 @@ type MixClientResult struct {
 	updsDone int
 	updStats []UpdateStats
 	DebugUpdStats
+	clientID int
 }
 
 type UpdateStats struct {
@@ -123,12 +125,12 @@ func startMixBench() {
 	}
 
 	selfRng := rand.New(rand.NewSource(seed + int64(2*TEST_ROUTINES)))
-	chans := make([]chan MixClientResult, TEST_ROUTINES)
+	resultChan := make(chan MixClientResult, TEST_ROUTINES)
 	results := make([]MixClientResult, TEST_ROUTINES)
 	serverPerClient := make([]int, TEST_ROUTINES)
 	collectQueryStats = make([]bool, TEST_ROUTINES)
-	for i := range chans {
-		chans[i] = make(chan MixClientResult)
+	for i := range results {
+		//chans[i] = make(chan MixClientResult)
 		collectQueryStats[i] = false
 	}
 	//Distribute query clients equally or randomly by servers
@@ -151,8 +153,12 @@ func startMixBench() {
 	nConns := TEST_ROUTINES
 	conns := make([][]net.Conn, nConns)
 	fmt.Println("Making", nConns, "connections.")
+	startConnTime := time.Now().UnixNano()
+	makeClientConns(nConns, conns)
+	endConnTime := time.Now().UnixNano()
+
 	//fmt.Printf("Making %d connections (%d, %d)\n", nConns, MAX_CONNECTIONS, TEST_ROUTINES)
-	for i := 0; i < nConns; i++ {
+	/*for i := 0; i < nConns; i++ {
 		go func(i int) {
 			list := make([]net.Conn, len(servers))
 			for j := 0; j < len(servers); j++ {
@@ -161,17 +167,32 @@ func startMixBench() {
 			}
 			conns[i] = list
 		}(i)
-	}
+	}*/
 
 	fmt.Printf("Times: %+v\n", times)
+	fmt.Printf("Took %dms to connect to the servers.\n", (endConnTime-startConnTime)/int64(time.Millisecond))
 	fmt.Println("[CQU]Using the following TopK size for Q15:", q15TopSize)
 	fmt.Printf("Waiting to start queries & upds... (ops per txn: %d; batch mode: %d; latency mode: %d, isGlobal: %t, isSingle: %t, isDirect: %t, updateSpecificIndex: %t)\n",
 		READS_PER_TXN, BATCH_MODE, LATENCY_MODE, isIndexGlobal, !isMulti, LOCAL_DIRECT, UPDATE_SPECIFIC_INDEX_ONLY)
-	fmt.Println("Sleeping at", time.Now().String())
-	time.Sleep(QUERY_WAIT*1000000 - time.Duration(time.Now().UnixNano()-times.startTime))
+	sleepTime := QUERY_WAIT*1000000 - time.Duration(time.Now().UnixNano()-times.startTime)
+	connTime := time.Duration(endConnTime-startConnTime) / time.Second
+	if connTime >= 5 {
+		sleepTime += (connTime / 5) * 5 //Add a sleeping time that is a multiple of 5s.
+	}
+	/*if sleepTime < 1*time.Second { //Try to make a "synchronized" wait time with the other clients
+		if sleepTime > 0 {
+			sleepTime += 10 * time.Second
+		} else {
+			excessTime := time.Duration(int64(math.Abs(float64(sleepTime))) % (int64(10 * time.Second)))
+			sleepTime = 10*time.Second - excessTime
+		}
+	}*/
+	fmt.Println("Sleeping at", time.Now().String(), "for", sleepTime/time.Millisecond, "ms")
+	time.Sleep(sleepTime)
+	//time.Sleep(QUERY_WAIT*1000000 - time.Duration(time.Now().UnixNano()-times.startTime))
 	fmt.Println("Queries & upds started at", time.Now().String())
 	fmt.Println("Is using split: ", SPLIT_UPDATES)
-	fmt.Println("Server per client:", serverPerClient)
+	//fmt.Println("Server per client:", serverPerClient)
 
 	if statisticsInterval > 0 {
 		fmt.Println("Called mixedInterval at", time.Now().String())
@@ -180,19 +201,23 @@ func startMixBench() {
 
 	if N_UPD_CLIENTS > 0 {
 		for i := 0; i < N_UPD_CLIENTS; i++ {
-			go mixBench(0, i, serverPerClient[i], conns[i], chans[i], singleTableInfos[i],
+			go mixBench(0, i, serverPerClient[i], conns[i], resultChan, singleTableInfos[i],
 				routineOrders[i], routineItems[i], routineDelete[i], routineLineSizes[i])
 		}
 		for i := N_UPD_CLIENTS; i < TEST_ROUTINES; i++ {
-			go queryOnlyBench(0, i, serverPerClient[i], conns[i], chans[i], singleTableInfos[i])
+			go queryOnlyBench(0, i, serverPerClient[i], conns[i], resultChan, singleTableInfos[i])
 		}
 	} else {
 		for i := 0; i < TEST_ROUTINES; i++ {
 			//for i := 0; i < TEST_ROUTINES; i++ {
 			//fmt.Printf("Value of update stats for client %d: %t, started at: %s\n", i, collectQueryStats[i], time.Now().String())
-			go mixBench(0, i, serverPerClient[i], conns[i], chans[i], singleTableInfos[i],
+			go mixBench(0, i, serverPerClient[i], conns[i], resultChan, singleTableInfos[i],
 				routineOrders[i], routineItems[i], routineDelete[i], routineLineSizes[i])
 		}
+	}
+
+	if TEST_ROUTINES > 4000 {
+		TEST_DURATION += int64(5000 * TEST_ROUTINES / 4000) //Compensating for delayed start due to too many clients.
 	}
 
 	fmt.Println("Sleeping for: ", time.Duration(TEST_DURATION)*time.Millisecond, "at", time.Now().String())
@@ -204,9 +229,14 @@ func startMixBench() {
 	fmt.Printf("Test time is over at %s.\n", stopTimeFull.Format("2006-01-02 15:04:05"))
 
 	go func() {
-		for i, channel := range chans {
-			results[i] = <-channel
+		var result MixClientResult
+		for range results {
+			result = <-resultChan
+			results[result.clientID] = result
 		}
+		/*for i, channel := range chans {
+			results[i] = <-channel
+		}*/
 		//Notify update channels that there's no further updates
 		/*
 			for _, channel := range channels.updateChans {
@@ -218,13 +248,15 @@ func startMixBench() {
 		totalQueries, totalReads, avgDuration, totalUpds, nFuncs := 0.0, 0.0, 0.0, 0.0, float64(len(queryFuncs))
 		totalNewOrders, totalNewItems, totalDeleteOrders, totalDeleteItems := 0, 0, 0, 0
 		for i, result := range results {
-			fmt.Printf("%d[%d]: QueryTxns: %f, Queries: %f, QueryTxns/s: %f, Query/s: %f, Reads: %f, Reads/s: %f, Upds: %d, Upds/s: %f, "+
-				"New orders: %d, New items: %d, Deleted orders: %d, Deleted items: %d, New items/order %f, Delete items/order %f\n", i, serverPerClient[i],
-				result.nQueries/nFuncs, result.nQueries, (result.nQueries/(result.duration*nFuncs))*1000,
-				(result.nQueries/result.duration)*1000, result.nReads, (result.nReads/result.duration)*1000,
-				result.updsDone, (float64(result.updsDone)/result.duration)*1000,
-				result.newOrders, result.newItems, result.deleteOrders, result.deleteItems, float64(result.newItems)/float64(result.newOrders),
-				float64(result.deleteItems)/float64(result.deleteOrders))
+			if len(results) < 300 { //Do not print each clients' results if too many.
+				fmt.Printf("%d[%d]: QueryTxns: %f, Queries: %f, QueryTxns/s: %f, Query/s: %f, Reads: %f, Reads/s: %f, Upds: %d, Upds/s: %f, "+
+					"New orders: %d, New items: %d, Deleted orders: %d, Deleted items: %d, New items/order %f, Delete items/order %f\n", i, serverPerClient[i],
+					result.nQueries/nFuncs, result.nQueries, (result.nQueries/(result.duration*nFuncs))*1000,
+					(result.nQueries/result.duration)*1000, result.nReads, (result.nReads/result.duration)*1000,
+					result.updsDone, (float64(result.updsDone)/result.duration)*1000,
+					result.newOrders, result.newItems, result.deleteOrders, result.deleteItems, float64(result.newItems)/float64(result.newOrders),
+					float64(result.deleteItems)/float64(result.deleteOrders))
+			}
 			totalQueries += result.nQueries
 			totalReads += result.nReads
 			avgDuration += result.duration
@@ -271,9 +303,76 @@ func clientsDistributionHelper(startPos, maxServers int, selfRng *rand.Rand, ser
 	}
 }
 
+func makeClientConns(nConns int, conns [][]net.Conn) {
+	nRoutines := runtime.NumCPU() * 5
+	var doneChan chan bool
+	if nConns <= nRoutines*2 {
+		doneChan = make(chan bool, nConns)
+		for i := 0; i < nConns; i++ {
+			go func(i int) {
+				var err error
+				nAttempts := 0
+				list := make([]net.Conn, len(servers))
+				for j := 0; j < len(servers); j++ {
+					dialer := net.Dialer{KeepAlive: -1}
+					list[j], err = (&dialer).Dial("tcp", servers[j])
+					if err != nil {
+						fmt.Printf("[CQU][MakeClientConns]Error connecting to PotionDB, trying again. Error: %s\n", err.Error())
+						j--
+						nAttempts++
+						if nAttempts > 3 {
+							fmt.Printf("[CQU][MakeClientConns]Too many connection attempts failed. Exiting.\n")
+							break
+						}
+					}
+				}
+				conns[i] = list
+				doneChan <- true
+			}(i)
+		}
+	} else {
+		doneChan = make(chan bool, nRoutines)
+		factor, remaining := nConns/nRoutines, nConns%nRoutines
+		connFunc := func(i, fac int) {
+			for k := 0; k < fac; k++ {
+				list := make([]net.Conn, len(servers))
+				for j := 0; j < len(servers); j++ {
+					dialer := net.Dialer{KeepAlive: -1}
+					list[j], _ = (&dialer).Dial("tcp", servers[j])
+				}
+				conns[i+k] = list
+			}
+			doneChan <- true
+		}
+		j := 0
+		for i := 0; i < nRoutines; i++ {
+			if i < remaining {
+				go connFunc(j, factor+1)
+				j++
+			} else {
+				go connFunc(j, factor)
+			}
+			j += factor
+		}
+		/*
+			for i := 0; i < nConns; i += factor {
+				if i < remaining {
+					connFunc(i, factor+1)
+					i++
+				} else {
+					connFunc(i, factor)
+				}
+			}
+		*/
+	}
+	for i := 0; i < cap(doneChan); i++ {
+		<-doneChan
+	}
+}
+
 func readUpdsByOrder() (ordersUpds [][]string, lineItemUpds [][]string, deleteKeys []string, lineItemSizes []int, itemSizesPerOrder []int) {
 	updPartsRead := [][]int8{tpchData.ToRead[tpch.ORDERS], tpchData.ToRead[tpch.LINEITEM]}
-	return tpch.ReadUpdatesPerOrder(updCompleteFilename[:], tpch.UpdEntries[:], UpdParts[:], updPartsRead, START_UPD_FILE, FINISH_UPD_FILE)
+	return tpch.ReadUpdatesPerOrder(updCompleteFilename[:], tpch.UpdEntries[:], tpch.UpdParts[:], updPartsRead, START_UPD_FILE, FINISH_UPD_FILE)
 }
 
 func updateMixStats(queryStats []QueryStats, updStats []UpdateStats, nReads, lastStatReads, nQueries, lastStatQueries int,
@@ -598,7 +697,7 @@ func mixBench(seed int64, clientN int, defaultServer int, conns []net.Conn, resu
 		conn.Close()
 	}
 
-	resultChan <- MixClientResult{QueryClientResult: QueryClientResult{duration: float64(endTime - startTime), nQueries: float64(qDone),
+	resultChan <- MixClientResult{clientID: clientN, QueryClientResult: QueryClientResult{duration: float64(endTime - startTime), nQueries: float64(qDone),
 		nReads: float64(reads), intermediateResults: queryStats, nEntries: float64(*client.nEntries)}, updsDone: updsDone, updStats: updStats, DebugUpdStats: *tableInfo.debugStats}
 }
 
@@ -764,7 +863,7 @@ func queryOnlyBench(seed int64, clientN int, defaultServer int, conns []net.Conn
 		conn.Close()
 	}
 
-	resultChan <- MixClientResult{QueryClientResult: QueryClientResult{duration: float64(endTime - startTime), nQueries: float64(qDone),
+	resultChan <- MixClientResult{clientID: clientN, QueryClientResult: QueryClientResult{duration: float64(endTime - startTime), nQueries: float64(qDone),
 		nReads: float64(reads), intermediateResults: queryStats, nEntries: float64(*client.nEntries)}, updsDone: 0, updStats: updStats, DebugUpdStats: *tableInfo.debugStats}
 }
 
@@ -1630,7 +1729,7 @@ func (ti SingleTableInfo) getSingleUpd(orderUpd []string, lineItemUpds [][]strin
 
 	//nItems, nItemUpds := 0, 0
 	for _, item := range lineItemUpds {
-		key, upd = tpch.GetInnerMapEntry(tpchData.Headers[tpch.LINEITEM], tpchData.Keys[tpch.LINEITEM], item, tpchData.ToRead[tpch.LINEITEM])
+		key, upd = GetInnerMapEntry(tpchData.Headers[tpch.LINEITEM], tpchData.Keys[tpch.LINEITEM], item, tpchData.ToRead[tpch.LINEITEM])
 		key = getEntryKey(tpch.TableNames[tpch.LINEITEM], key)
 		itemRegions = itemFunc(orderUpd, item)
 		for _, region := range itemRegions {
@@ -1653,7 +1752,7 @@ func (ti SingleTableInfo) makeSingleUpd(orderUpd []string, lineItemUpds [][]stri
 	itemsPerServer []map[string]crdt.UpdateArguments) {
 	orderReg := regionFuncs[tpch.ORDERS](orderUpd)
 
-	orderKey, orderMapUpd := tpch.GetInnerMapEntry(tpchData.Headers[tpch.ORDERS], tpchData.Keys[tpch.ORDERS], orderUpd, tpchData.ToRead[tpch.ORDERS])
+	orderKey, orderMapUpd := GetInnerMapEntry(tpchData.Headers[tpch.ORDERS], tpchData.Keys[tpch.ORDERS], orderUpd, tpchData.ToRead[tpch.ORDERS])
 	orderKey = getEntryKey(tpch.TableNames[tpch.ORDERS], orderKey)
 	//fmt.Println("startSingleUpd", bufI)
 	//currUpdParams := make([]crdt.UpdateObjectParams, getUpdSize(itemsPerServer[orderReg])+1)

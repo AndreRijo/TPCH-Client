@@ -107,7 +107,7 @@ func chooseTest() {
 			go doProtoTest(replyChan)
 		}
 	} else if testType == TEST_CLIENT {
-		conns := makeClientConns()
+		conns := makePBClientConns()
 		start = time.Now().UnixNano()
 		for i := 0; i < nRoutines; i++ {
 			conn := conns[i]
@@ -115,7 +115,7 @@ func chooseTest() {
 		}
 	} else if testType == TEST_CLIENT_REPLY {
 		replySize := calculateReplySize()
-		conns := makeClientConns()
+		conns := makePBClientConns()
 		start = time.Now().UnixNano()
 		for i := 0; i < nRoutines; i++ {
 			conn := conns[i]
@@ -172,7 +172,7 @@ func chooseTest() {
 	printProtoStatistics(totalBytes, start, end)
 }
 
-func makeClientConns() (conns []net.Conn) {
+func makePBClientConns() (conns []net.Conn) {
 	conns = make([]net.Conn, nRoutines)
 	var err error
 	dialer := net.Dialer{KeepAlive: -1}

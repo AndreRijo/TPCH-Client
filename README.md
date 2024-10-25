@@ -3,8 +3,8 @@
 A client for PotionDB that implements [TPC-H's](https://www.tpc.org/tpch/) benchmark.
 It is assumed the reader is somewhat familiar with [TPC-H's specification](https://www.tpc.org/tpc_documents_current_versions/current_specifications5.asp).
 
-For Eurosys reviewers, please use the Docker image provided at `andrerj/tpchclient:vldb`.
-If building from source is a must, consider changing to the *vldb* branch: the main branch will remain stable (code-wise) during the review process, but may be updated later on.
+For Eurosys reviewers, please use the Docker image provided at `andrerj/tpchclient`.
+If building from source is a must, please refer to the instructions in [Using Docker and compile from source](#option-2-using-docker-and-compile-from-source).
 
 ## Features
 
@@ -18,6 +18,8 @@ If building from source is a must, consider changing to the *vldb* branch: the m
 - And more :)
 
 ## Initial setup
+
+**Note**: if you have already prepared the TPC-H dataset when setting up PotionDB, you can re-use the dataset for the client and skip to [here](#potiondbs-tpc-h-client-setup).
 
 Before the client can be used, it is necessary to prepare TPC-H's dataset.
 This can be summarized into the following tasks:
@@ -84,18 +86,18 @@ The new data will be inside a folder named `_mod` that is inside both `tables` a
 
 ### Preparing PotionDB for TPC-H
 
-Please check the instructions in [PotionDB's github page](https://github.com/AndreRijo/potionDB/tree/remoteOp) on how to start PotionDB.
+Please check the instructions in [PotionDB's github page](https://github.com/AndreRijo/potionDB) on how to start PotionDB.
 It is recommended to read its full README before proceding further with PotionDB's TPC-H client.
 
-[This section in particular](https://github.com/AndreRijo/potionDB/tree/remoteOp#Running-multiple-instances-of-PotionDB) explains how to run 5 instances of PotionDB that are ready for TPC-H benchmarking.
+[This section in particular](https://github.com/AndreRijo/potionDB#Running-multiple-instances-of-PotionDB) explains how to run 5 instances of PotionDB that are ready for TPC-H benchmarking.
 Make sure to start those 5 instances before attempting to start the client and wait until a message similar to this one shows up in every instance:
 
 ```
 PotionDB started at port 8087 with ReplicaID 23781
 ```
 
-Make sure to use the Docker image provided at andrerj/potiondb (for Eurosys reviewers, andrerj/potiondb:vldb).
-If for some reason you do not want to do so, please check on [PotionDB's github page](https://github.com/AndreRijo/potionDB/tree/remoteOp) for other options which may fit you.
+Make sure to use the Docker image provided at andrerj/potiondb.
+If for some reason you do not want to do so, please check on [PotionDB's github page](https://github.com/AndreRijo/potionDB) for other options that may fit you.
 
 ## PotionDB's TPC-H Client setup
 
@@ -121,13 +123,6 @@ git clone https://github.com/AndreRijo/potionDB.git potionDB
 git clone https://github.com/AndreRijo/tpch-data-processor.git tpch_data_processor
 git clone https://github.com/AndreRijo/potiondbSQL sqlToKeyValue
 git clone https://github.com/AndreRijo/TPCH-Client.git tpch_client
-```
-
-Make sure to checkout PotionDB into the branch *remoteOp*.
-For this, go inside the folder *potionDB* and run:
-
-```
-git checkout remoteOp
 ```
 
 If not already done, install Docker. For reference: https://docs.docker.com/engine/install/
@@ -225,7 +220,7 @@ Some of the most relevant, available settings:
 - `singleIndexServer (true/false)`: by default false, in order for all servers to replicate all views. Can be set to true to simulate a single, central server responsible for processing all views;
 - `servers`: list of servers (IP:port), separated by a space. The order *matters*: define them according to the order of which regions are spread across servers (check the `buckets` setting of each server - the one with `R1` is the first server, the one with `R2` the second, etc). For example, if executing locally, this would be: `potiondb1:8087, potiondb2:8087, potiondb3:8087, potiondb4:8087, potiondb5:8087`. Ports will be usually `:8087` unless PotionDB is being deployed without Docker or all servers are in the same machine but the client is in another machine;
 - `scale`: corresponds to the value used for `-s` when the dataset was generated with `dbgen`;
-- `doDataLoad (true/false)`: defines if the client should do the initial loading of the database or not. If it is intended to run multiple instances of the client in different machines, this should be set to false in all clients bar one;
+- `doDataLoad (true/false)`: defines if the client should do the initial loading of the database or not. If it is intended to run multiple instances of the client in different machines, this should be set to false in all clients bar one. If PotionDB is set to do dataload, set this to false;
 - `doQueries` and `doUpdates (true/false on both)`: defines if the client should do queries or updates. Set them both to false if the intention is for the client to only do the initial loading of the database - otherwise, keep them both on true and control the update ratio with `updRate`;
 - `updRate (0-1)`: defines the percentage of operations that should be updates. Setting to 0 or 1 corresponds to only doing, respectively, queries or updates;
 - `startUpdFile` and `finishUpdFile`: if running multiple instances of the client, you will need to adjust this to ensure each instance has a non-overlaping subset of update files;

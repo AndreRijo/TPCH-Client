@@ -1249,8 +1249,10 @@ func sendQ18(client QueryClient) (nRequests int) {
 // Note that this is penalizing PotionDB.
 func getQ1Reads(client QueryClient, fullR, partialR []crdt.ReadObjectParams, bufI []int, reads int) (newReads int) {
 	rndDay := client.rng.Int63n(60) + 61 //0-59 + 61 = 61-120, as intended.
-	partialR[bufI[1]], partialR[bufI[1]+1] = q1ReadParamsHelper(strconv.FormatInt(rndDay, 10)), q1ReadParamsHelper("120")
-	bufI[1] += 2
+	partialR[bufI[1]] = q1ReadParamsHelper(strconv.FormatInt(rndDay, 10))
+	bufI[1]++
+	//partialR[bufI[1]], partialR[bufI[1]+1] = q1ReadParamsHelper(strconv.FormatInt(rndDay, 10)), q1ReadParamsHelper("120")
+	//bufI[1] += 2
 	if PRINT_QUERY {
 		fmt.Println("[ClientQuery][MapFullRead]Q1 query: requesting delta days ", rndDay)
 	}
@@ -1260,8 +1262,9 @@ func getQ1Reads(client QueryClient, fullR, partialR []crdt.ReadObjectParams, buf
 func getQ1LocalDirectReads(client QueryClient, fullR, partialR [][]crdt.ReadObjectParams, bufI [][]int, rngRegions []int, rngRegionsI, reads int) (newReads, rngRegion int) {
 	rndDay, nRegions := client.rng.Int63n(60)+61, len(fullR) //0-59 + 61 = 61-120, as intended.
 	for i := 0; i < nRegions; i++ {
-		partialR[i][bufI[i][1]], partialR[i][bufI[i][1]+1] = q1ReadParamsHelper(strconv.FormatInt(rndDay, 10)), q1ReadParamsHelper("120")
-		bufI[i][1] += 2
+		//partialR[i][bufI[i][1]], partialR[i][bufI[i][1]+1] = q1ReadParamsHelper(strconv.FormatInt(rndDay, 10)), q1ReadParamsHelper("120")
+		//bufI[i][1] += 2
+		partialR[i][bufI[i][1]] = q1ReadParamsHelper(strconv.FormatInt(rndDay, 10))
 	}
 	if PRINT_QUERY {
 		fmt.Println("[ClientQuery][MapFullRead]Q1 query: requesting delta days ", rndDay)
@@ -1272,9 +1275,11 @@ func getQ1LocalDirectReads(client QueryClient, fullR, partialR [][]crdt.ReadObje
 func getQ1LocalServerReads(client QueryClient, fullR, partialR []crdt.ReadObjectParams, bufI []int, reads int) (newReads int) {
 	rndDay, nRegions, offset := client.rng.Int63n(60)+61, len(fullR), bufI[1] //0-59 + 61 = 61-120, as intended.
 	for i := 0; i < nRegions; i++ {
-		partialR[offset+i*2], partialR[offset+i*2+1] = q1ReadParamsHelper(strconv.FormatInt(rndDay, 10)), q1ReadParamsHelper("120")
+		//partialR[offset+i*2], partialR[offset+i*2+1] = q1ReadParamsHelper(strconv.FormatInt(rndDay, 10)), q1ReadParamsHelper("120")
+		partialR[offset+i] = q1ReadParamsHelper(strconv.FormatInt(rndDay, 10))
 	}
-	bufI[1] += nRegions * 2
+	bufI[1] += nRegions
+	//bufI[1] += nRegions * 2
 	if PRINT_QUERY {
 		fmt.Println("[ClientQuery][MapFullRead]Q1 query: requesting delta days ", rndDay)
 	}
@@ -1282,41 +1287,60 @@ func getQ1LocalServerReads(client QueryClient, fullR, partialR []crdt.ReadObject
 }
 
 func processQ1Reply(client QueryClient, replies []*proto.ApbReadObjectResp, bufI []int, reads int) (newReads int) {
-	processQ1ReplyProto(replies[bufI[1]], replies[bufI[1]+1], client)
-	bufI[1] += 2
+	//processQ1ReplyProto(replies[bufI[1]], replies[bufI[1]+1], client)
+	//bufI[1] += 2
+	//return reads + 2
+	processQ1ReplyProto(replies[bufI[1]], client)
+	bufI[1]++
 	return reads + 2
 }
 
 func processQ1LocalDirectReply(client QueryClient, replies [][]*proto.ApbReadObjectResp, bufI [][]int, rngRegions []int, rngRegionsI int, reads int) (newReads int) {
 	nRegions := len(client.serverConns)
 	bufI1 := localDirectBufIToServerBufI(bufI, 1)
-	relevantReplies := readRepliesToOneSlice(replies, bufI1, 2)
+	relevantReplies := readRepliesToOneSlice(replies, bufI1, 1 /*2*/)
 	//No need to call processQ1ReplyProto as the merge already does the processing
-	printQ1Result(crdt.ReadRespProtoToAntidoteState(mergeQ1IndexReply(relevantReplies)[0], proto.CRDTType_RRMAP, proto.READType_GET_ALL_VALUES).(crdt.EmbMapGetValuesState))
-	incrementAllBufILocalDirect(bufI, 1, 2)
+	//printQ1Result(crdt.ReadRespProtoToAntidoteState(mergeQ1IndexReply(relevantReplies)[0], proto.CRDTType_RRMAP, proto.READType_GET_ALL_VALUES).(crdt.EmbMapGetValuesState))
+	printQ1Result(crdt.ReadRespProtoToAntidoteState(mergeQ1IndexReply(relevantReplies)[0], proto.CRDTType_RRMAP, proto.READType_GET_VALUES).(crdt.EmbMapGetValuesState))
+	incrementAllBufILocalDirect(bufI, 1, 1 /*2*/)
 	return reads + nRegions*2
 }
 
 func processQ1LocalServerReply(client QueryClient, replies []*proto.ApbReadObjectResp, bufI []int, reads int) (newReads int) {
 	nRegions := len(client.serverConns)
-	start, end := bufI[1], bufI[1]+2*nRegions
+	start, end := bufI[1] /*bufI[1]+2*nRegions*/, bufI[1]+nRegions
 	//No need to call processQ1ReplyProto as the merge already does the processing
-	printQ1Result(crdt.ReadRespProtoToAntidoteState(mergeQ1IndexReply(replies[start:end])[1], proto.CRDTType_RRMAP, proto.READType_GET_ALL_VALUES).(crdt.EmbMapGetValuesState))
-	bufI[1] += 2 * nRegions
+	printQ1Result(crdt.ReadRespProtoToAntidoteState(mergeQ1IndexReply(replies[start:end])[1], proto.CRDTType_RRMAP, proto.READType_GET_VALUES).(crdt.EmbMapGetValuesState))
+	//printQ1Result(crdt.ReadRespProtoToAntidoteState(mergeQ1IndexReply(replies[start:end])[1], proto.CRDTType_RRMAP, proto.READType_GET_ALL_VALUES).(crdt.EmbMapGetValuesState))
+	//bufI[1] += 2 * nRegions
+	bufI[1] += nRegions
 	return reads + 2*nRegions
 }
 
-func processQ1ReplyProto(askedReply, baseReply *proto.ApbReadObjectResp, client QueryClient) {
+func processQ1ReplyProto( /*askedReply, baseReply *proto.ApbReadObjectResp*/ reply *proto.ApbReadObjectResp, client QueryClient) {
 	//fmt.Println("[ProcessQ1]Asked State (proto):", askedReply)
 	//fmt.Println()
 	//fmt.Println("[ProcessQ1]Base State (proto):", baseReply)
 	//fmt.Println()
-	askedState, baseState := crdt.ReadRespProtoToAntidoteState(askedReply, proto.CRDTType_RRMAP, proto.READType_GET_ALL_VALUES).(crdt.EmbMapGetValuesState),
-		crdt.ReadRespProtoToAntidoteState(baseReply, proto.CRDTType_RRMAP, proto.READType_GET_ALL_VALUES).(crdt.EmbMapGetValuesState)
-	//fmt.Println("[ProcessQ1]Asked State:", askedState)
+	//askedState, baseState := crdt.ReadRespProtoToAntidoteState(askedReply, proto.CRDTType_RRMAP, proto.READType_GET_ALL_VALUES).(crdt.EmbMapGetValuesState),
+	//crdt.ReadRespProtoToAntidoteState(baseReply, proto.CRDTType_RRMAP, proto.READType_GET_ALL_VALUES).(crdt.EmbMapGetValuesState)
+	fullState := crdt.ReadRespProtoToAntidoteState(reply, proto.CRDTType_RRMAP, proto.READType_GET_VALUES).(crdt.EmbMapGetValuesState)
+	var askedState, baseState crdt.EmbMapGetValuesState
+	//fmt.Printf("[ClientQuery][Q1]Full state: %+v\n", fullState)
 	//fmt.Println()
-	//fmt.Println("[ProcessQ1]Base State:", baseState)
-	//fmt.Println()
+	for key, state := range fullState.States {
+		if key == "120" {
+			//fmt.Println("[ClientQuery][Q1]Found state with 120")
+			baseState = state.(crdt.EmbMapGetValuesState)
+		} else {
+			//fmt.Println("[ClientQuery][Q1]Found state with", key)
+			askedState = state.(crdt.EmbMapGetValuesState)
+		}
+	}
+	/*fmt.Println("[ProcessQ1]Asked State:", askedState)
+	fmt.Println()
+	fmt.Println("[ProcessQ1]Base State:", baseState)
+	fmt.Println()*/
 	mergedState := crdt.EmbMapGetValuesState{States: make(map[string]crdt.State, len(askedState.States))}
 	for key, innerAsked := range askedState.States {
 		mergedState.States[key] = q1MergeReadResult(innerAsked.(crdt.EmbMapGetValuesState), baseState.States[key].(crdt.EmbMapGetValuesState))
@@ -1330,7 +1354,8 @@ func processQ1ReplyProto(askedReply, baseReply *proto.ApbReadObjectResp, client 
 func sendQ1(client QueryClient) (nRequests int) {
 	rndDay := client.rng.Int63n(60) + 61 //0-59 + 61 = 61-120, as intended.
 
-	readParam := []crdt.ReadObjectParams{q1ReadParamsHelper(strconv.FormatInt(rndDay, 10)), q1ReadParamsHelper("120")}
+	//readParam := []crdt.ReadObjectParams{q1ReadParamsHelper(strconv.FormatInt(rndDay, 10)), q1ReadParamsHelper("120")}
+	readParam := []crdt.ReadObjectParams{q1ReadParamsHelper(strconv.FormatInt(rndDay, 10))}
 	//fmt.Printf("%+v\n", readParam)
 	//fmt.Println("Rnd day:", rndDay)
 	replyProto := mergeIndex(sendReceiveIndexQuery(client, nil, readParam), 1)
@@ -1343,7 +1368,8 @@ func sendQ1(client QueryClient) (nRequests int) {
 	fmt.Println()
 	fmt.Println("[SendQ1]Second replyProto:", replyProto[1])
 	fmt.Println()*/
-	processQ1ReplyProto(replyProto[0], replyProto[1], client)
+	processQ1ReplyProto(replyProto[0], client)
+	//processQ1ReplyProto(replyProto[0], replyProto[1], client)
 
 	//mapStateMerged := processQ1ReplyProto(mapStateAsked, mapStateBased)
 
@@ -1375,7 +1401,7 @@ func q1MergeReadResult(askedState, baseState crdt.EmbMapGetValuesState) (mergedS
 	return
 }
 
-func q1ReadParamsHelper(day string) crdt.ReadObjectParams {
+/*func q1ReadParamsHelper(day string) crdt.ReadObjectParams {
 	outerArgs := crdt.EmbMapPartialArguments{Args: make(map[string]crdt.ReadArguments)}
 	cr, ar := crdt.StateReadArguments{}, crdt.AvgGetFullArguments{}
 	outerArgs.Args[Q1_SUM_QTY], outerArgs.Args[Q1_SUM_BASE_PRICE], outerArgs.Args[Q1_SUM_DISC_PRICE], outerArgs.Args[Q1_SUM_CHARGE], outerArgs.Args[Q1_COUNT_ORDER] = cr, cr, cr, cr, cr
@@ -1385,13 +1411,26 @@ func q1ReadParamsHelper(day string) crdt.ReadObjectParams {
 		KeyParams: crdt.KeyParams{Key: Q1_KEY + day, CrdtType: proto.CRDTType_RRMAP, Bucket: buckets[INDEX_BKT]},
 		ReadArgs:  crdt.EmbMapPartialOnAllArguments{ArgForAll: outerArgs},
 	}
+}*/
+
+func q1ReadParamsHelper(day string) crdt.ReadObjectParams {
+	outerArgs := crdt.EmbMapPartialArguments{Args: make(map[string]crdt.ReadArguments)}
+	cr, ar := crdt.StateReadArguments{}, crdt.AvgGetFullArguments{}
+	outerArgs.Args[Q1_SUM_QTY], outerArgs.Args[Q1_SUM_BASE_PRICE], outerArgs.Args[Q1_SUM_DISC_PRICE], outerArgs.Args[Q1_SUM_CHARGE], outerArgs.Args[Q1_COUNT_ORDER] = cr, cr, cr, cr, cr
+	outerArgs.Args[Q1_AVG_QTY], outerArgs.Args[Q1_AVG_PRICE], outerArgs.Args[Q1_AVG_DISC] = ar, ar, ar
+
+	return crdt.ReadObjectParams{
+		KeyParams: crdt.KeyParams{Key: Q1_KEY, CrdtType: proto.CRDTType_RRMAP, Bucket: buckets[INDEX_BKT]},
+		ReadArgs: crdt.EmbMapPartialArguments{Args: map[string]crdt.ReadArguments{
+			day: crdt.EmbMapPartialOnAllArguments{ArgForAll: outerArgs}, "120": crdt.EmbMapPartialOnAllArguments{ArgForAll: outerArgs}}},
+	}
 }
 
 func printQ1Result(mapState crdt.EmbMapGetValuesState) {
 	//fmt.Println("[PrintQ1Result]State:", mapState)
 	if PRINT_QUERY {
 		fmt.Println("Q1: Summary report for shipped lineitems")
-		//fmt.Println(mapState)
+		//fmt.Printf("[ClientQuery][Q1Print]Map State: %+v\n", mapState)
 		for key, insideState := range mapState.States {
 			insideMap := insideState.(crdt.EmbMapGetValuesState)
 			qtyState, priceState, discState := insideMap.States[Q1_AVG_QTY].(crdt.AvgFullState), insideMap.States[Q1_AVG_PRICE].(crdt.AvgFullState), insideMap.States[Q1_AVG_DISC].(crdt.AvgFullState)
@@ -2042,7 +2081,7 @@ func processQ10ReplyProto(protobuf *proto.ApbReadObjectResp, client QueryClient)
 		var extraData []string
 		for _, pair := range entries {
 			extraData = unpackIndexExtraData(pair.GetData(), Q10_N_EXTRA_DATA)
-			fmt.Printf("%d: %d", pair.GetPlayerId(), pair.GetScore())
+			fmt.Printf("%d: %d ", pair.GetPlayerId(), pair.GetScore())
 			for _, data := range extraData {
 				fmt.Printf("| %s", data)
 			}
@@ -3151,19 +3190,26 @@ func sendQ17(client QueryClient) (nRequests int) {
 
 func getQ19Reads(client QueryClient, fullR, partialR []crdt.ReadObjectParams, bufI []int, reads int) (newReads int) {
 	brandsMap, quantities := getBrandsQuantitiesQ19(client)
-	offset, i := bufI[1], 0
+	//offset, i := bufI[1], 0
 	//3 reads: one per brand
-	for brand := range brandsMap {
+	/*for brand := range brandsMap {
 		partialR[offset] = crdt.ReadObjectParams{KeyParams: crdt.KeyParams{Key: Q19_KEY + Q19_CONTAINERS[i], CrdtType: proto.CRDTType_RRMAP, Bucket: buckets[INDEX_BKT]},
 			ReadArgs: getQ19QuantityReadArgs(quantities[i], brand)}
 		offset++
 		i++
+	}*/
+	//bufI[1] = offset
+	readArgs, i := crdt.EmbMapPartialArguments{Args: make(map[string]crdt.ReadArguments, 3)}, 0
+	for brand := range brandsMap {
+		readArgs.Args[Q19_CONTAINERS[i]] = getQ19QuantityReadArgs(quantities[i], brand)
+		i++
 	}
-	bufI[1] = offset
+	partialR[bufI[1]] = crdt.ReadObjectParams{KeyParams: crdt.KeyParams{Key: Q19_KEY, CrdtType: proto.CRDTType_RRMAP, Bucket: buckets[INDEX_BKT]}, ReadArgs: readArgs}
+	bufI[1]++
 	if PRINT_QUERY {
 		fmt.Printf("[ClientQuery][RRMap]Q19 query: Discounted revenue of orders delivered by air, in person, of brands %v, quantity %v, with a given size and container.\n", brandsMap, quantities)
 	}
-	return reads + 30
+	return reads + 33
 }
 
 func getBrandsQuantitiesQ19(client QueryClient) (brandsMap map[string]struct{}, quantities []int64) {
@@ -3189,72 +3235,88 @@ func getQ19QuantityReadArgs(quantity int64, brand string) crdt.EmbMapPartialArgu
 
 func getQ19LocalDirectReads(client QueryClient, fullR, partialR [][]crdt.ReadObjectParams, bufI [][]int, rngRegions []int, rngRegionsI, reads int) (newReads, rngRegion int) {
 	brandsMap, quantities := getBrandsQuantitiesQ19(client)
-	readArgs, keyP, nRegions := make([]crdt.EmbMapPartialArguments, len(brandsMap)), make([]crdt.KeyParams, len(brandsMap)), len(tpchData.Tables.Regions)
-	j := 0
+	//readArgs, keyP, nRegions := make([]crdt.EmbMapPartialArguments, len(brandsMap)), make([]crdt.KeyParams, len(brandsMap)), len(tpchData.Tables.Regions)
+	nRegions := len(tpchData.Tables.Regions)
+	readArgs, nRegions, j := crdt.EmbMapPartialArguments{Args: make(map[string]crdt.ReadArguments, 3)}, len(tpchData.Tables.Regions), 0
 	for brand := range brandsMap {
-		readArgs[j], keyP[j] = getQ19QuantityReadArgs(quantities[j], brand), crdt.KeyParams{Key: Q19_KEY + Q19_CONTAINERS[j], CrdtType: proto.CRDTType_RRMAP, Bucket: buckets[INDEX_BKT]}
+		readArgs.Args[Q19_CONTAINERS[j]] = getQ19QuantityReadArgs(quantities[j], brand)
+		//readArgs[j], keyP[j] = getQ19QuantityReadArgs(quantities[j], brand), crdt.KeyParams{Key: Q19_KEY + Q19_CONTAINERS[j], CrdtType: proto.CRDTType_RRMAP, Bucket: buckets[INDEX_BKT]}
 		j++
 	}
 	for i := 0; i < nRegions; i++ {
-		localP, localBufI := partialR[i], bufI[i][1]
+		/*localP, localBufI := partialR[i], bufI[i][1]
 		for j = 0; j < len(readArgs); j++ {
 			keyP[j].Bucket = buckets[INDEX_BKT+i]
 			localP[localBufI] = crdt.ReadObjectParams{KeyParams: keyP[j], ReadArgs: readArgs[j]}
 			localBufI++
 		}
-		bufI[i][1] = localBufI
+		bufI[i][1] = localBufI*/
+		partialR[i][bufI[i][1]] = crdt.ReadObjectParams{KeyParams: crdt.KeyParams{Key: Q19_KEY, CrdtType: proto.CRDTType_RRMAP, Bucket: buckets[INDEX_BKT+i]}, ReadArgs: readArgs}
+		bufI[i][1]++
 	}
-	return reads + nRegions*30, 0
+	return reads + nRegions*33, 0
 }
 
 func getQ19LocalServerReads(client QueryClient, fullR, partialR []crdt.ReadObjectParams, bufI []int, reads int) (newReads int) {
 	brandsMap, quantities := getBrandsQuantitiesQ19(client)
-	readArgs, keyP, nRegions, offset := make([]crdt.EmbMapPartialArguments, len(brandsMap)), make([]crdt.KeyParams, len(brandsMap)), len(tpchData.Tables.Regions), bufI[1]
+	//readArgs, keyP, nRegions, offset := make([]crdt.EmbMapPartialArguments, len(brandsMap)), make([]crdt.KeyParams, len(brandsMap)), len(tpchData.Tables.Regions), bufI[1]
+	readArgs, nRegions, offset := crdt.EmbMapPartialArguments{Args: make(map[string]crdt.ReadArguments, 3)}, len(tpchData.Tables.Regions), bufI[1]
 	j := 0
 	for brand := range brandsMap {
-		readArgs[j], keyP[j] = getQ19QuantityReadArgs(quantities[j], Q19_CONTAINERS[j]), crdt.KeyParams{Key: Q19_KEY + brand, CrdtType: proto.CRDTType_RRMAP, Bucket: buckets[INDEX_BKT]}
+		//readArgs[j], keyP[j] = getQ19QuantityReadArgs(quantities[j], Q19_CONTAINERS[j]), crdt.KeyParams{Key: Q19_KEY + brand, CrdtType: proto.CRDTType_RRMAP, Bucket: buckets[INDEX_BKT]}
+		//readArgs[j], keyP[j] = getQ19QuantityReadArgs(quantities[j], brand), crdt.KeyParams{Key: Q19_KEY + Q19_CONTAINERS[j], CrdtType: proto.CRDTType_RRMAP, Bucket: buckets[INDEX_BKT]}
+		readArgs.Args[Q19_CONTAINERS[j]] = getQ19QuantityReadArgs(quantities[j], brand)
 		j++
 	}
 	for i := 0; i < nRegions; i++ {
-		for j = 0; j < len(readArgs); j++ {
+		/*for j = 0; j < len(readArgs); j++ {
 			keyP[j].Bucket = buckets[INDEX_BKT+i]
 			partialR[offset] = crdt.ReadObjectParams{KeyParams: keyP[j], ReadArgs: readArgs[j]}
 			offset++
-		}
+		}*/
+		partialR[offset] = crdt.ReadObjectParams{KeyParams: crdt.KeyParams{Key: Q19_KEY, CrdtType: proto.CRDTType_RRMAP, Bucket: buckets[INDEX_BKT+i]}, ReadArgs: readArgs}
+		offset++
 	}
 	bufI[1] = offset
-	return reads + nRegions*30
+	return reads + nRegions*33
 }
 
 func processQ19Reply(client QueryClient, replies []*proto.ApbReadObjectResp, bufI []int, reads int) (newReads int) {
-	processQ19ReplyProto(replies[bufI[1]:bufI[1]+3], client)
-	bufI[1] += 3
-	return reads + 30
+	//processQ19ReplyProto(replies[bufI[1]:bufI[1]+3], client)
+	processQ19ReplyProto(replies[bufI[1]], client)
+	//bufI[1] += 3
+	bufI[1]++
+	return reads + 33
 }
 
 func processQ19LocalDirectReply(client QueryClient, replies [][]*proto.ApbReadObjectResp, bufI [][]int, rngRegions []int, rngRegionsI int, reads int) (newReads int) {
 	nRegions := len(client.serverConns)
 	bufI1 := localDirectBufIToServerBufI(bufI, 1)
-	relevantReplies := readRepliesToOneSlice(replies, bufI1, 3)
-	processQ19ReplyProto(mergeQ19IndexReply(relevantReplies), client)
-	incrementAllBufILocalDirect(bufI, 1, 3)
-	return reads + nRegions*30
+	//relevantReplies := readRepliesToOneSlice(replies, bufI1, 3)
+	relevantReplies := readRepliesToOneSlice(replies, bufI1, 1)
+	processQ19ReplyProto(mergeQ19IndexReply(relevantReplies)[0], client)
+	incrementAllBufILocalDirect(bufI, 1, 1 /*3*/)
+	return reads + nRegions*33
 }
 
 // Queries that are naturally local (i.e., no merging needed) do not need processLocalServerReply
 func processQ19LocalServerReply(client QueryClient, replies []*proto.ApbReadObjectResp, bufI []int, reads int) (newReads int) {
 	nRegions := len(client.serverConns)
-	start, end := bufI[1], bufI[1]+nRegions*3
-	processQ19ReplyProto(mergeQ19IndexReply(replies[start:end]), client)
-	bufI[1] += nRegions * 3
-	return reads + nRegions*30
+	start, end := bufI[1] /*, bufI[1]+nRegions*3*/, bufI[1]+nRegions
+	processQ19ReplyProto(mergeQ19IndexReply(replies[start:end])[0], client)
+	//bufI[1] += nRegions * 3
+	bufI[1] += nRegions
+	return reads + nRegions*33
 }
 
-func processQ19ReplyProto(protobufs []*proto.ApbReadObjectResp, client QueryClient) {
+func processQ19ReplyProto( /*protobufs []*proto.ApbReadObjectResp*/ protobufs *proto.ApbReadObjectResp, client QueryClient) {
 	revenue := 0.0
 	nEntries := 0
-	for _, protobuf := range protobufs {
-		mapEntries := protobuf.GetPartread().GetMap().GetGetvalues().GetValues()
+	insidePbs := protobufs.GetPartread().GetMap().GetGetvalues().GetValues()
+	//fmt.Printf("[ClientQuery]Q19: PBs received: %v\n", protobufs)
+	//for _, protobuf := range protobufs {
+	for _, insidePb := range insidePbs {
+		mapEntries := insidePb.GetValue().GetPartread().GetMap().GetGetvalues().GetValues()
 		nEntries += len(mapEntries)
 		for _, entry := range mapEntries {
 			revenue += entry.GetValue().GetCounterfloat().GetValue()
@@ -3268,24 +3330,33 @@ func processQ19ReplyProto(protobufs []*proto.ApbReadObjectResp, client QueryClie
 
 func sendQ19(client QueryClient) (nRequests int) {
 	brandsMap, quantities := getBrandsQuantitiesQ19(client)
-	i, readP := 0, make([]crdt.ReadObjectParams, len(brandsMap))
+	/*i, readP := 0, make([]crdt.ReadObjectParams, len(brandsMap))
 	//3 reads: one per brand
 	for brand := range brandsMap {
 		readP[i] = crdt.ReadObjectParams{KeyParams: crdt.KeyParams{Key: Q19_KEY + Q19_CONTAINERS[i], CrdtType: proto.CRDTType_RRMAP, Bucket: buckets[INDEX_BKT]},
 			ReadArgs: getQ19QuantityReadArgs(quantities[i], brand)}
 		i++
+	}*/
+
+	readArgs, i := crdt.EmbMapPartialArguments{Args: make(map[string]crdt.ReadArguments, 3)}, 0
+	for brand := range brandsMap {
+		readArgs.Args[Q19_CONTAINERS[i]] = getQ19QuantityReadArgs(quantities[i], brand)
+		i++
 	}
+	readP := []crdt.ReadObjectParams{{KeyParams: crdt.KeyParams{Key: Q19_KEY, CrdtType: proto.CRDTType_RRMAP, Bucket: buckets[INDEX_BKT]}, ReadArgs: readArgs}}
+
 	protos := mergeIndex(sendReceiveIndexQuery(client, nil, readP), 19)
 
 	if PRINT_QUERY {
 		fmt.Printf("[ClientQuery][RRMap]Q19 query: Discounted revenue of orders delivered by air, in person, of brands %v, quantity %v, with a given size and container.\n", brandsMap, quantities)
 	}
-	processQ19ReplyProto(protos, client)
+	processQ19ReplyProto(protos[0], client)
+	//processQ19ReplyProto(protos, client)
 
 	if isIndexGlobal {
-		return 30
+		return 33
 	}
-	return 30 * len(tpchData.Tables.Regions)
+	return 33 * len(tpchData.Tables.Regions)
 }
 
 func getQ20Reads(client QueryClient, fullR, partialR []crdt.ReadObjectParams, bufI []int, reads int) (newReads int) {
@@ -4359,10 +4430,12 @@ func mergeQ1IndexReply(protoObjs []*proto.ApbReadObjectResp) (merged []*proto.Ap
 	//This function is already prepared to merge any amount of embedded maps
 	//fmt.Printf("[Queries][MergeQ1IndexReply]ProtoObjs: %+v\n", protoObjs)
 	//fmt.Println("[Queries][MergeQ1IndexReply]Len of protoObjs:", len(protoObjs))
-	dayOne := []*proto.ApbReadObjectResp{protoObjs[0], protoObjs[2], protoObjs[4], protoObjs[6], protoObjs[8]}
+
+	/*dayOne := []*proto.ApbReadObjectResp{protoObjs[0], protoObjs[2], protoObjs[4], protoObjs[6], protoObjs[8]}
 	dayTwo := []*proto.ApbReadObjectResp{protoObjs[1], protoObjs[3], protoObjs[5], protoObjs[7], protoObjs[9]}
 
-	return []*proto.ApbReadObjectResp{mergeEmbMapProtosPartRead(dayOne)[0], mergeEmbMapProtosPartRead(dayTwo)[0]}
+	return []*proto.ApbReadObjectResp{mergeEmbMapProtosPartRead(dayOne)[0], mergeEmbMapProtosPartRead(dayTwo)[0]}*/
+	return mergeEmbMapProtosPartRead(protoObjs)
 }
 
 func mergeQ4IndexReply(protoObjs []*proto.ApbReadObjectResp) (merged []*proto.ApbReadObjectResp) {
@@ -4515,12 +4588,51 @@ func mergeQ17IndexReply(protoObjs []*proto.ApbReadObjectResp) (merged []*proto.A
 func mergeQ19IndexReply(protoObjs []*proto.ApbReadObjectResp) (merged []*proto.ApbReadObjectResp) {
 	//3 reads per server.
 	//Also custom merge as some protobufs may not have an entry
-	firstGroup := []*proto.ApbReadObjectResp{protoObjs[0], protoObjs[3], protoObjs[6], protoObjs[9], protoObjs[12]}
+	/*firstGroup := []*proto.ApbReadObjectResp{protoObjs[0], protoObjs[3], protoObjs[6], protoObjs[9], protoObjs[12]}
 	secondGroup := []*proto.ApbReadObjectResp{protoObjs[1], protoObjs[4], protoObjs[7], protoObjs[10], protoObjs[13]}
 	thirdGroup := []*proto.ApbReadObjectResp{protoObjs[2], protoObjs[5], protoObjs[8], protoObjs[11], protoObjs[14]}
 	merged = make([]*proto.ApbReadObjectResp, 3)
 	merged[0], merged[1], merged[2] = mergeQ19IndexReplyHelper(firstGroup), mergeQ19IndexReplyHelper(secondGroup), mergeQ19IndexReplyHelper(thirdGroup)
 	return merged
+	*/
+	var stringKey, contStringKey string
+	var mapKeysToValues map[string]float64
+	var has bool
+	outKeys, outValues := make([][]byte, 3), make([]*proto.ApbMapGetValueResp, 3) //3 containers
+	outMapKeysToValues := make(map[string]map[string]float64, 3)                  //3 containers
+	for _, protoObj := range protoObjs {
+		//Containers -> Brands+quantity -> ...
+		contEntries := protoObj.GetPartread().GetMap().GetGetvalues()
+		contKeys, contValues := contEntries.GetKeys(), contEntries.GetValues()
+		for k, contByteKey := range contKeys {
+			contStringKey = string(contByteKey)
+			mapKeysToValues, has = outMapKeysToValues[contStringKey]
+			if !has {
+				mapKeysToValues = make(map[string]float64)
+				outMapKeysToValues[contStringKey] = mapKeysToValues
+			}
+			entries := contValues[k].GetValue().GetPartread().GetMap().GetGetvalues()
+			keys, values := entries.GetKeys(), entries.GetValues()
+			for j, byteKey := range keys {
+				stringKey = string(byteKey)
+				mapKeysToValues[stringKey] += values[j].GetValue().GetCounterfloat().GetValue()
+			}
+		}
+	}
+
+	floatCounterType, fullReadType, mapType, getValuesType, i := proto.CRDTType_COUNTER_FLOAT, proto.READType_FULL, proto.CRDTType_RRMAP, proto.READType_GET_VALUES, 0
+	for contKey, mapKeysToValues := range outMapKeysToValues {
+		mergedKeys, mergedValues := make([][]byte, len(mapKeysToValues)), make([]*proto.ApbMapGetValueResp, len(mapKeysToValues))
+		j := 0
+		for key, value := range mapKeysToValues {
+			mergedKeys[j], mergedValues[j] = []byte(key), &proto.ApbMapGetValueResp{Value: crdt.CounterFloatState{Value: value}.ToReadResp(), Crdttype: &floatCounterType, Parttype: &fullReadType}
+			j++
+		}
+		mapPartResp := &proto.ApbMapPartialReadResp{Getvalues: &proto.ApbMapGetValuesResp{Keys: mergedKeys, Values: mergedValues}}
+		outKeys[i], outValues[i] = []byte(contKey), &proto.ApbMapGetValueResp{Value: &proto.ApbReadObjectResp{Partread: &proto.ApbPartialReadResp{Map: mapPartResp}}, Crdttype: &mapType, Parttype: &getValuesType}
+		i++
+	}
+	return []*proto.ApbReadObjectResp{{Partread: &proto.ApbPartialReadResp{Map: &proto.ApbMapPartialReadResp{Getvalues: &proto.ApbMapGetValuesResp{Keys: outKeys, Values: outValues}}}}}
 }
 
 func mergeQ19IndexReplyHelper(protoObjs []*proto.ApbReadObjectResp) (merged *proto.ApbReadObjectResp) {

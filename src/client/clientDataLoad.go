@@ -7,6 +7,7 @@ import (
 	"potionDB/crdt/proto"
 	antidote "potionDB/potionDB/components"
 	"runtime"
+	"strings"
 	"time"
 
 	//"tpch_client/src/tpch"
@@ -155,7 +156,7 @@ func readProcessSendTable(i int) {
 }*/
 
 func readOrderUpdates() {
-	updOrders := tpch.ReadOrderUpdates(tpch.UpdsNames[0], tpch.UpdEntries[0], UpdParts[0], tpchData.ToRead[0], N_UPDATE_FILES)
+	updOrders := tpch.ReadOrderUpdates(tpch.UpdsNames[0], tpch.UpdEntries[0], tpch.UpdParts[0], tpchData.ToRead[0], N_UPDATE_FILES)
 	tpchData.Tables.FillOrdersToRegion(updOrders)
 	//tpchData.Tables.FillOrdersToRegion(nil)
 }
@@ -346,7 +347,7 @@ func prepareSendPartitioned(tableIndex int) {
 	var region int8
 	var currMap map[string]crdt.UpdateArguments
 	for _, obj := range table {
-		key, upd = tpch.GetInnerMapEntry(header, primKeys, obj, read)
+		key, upd = GetInnerMapEntry(header, primKeys, obj, read)
 		key = getEntryKey(name, key)
 		region = regionFunc(obj)
 		currMap = updsPerServer[region]
@@ -409,7 +410,7 @@ func prepareSendMultiplePartitioned(tableIndex int) {
 			count := 0
 			printTarget := (len(itemTable) / 2) / maxUpdSize
 			for _, obj := range itemTable {
-				key, upd = tpch.GetInnerMapEntry(header, primKeys, obj, read)
+				key, upd = GetInnerMapEntry(header, primKeys, obj, read)
 				key = getEntryKey(name, key)
 				regions = regionFunc(obj)
 				for _, reg := range regions {
@@ -483,7 +484,7 @@ func prepareSendAny(tableIndex int, bucketIndex int) {
 	var key string
 	var upd crdt.EmbMapUpdateAll
 	for _, obj := range table {
-		key, upd = tpch.GetInnerMapEntry(header, primKeys, obj, read)
+		key, upd = GetInnerMapEntry(header, primKeys, obj, read)
 		key = getEntryKey(name, key)
 		upds[key] = upd
 		if len(upds) == maxUpdSize {
@@ -498,4 +499,37 @@ func prepareSendAny(tableIndex int, bucketIndex int) {
 	//Clean table
 	tpchData.RawTables[tableIndex] = nil
 	prepareProtoFinishChan <- true
+}
+
+// Inner most updates: the object/entry itself (upd to an RWEmbMap, whose entries are LWWRegisters)
+func GetInnerMapEntry(headers []string, primKeys []int, object []string, toRead []int8) (objKey string, upd crdt.EmbMapUpdateAll) {
+	entries := make(map[string]crdt.UpdateArguments)
+	for _, tableI := range toRead {
+		entries[headers[tableI]] = crdt.SetValue{NewValue: object[tableI]}
+	}
+
+	var buf strings.Builder
+	for _, keyIndex := range primKeys {
+		buf.WriteString(object[keyIndex])
+		//TODO: Remove, just for easier debug
+		buf.WriteRune('_')
+	}
+	//TODO: Also remove the slicing after removing the "_"
+	return buf.String()[:buf.Len()-1], crdt.EmbMapUpdateAll{Upds: entries}
+}
+
+func GetInnerMapEntryArray(headers []string, primKeys []int, object []string, toRead []int8) (objKey string, upd crdt.EmbMapUpdateAllArray) {
+	entries := make([]crdt.EmbMapUpdate, len(toRead))
+	for i, tableI := range toRead {
+		entries[i] = crdt.EmbMapUpdate{Key: headers[tableI], Upd: crdt.SetValue{NewValue: object[tableI]}}
+	}
+
+	var buf strings.Builder
+	for _, keyIndex := range primKeys {
+		buf.WriteString(object[keyIndex])
+		//TODO: Remove, just for easier debug
+		buf.WriteRune('_')
+	}
+	//TODO: Also remove the slicing after removing the "_"
+	return buf.String()[:buf.Len()-1], crdt.EmbMapUpdateAllArray{Upds: entries}
 }

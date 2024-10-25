@@ -3,7 +3,6 @@ package client
 import (
 	"encoding/csv"
 	"fmt"
-	"gotools/src/tools"
 	"math"
 	"math/rand"
 	"net"
@@ -16,6 +15,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/AndreRijo/go-tools/src/tools"
 
 	//pb "github.com/golang/protobuf/proto"
 	pb "google.golang.org/protobuf/proto"

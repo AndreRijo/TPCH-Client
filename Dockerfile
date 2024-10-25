@@ -27,7 +27,7 @@ COPY sqlToKeyValue/ /go/sqlToKeyValue/
 COPY tpch_client/dockerstuff tpch_client/
 COPY tpch_client/src tpch_client/src
 
-RUN cd tpch_client/src/main && go build && cd /go && rm -r bin goTools pkg potionDB tpch_data_processor sqlToKeyValue tpch_client/src/autoindex tpch_client/src/client
+RUN cd tpch_client/src/main && go build && cd /go && rm -r bin pkg potionDB tpch_data_processor sqlToKeyValue tpch_client/src/autoindex tpch_client/src/client
 #RUN go install main
 
 #Final image

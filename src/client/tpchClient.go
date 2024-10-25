@@ -3,7 +3,6 @@ package client
 import (
 	"flag"
 	"fmt"
-	"gotools/src/tools"
 	"math/rand"
 	"net"
 	"os"
@@ -21,6 +20,8 @@ import (
 	"syscall"
 	"time"
 	tpch "tpch_data_processor/tpch"
+
+	"github.com/AndreRijo/go-tools/src/tools"
 	//"tpch_client/src/tpch"
 )
 

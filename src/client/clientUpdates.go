@@ -626,12 +626,12 @@ func (ti TableInfo) sendUpdates(ordersUpds [][]string, lineItemUpds [][]string) 
 	var itemRegions []int8
 
 	for _, order := range ordersUpds {
-		key, upd = tpch.GetInnerMapEntry(tpchData.Headers[tpch.ORDERS], tpchData.Keys[tpch.ORDERS], order, tpchData.ToRead[tpch.ORDERS])
+		key, upd = GetInnerMapEntry(tpchData.Headers[tpch.ORDERS], tpchData.Keys[tpch.ORDERS], order, tpchData.ToRead[tpch.ORDERS])
 		key = getEntryKey(tpch.TableNames[tpch.ORDERS], key)
 		ordersPerServer[orderFunc(order)][key] = upd
 	}
 	for _, item := range lineItemUpds {
-		key, upd = tpch.GetInnerMapEntry(tpchData.Headers[tpch.LINEITEM], tpchData.Keys[tpch.LINEITEM], item, tpchData.ToRead[tpch.LINEITEM])
+		key, upd = GetInnerMapEntry(tpchData.Headers[tpch.LINEITEM], tpchData.Keys[tpch.LINEITEM], item, tpchData.ToRead[tpch.LINEITEM])
 		key = getEntryKey(tpch.TableNames[tpch.LINEITEM], key)
 		itemRegions = itemFunc(item)
 		for _, region := range itemRegions {
@@ -1680,10 +1680,10 @@ func sendUpdateData(ordersUpds [][]string, lineItemUpds [][]string, deleteKeys [
 }
 
 func getUpdWithIndex(order []string, lineItems [][]string) {
-	_, orderUpd := tpch.GetInnerMapEntry(tpchData.Headers[tpch.ORDERS], tpchData.Keys[tpch.ORDERS], order, tpchData.ToRead[tpch.ORDERS])
+	_, orderUpd := GetInnerMapEntry(tpchData.Headers[tpch.ORDERS], tpchData.Keys[tpch.ORDERS], order, tpchData.ToRead[tpch.ORDERS])
 	lineUpds := make([]crdt.EmbMapUpdateAll, len(lineItems))
 	for i, item := range lineItems {
-		_, lineUpds[i] = tpch.GetInnerMapEntry(tpchData.Headers[tpch.LINEITEM], tpchData.Keys[tpch.LINEITEM], order, tpchData.ToRead[tpch.LINEITEM])
+		_, lineUpds[i] = GetInnerMapEntry(tpchData.Headers[tpch.LINEITEM], tpchData.Keys[tpch.LINEITEM], order, tpchData.ToRead[tpch.LINEITEM])
 		ignore(item)
 	}
 	//orderObj, lineItemsObjs := ti.Tables.UpdateOrderLineitems(order, lineItems)

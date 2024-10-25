@@ -1563,12 +1563,30 @@ func q1CalcHelper(q1Map map[int8]map[string]*Q1Data, order *tpch.Orders, orderIt
 }
 
 func (ti TableInfo) makeQ1IndexUpds(q1Map map[int8]map[string]*Q1Data, bucketI int) (upds []crdt.UpdateObjectParams) {
-	upds = make([]crdt.UpdateObjectParams, 61) //60 to 120 days, inclusive (61 days)
-	pos := makeQ1IndexUpdsHelper(q1Map, upds, 0, bucketI)
-	return upds[:pos]
+	//upds = make([]crdt.UpdateObjectParams, 61) //60 to 120 days, inclusive (61 days)
+	//pos := makeQ1IndexUpdsHelper(q1Map, upds, 0, bucketI)
+	//return upds[:pos]
+	upds = make([]crdt.UpdateObjectParams, 1)
+	makeQ1IndexUpdsHelper(q1Map, upds, 0, bucketI)
+	return upds
 }
 
 func makeQ1IndexUpdsHelper(q1Map map[int8]map[string]*Q1Data, buf []crdt.UpdateObjectParams, bufI, bucketI int) (newBufI int) {
+	keyArgs := crdt.KeyParams{Key: Q1_KEY, CrdtType: proto.CRDTType_RRMAP, Bucket: buckets[bucketI]}
+	dayMapUpd := crdt.EmbMapUpdateAll{Upds: make(map[string]crdt.UpdateArguments)} //We don't know the size needed as this function is also used by queryInfos.go
+	var outerMapUpd crdt.EmbMapUpdateAll
+	for day, dayMap := range q1Map {
+		outerMapUpd = crdt.EmbMapUpdateAll{Upds: make(map[string]crdt.UpdateArguments)}
+		for pairKey, entries := range dayMap {
+			outerMapUpd.Upds[pairKey] = makeQ1InnerMapUpd(entries)
+		}
+		dayMapUpd.Upds[strconv.FormatInt(int64(day), 10)] = outerMapUpd
+	}
+	buf[bufI] = crdt.UpdateObjectParams{KeyParams: keyArgs, UpdateArgs: dayMapUpd}
+	return bufI + 1
+}
+
+/*func makeQ1IndexUpdsHelper(q1Map map[int8]map[string]*Q1Data, buf []crdt.UpdateObjectParams, bufI, bucketI int) (newBufI int) {
 	var keyArgs crdt.KeyParams
 	var outerMapUpd crdt.EmbMapUpdateAll
 	for day, dayMap := range q1Map {
@@ -1581,7 +1599,7 @@ func makeQ1IndexUpdsHelper(q1Map map[int8]map[string]*Q1Data, buf []crdt.UpdateO
 		bufI++
 	}
 	return bufI
-}
+}*/
 
 func makeQ1InnerMapUpd(q1Data *Q1Data) (mapUpd crdt.EmbMapUpdateAll) {
 	mapUpd = crdt.EmbMapUpdateAll{Upds: make(map[string]crdt.UpdateArguments)}
@@ -3397,12 +3415,14 @@ func isLineItemEligibleForQ19(tables *tpch.Tables, item *tpch.LineItem) (eligibl
 }
 
 func (ti TableInfo) makeQ19IndexUpds(q19Info map[string]map[string]map[int8]float64, bucketI int) (upds []crdt.UpdateObjectParams, nUpds int) {
-	upds = make([]crdt.UpdateObjectParams, 3) //3 container types
+	//upds = make([]crdt.UpdateObjectParams, 3) //3 container types
+	upds = make([]crdt.UpdateObjectParams, 1)
 	_, nUpds = makeQ19IndexUpdsHelper(q19Info, upds, 0, bucketI)
 	return
 }
 
 func makeQ19IndexUpdsHelper(q19Info map[string]map[string]map[int8]float64, buf []crdt.UpdateObjectParams, bufI, bucketI int) (newBufI, nUpds int) {
+	outerUpd := crdt.EmbMapUpdateAll{Upds: make(map[string]crdt.UpdateArguments, 3)} //3 container types
 	for container, containerMap := range q19Info {
 		mapUpd := crdt.EmbMapUpdateAll{Upds: make(map[string]crdt.UpdateArguments)}
 		for brand, quantityMap := range containerMap {
@@ -3411,10 +3431,12 @@ func makeQ19IndexUpdsHelper(q19Info map[string]map[string]map[int8]float64, buf 
 				nUpds++
 			}
 		}
-		buf[bufI] = crdt.UpdateObjectParams{KeyParams: crdt.KeyParams{Key: Q19_KEY + container, CrdtType: proto.CRDTType_RRMAP, Bucket: buckets[bucketI]}, UpdateArgs: mapUpd}
-		bufI++
+		//buf[bufI] = crdt.UpdateObjectParams{KeyParams: crdt.KeyParams{Key: Q19_KEY + container, CrdtType: proto.CRDTType_RRMAP, Bucket: buckets[bucketI]}, UpdateArgs: mapUpd}
+		//bufI++
+		outerUpd.Upds[container] = mapUpd
 	}
-	return bufI, nUpds
+	buf[bufI] = crdt.UpdateObjectParams{KeyParams: crdt.KeyParams{Key: Q19_KEY, CrdtType: proto.CRDTType_RRMAP, Bucket: buckets[bucketI]}, UpdateArgs: outerUpd}
+	return bufI + 1, nUpds
 }
 
 /*
